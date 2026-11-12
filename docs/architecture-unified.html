@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>phonebridge — unified architecture (microservices + channel registration)</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0f1420; color: #e8ecf4; margin: 24px; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; color: #9fc2ff; margin-top: 34px; }
+  .zone { border: 1px dashed #3a4a66; border-radius: 10px; padding: 14px; margin: 12px 0; position: relative; }
+  .zone-title { font-size: 12px; color: #8aa; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .box { display: inline-block; border-radius: 8px; padding: 10px 14px; margin: 6px; font-size: 13px;
+         vertical-align: top; border: 1px solid #567; max-width: 300px; }
+  .agent { background: #1d3a5f; border-color: #4a90d9; }
+  .core  { background: #26382a; border-color: #5fbf77; }
+  .prov  { background: #3a2f4f; border-color: #9a7fd0; }
+  .hw    { background: #4f3a26; border-color: #d0a25f; }
+  .small { font-size: 11px; color: #aab; display:block; margin-top:4px; line-height:1.5; }
+  .arrow { color: #7fd0ff; font-weight: bold; font-size: 15px; }
+  .wire  { display:block; font-size:12px; color:#7fd0ff; margin: 4px 0 4px 20px; }
+  code { background: #202940; padding: 1px 6px; border-radius: 4px; color: #8fe0ff; font-size: 12px; }
+  .evt { color: #9fe8a9; } .note { color: #f0a0a0; } .key { color:#ffd479; }
+  table { border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+  td, th { border: 1px solid #3a4a66; padding: 6px 10px; text-align:left; }
+  ol { font-size: 13px; line-height: 1.75; }
+</style>
+</head>
+<body>
+<h1>phonebridge — unified architecture</h1>
+<p style="font-size:13px;color:#aab">Principle: everything is registration. A line provider registers a "communication channel" with the gateway by address (127.0.0.1 or WAN) — one codebase. An agent registers an intent — one model. There is no difference between "phone nearby" and "phone far away" in the code.</p>
+
+<!-- ============ AGENTS ============ -->
+<div class="zone">
+  <div class="zone-title">Agents — any kind (Devin sessions, daemons, external systems)</div>
+  <div class="box agent">Secretary agent<span class="small">intents: [receive_inbound, dial_out], exclusive on the "personal number" line</span></div>
+  <div class="box agent">Outbound-campaign agent<span class="small">intents: [dial_out], takes lines from the pool</span></div>
+  <div class="box agent">Other systems<span class="small">n8n / scripts — via webhook events</span></div>
+  <div class="wire">▼ registration + RPC: <code>agent.register_intent([...])</code> → JSON-RPC ns <code>agent.*, call.*</code> (Unix socket on host / WSS remotely, own token scope)</div>
+</div>
+
+<!-- ============ CONTAINER ============ -->
+<div class="zone" style="border: 2px solid #5fbf77;">
+  <div class="zone-title">DOCKER container "phonebridge-gateway" — the single deployment artifact</div>
+
+  <div class="box core">Manager + APICallService<span class="small">two surfaces of one daemon: Manager accepts <code>provider.register/line.*</code> from lines; APICallService accepts <code>agent.*/call.*</code> from agents; shared LineManager kernel; separate token scopes</span></div>
+  <div class="box core">LineManager<span class="small">LineAssignment (durable, no heartbeat) + CallLease (ephemeral) + intent-resolver; queues: per-line + global pool</span></div>
+  <div class="box core">EventBus<span class="small">fan-out: socket-subscribe · webhook (retry+HMAC) · exec/file-drop — wakes any agent type</span></div>
+
+  <div class="wire">▼ internal call to address <code>127.0.0.1</code> — the same protocol a remote provider uses</div>
+
+  <div class="box prov">LocalLine (line provider)<span class="small">SEPARATE process in the same container; owns BlueZ+oFono+PipeWire+dbus and the USB dongles (--device); registers with Manager at <code>wss://127.0.0.1:7001/provider</code></span></div>
+  <div class="box hw">BT dongle hci0 → phone A</div>
+  <div class="box hw">BT dongle hci1 → phone B</div>
+</div>
+
+<!-- ============ REMOTE ============ -->
+<div class="zone">
+  <div class="zone-title">Remote site — same provider code, different registration address</div>
+  <div class="box prov">RemoteLine (Raspberry Pi)<span class="small">SAME code, different config: <code>manager_endpoint=wss://&lt;WAN&gt;:7001</code>, per-line token, reconnect=re-register; jitter buffer + audio watchdog</span></div>
+  <div class="box hw">BT dongle → phone C (another city/country)</div>
+  <div class="wire">▲ WSS: <code>provider.register(line_id, caps, token)</code> → gateway — full bidirectional RPC (outbound and inbound calls are equal citizens)</div>
+</div>
+
+<h2>Unified model: three kinds of registration</h2>
+<table>
+<tr><th>Who</th><th>What is registered</th><th>Lives while</th></tr>
+<tr><td class="key">Line provider</td><td><code>provider.register{line_id, caps, token}</code> — a "communication channel"</td><td>transport session + ping; lost → DEGRADED→DOWN</td></tr>
+<tr><td class="key">Agent</td><td><code>agent.register_intent{dial_out|receive_inbound|exclusive_line}</code> — an "intention"</td><td>declarative; LineManager resolves intents → LineAssignment</td></tr>
+<tr><td class="key">Line ownership</td><td>LineAssignment (durable, survives sleep) — derived from intent OR admin_pin</td><td>until release / revoke / idle alert</td></tr>
+</table>
+
+<h2>Inbound call under any topology</h2>
+<ol>
+  <li>Phone rings → provider (local or Pi — no difference) reports it to the gateway → line goes <code>RINGING_LOCKED</code>.</li>
+  <li>Gateway consults LineAssignment: owner exists → wakes it via webhook/event; no owner → notifies live subscribers per the line's inbound policy.</li>
+  <li>Woken agent: <code>call.accept(call_token)</code> → atomically lease+answer+media. Non-owner → <code>OWNER_MISMATCH</code>. Timeout → per-line fallback policy (default: phone rings on to carrier voicemail as usual).</li>
+</ol>
+
+<h2>Deliberate asymmetries (per consultation)</h2>
+<table>
+<tr><td>One transport</td><td>JSON-RPC 2.0 + packetized media — one format everywhere</td></tr>
+<tr><td>Different namespaces</td><td><code>provider.*</code> vs <code>agent.*/call.*</code> — separate token scopes; an agent cannot call provider methods</td></tr>
+<tr><td>Intent ≠ Assignment</td><td>intent is a declarative wish; LineAssignment is durable truth; conflicts = explicit error; admin-override remains</td></tr>
+<tr><td>Media not symmetric</td><td>WAN leg only: jitter buffer + audio watchdog; Opus/WebRTC = upgrade path</td></tr>
+<tr><td>Deployment</td><td>1 container, several processes (supervisord); local provider = separate process for code symmetry, NOT a separate container</td></tr>
+</table>
+
+<p style="font-size:12px;color:#688">API contract: <code>docs/api-contract.md</code> · flows: <code>docs/interaction-flow.html</code> · design: <code>docs/phone-bridge-service-design.md</code></p>
+</body>
+</html>
