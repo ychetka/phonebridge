@@ -1,6 +1,6 @@
 # phonebridge API contract (v0 draft)
 
-Status: design draft (consolidated with design rounds 1-10,
+Status: design draft (consolidated with design rounds 1-11,
 2026-11-12; see docs/phone-bridge-service-design.md decision log).
 Transport: **JSON-RPC 2.0 bidirectional over one connection per peer**.
 - Local peers: Unix-domain socket (bind-mounted out of the container).
@@ -19,9 +19,11 @@ design doc §8 lists the hard paths.
 
 Token scopes are separate: provider tokens never grant `agent.*`/`call.*`, agent tokens never grant `provider.*`/`line.*`; `admin` scope is a third class.
 
-`line_id:"default"` is accepted in every RPC and emitted event as a
-forward-compat alias for single-line clients (multi-dongle is
-first-class in the architecture; implementation may run one line).
+`line_id:"default"` is accepted **only in inbound RPC requests
+from agents** (`call.acquire`, `call.get_lines`) as an alias for
+"any suitable pool line". Every server response and every `event.*`
+payload carries the canonical `line_id` (e.g. `"line-main"`) -
+the alias never leaks into wire output (round 11).
 
 ## Common types
 
@@ -35,7 +37,22 @@ type LineSummary = {
   state: LineState,
   profile?: string
 };
+
+// PII masking (CODING_HAZARDS rule 10): number / caller_id values
+// use a RedactedString type at the serializer/logger boundary -
+// the wire value is complete, the log/error-dump rendering is
+// masked (e.g. "+373****56").
+type RedactedString = string;
 ```
+
+## Identifier taxonomy (round 11)
+
+| id | issued by | lifetime | purpose |
+|---|---|---|---|
+| `assignment_id` | LineManager | durable | line<->owner/provider binding; survives reconnects |
+| `call_token` | LineManager | TTL = `accept_window_sec` (default 30 s) | one-shot token for an inbound ring (`RINGING_LOCKED`); burns on `call.accept` or timeout |
+| `lease_id` | LineManager | ephemeral (one call / one hold) | single id of the active line hold AND the call - replaces any `call_id` everywhere (methods and events) |
+| `media_token` | MediaRouter | ephemeral (bound to `lease_id`) | authorizes the binary media socket handshake |
 
 ## Error codes
 
@@ -82,8 +99,8 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` | `{granted: true, line_id, lease_id}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — empty free_lines = nothing available, normal result not an error; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) |
 | `call.cancel_acquire` | `{session_id, ticket_id}` | `{ok}` — withdraw a queued acquire |
 | `call.release` | `{session_id, lease_id}` | `{ok}` / `OWNER_MISMATCH` |
-| `call.dial` | `{session_id, lease_id, number}` | `{call_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE` |
-| `call.accept` | `{session_id, lease_id, call_token}` | `{ok}` / `STALE_TOKEN`, `LINE_BUSY_INCOMING`, `OWNER_MISMATCH` — atomic: lease+answer+media attach |
+| `call.dial` | `{session_id, lease_id, number}` | `{lease_id, media_endpoint, media_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE` |
+| `call.accept` | `{session_id, call_token}` | `{lease_id, line_id, media_endpoint, media_token}` / `STALE_TOKEN`, `LINE_BUSY_INCOMING`, `OWNER_MISMATCH` — atomic: issues the lease, answers the ring, attaches media |
 | `call.hangup` | `{session_id, lease_id}` | `{ok}` |
 | `call.send_dtmf` | `{session_id, lease_id, digits}` | `{ok}` |
 | `call.claim_exclusive` | `{session_id, line_id}` | `{claim_id, status: "pending_approval"}` — moderator approval required in admin, never self-granted |
@@ -98,8 +115,8 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `event.queue_updated` | `{session_id, ticket_id, position}` |
 | `event.missed_call` | `{line_id, caller_id?, reason, voicemail_ref?}` |
 | `event.line_state_changed` | `{line_id, old_state, new_state, reason?}` |
-| `event.audio_ready` | `{call_id}` — "you may speak" gate vs SCO bring-up lag |
-| `event.call_state_changed` | `{call_id, state, reason}` |
+| `event.audio_ready` | `{lease_id, line_id}` — BT SCO path is up: early media (ringback) audible, uplink accepted without first-word clipping |
+| `event.call_state_changed` | `{lease_id, line_id, state, reason}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected`; agent may start its greeting only on `state == "active"` AND `audio_ready` received |
 
 ## Queue semantics (mandatory FIFO)
 
@@ -116,11 +133,11 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 ## Intent / allocation semantics
 
 - `dial_out` — line granted from pool for dialing; released after `call.hangup` + `call.release`.
-- `receive_inbound` — line granted and marked `BUSY` while the agent waits for a ring; `call.accept` consumes the ring; agent calls `call.release` after the call.
+- `receive_inbound` — a registered inbound intent does NOT hold the line `BUSY` (round 11): the line stays `FREE` (available to the pool unless `exclusive_line`) and transitions to `RINGING_LOCKED` only while a physical call rings; `call.accept` consumes the ring and issues the lease; agent calls `call.release` after the call.
 - `exclusive_line` — durable `LineAssignment` (survives disconnects, no heartbeat); granted only via `call.claim_exclusive` + moderator approval or admin assign; conflict → `LINE_EXCLUSIVE_NOT_OWNER` + `data.free_lines[]`.
 - All lines busy → `call.acquire` returns `{granted: false, free_lines: []}` — routine result, not an error; client retries itself. No server-side parked requests (a stale parked request = zombie grant risk; client retry = freshness).
 - Inbound: ring → `RINGING_LOCKED` → hooks + `event.incoming_call{call_token}` → first `call.accept` = atomic lease+answer. Accept window default **30 s**; ALL timeouts/windows admin-configurable. Timeout → per-line `fallback_policy`.
-- Per-line inbound `fallback_policy` (admin config): `no_pickup` (carrier voicemail - default) | `forward_via_line:<line_id>` | `record_and_telegram:<channel>` | `reject` | `answer_and_announce` (only if an inbound agent is registered). NOTE: no `spill_to_pool` - a live-but-slow owner = missed call.
+- Per-line inbound `fallback_policy` (admin config). CORE policies (executed inside LineManager, atomic telecom ops): `no_pickup` (carrier voicemail - default) | `reject`. WORKER policies (executed by the internal `FallbackWorker` - a system agent that connects via the standard agent API, ADR-01): `record_and_telegram:<channel>` | `answer_and_announce` (only if an inbound agent is registered) | `forward_via_line:<line_id>`. NOTE: no `spill_to_pool` - a live-but-slow owner = missed call.
 
 ## LineProvider contract (one codebase)
 
@@ -128,6 +145,7 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 interface LineProviderConfig {
   manager_endpoint: string;      // wss://127.0.0.1:7001/provider  |  wss://<wan>:7001/provider
   line_id: string;
+  adapter_mac: string;           // BDADDR of the BT dongle - hciX names are unstable across reboots (ADR-03)
   token: string;                 // per-line, provisioned out-of-band
   caps: Intent[];
   profile?: string;
@@ -138,6 +156,23 @@ interface LineProviderConfig {
 ```
 
 LocalLine and RemoteLine run identical logic end-to-end, including media: audio is ALWAYS packetized and sent over the dedicated media channel (loopback for LocalLine). No local PipeWire fast-path - one MediaSink implementation.
+
+## Binary media protocol (ADR-02, round 11)
+
+Both agents and line providers attach to a server-issued
+`media_endpoint` (`unix:///run/phonebridge/media.sock` local or
+`wss://gw:7003/media` remote) returned by `call.dial` /
+`call.accept` (agent) or `provider.register` (provider).
+
+1. **Auth handshake** — first frame is TEXT JSON:
+   - client: `{"type":"media.auth","role":"agent"|"provider","lease_id":"...","media_token":"..."}`
+   - server: `{"type":"media.auth_ok"}` or socket close `4001 Unauthorized`.
+2. **Streaming** — all subsequent frames are BINARY, fixed 648 B:
+   - `byte 0` `uint8` flags: `0x01`=audio, `0x02`=flush/clear-uplink-buffer, `0x03`=keepalive;
+   - `bytes 1..3` `uint24` BE `seq` (monotonic, loss detection);
+   - `bytes 4..7` `uint32` BE `timestamp_ms` (stream-relative);
+   - `bytes 8..647` payload: raw PCM 16 kHz S16_LE mono = 640 B = 20 ms. Flags `0x02`/`0x03` may carry 0-byte payload.
+   Flush is in-band — `clear_uplink_buffer`/`flush_audio_out` map to flag `0x02`, no control/media race.
 
 ## Decisions (developer, 2026-11-12)
 

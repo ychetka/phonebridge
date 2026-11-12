@@ -49,6 +49,7 @@ referenced sections.
 | round 8 | `call.standby` REMOVED - no server-side parked requests; client retry = freshness guarantee | §3.4 |
 | round 9 | `NO_FREE_LINE` error REMOVED - busy is a normal result: `call.acquire` returns `{granted:true,...}` or `{granted:false, free_lines[]}` | §3.3 |
 | round 10 | Accept window default 30 s, ALL timeouts admin-configurable; per-line inbound fallback policy set; idle_revoke = alert-only via escalation channels; exclusive binding = claim + moderator approval; admin = private MCP server; `line.revoke` admin-only | §5.3, §4.2, §10 |
+| round 11 (architecture review hardening) | Unified ID taxonomy (`lease_id` is the only call id); `call.dial`/`call.accept` return `media_endpoint`+`media_token`; `call.accept` takes only `{session_id, call_token}`; `receive_inbound` keeps line `FREE` until a physical ring; `line_id:"default"` input-only alias; `RedactedString` PII masking; ADR-01 FallbackWorker owns complex fallbacks; ADR-02 binary 20 ms media framing with in-band flush; ADR-03 BDADDR binding + mandatory `/var/lib/bluetooth` + `/var/lib/phonebridge` volumes; WAN media reclassified to prod gate | §2.1, §3.3, §4.1, §5.3, §5.5, §6.2, §12 |
 
 ## §1. Service boundary
 
@@ -113,6 +114,20 @@ Motive is host isolation: the host system can be wiped and
 reinstalled and the telephony stack survives entirely inside the
 container. Agents reach the API through the socket directory
 bind-mounted out of the container (UDS) or over WSS remotely.
+
+Persistence requirement (ADR-03, round 11): "wipe-safe" is only true
+with two MANDATORY persistent volumes:
+
+- `/var/lib/bluetooth` - BlueZ link keys; without it recreating the
+  container drops phone pairing and demands manual re-pairing.
+- `/var/lib/phonebridge` - SQLite (keys, LineAssignments, configs)
+  and any recorded media.
+
+Dongle binding is by `adapter_mac` (BDADDR), never `hciN` - indices
+are assigned in USB init order and swap across reboots. Hardware
+constraint note: with >2 dongles place them on different root USB
+controllers/hubs - multiple SCO audio streams on one USB 2.0 hub hit
+the isochronous bandwidth allocation limit.
 
 (Superseded: founding spec's "systemd user service on the host" as
 the production model - host-native deployment remains legal ONLY as a
@@ -182,12 +197,14 @@ registration" model:
 ### §2.4 Multi-dongle / multi-phone first-class
 
 `Line` is a first-class entity from day one:
-`{line_id, hci dongle, paired phone, oFono modem, caps, profile,
+`{line_id, adapter_mac (BDADDR of the BT dongle - hciN names are
+unstable), paired phone, oFono modem, caps, profile,
 state}`. `LineManager` owns N lines, with a per-line queue plus a
 global pool queue (§5.1). The implementation MAY run a single line -
 the architecture must not assume it. `line_id:"default"` is accepted
-in every RPC and emitted event as a forward-compat alias for
-single-line clients.
+only in inbound agent RPC requests as a forward-compat alias for
+single-line clients (round 11: every response/event carries the
+canonical `line_id`).
 
 ## §3. Agent-facing API surface
 
@@ -224,8 +241,8 @@ normal result, not an exception.
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` -> `{session_id}`; declarative wish resolved by the intent-resolver into a LineAssignment (§4) |
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` -> `{granted:true, line_id, lease_id}` or `{granted:false, free_lines[]}`; `free_lines:[]` = nothing available - routine result, the client retries itself. Optional `enqueue` joins the FIFO queue (§3.4) |
 | `call.release` | release a lease; `OWNER_MISMATCH` on foreign lease |
-| `call.dial` | `{session_id, lease_id, number}` -> `{call_token}` |
-| `call.accept` | `{session_id, lease_id, call_token}` - atomic lease + answer + media attach for an inbound ring; `STALE_TOKEN` if the accept window expired, `LINE_BUSY_INCOMING`/`OWNER_MISMATCH` as applicable |
+| `call.dial` | `{session_id, lease_id, number}` -> `{lease_id, media_endpoint, media_token}` |
+| `call.accept` | `{session_id, call_token}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired, `LINE_BUSY_INCOMING`/`OWNER_MISMATCH` as applicable |
 | `call.hangup` / `call.send_dtmf` / `call.get_lines` | call control and line listing |
 
 DTMF is mandatory from v1 - an agent cannot survive IVR trees
@@ -266,8 +283,10 @@ expires_in_ms}` (first valid `call.accept` wins),
 `event.line_acquired`, `event.queue_updated`,
 `event.missed_call{line_id, caller_id?, reason, voicemail_ref?}`,
 `event.line_state_changed{line_id, old_state, new_state, reason?}`,
-`audio_ready{call_id}` (§5.5), `call_state_changed{call_id, state,
-reason}`.
+`audio_ready{lease_id, line_id}` (§5.5),
+`call_state_changed{lease_id, line_id, state, reason}` - `lease_id`
+is the single call identifier everywhere; no `call_id` exists
+(round 11).
 
 `sms_received` and every other SMS surface are removed (§8).
 
@@ -283,9 +302,11 @@ who owns what.
 
 - `dial_out` - line granted from the pool for dialing; released
   after `call.hangup` + `call.release`.
-- `receive_inbound` - line granted and marked `BUSY` while the agent
-  waits for a ring; `call.accept` consumes the ring; the agent calls
-  `call.release` after the call.
+- `receive_inbound` - a registered inbound intent does NOT hold the
+  line `BUSY` (round 11): the line stays `FREE` (pool-eligible
+  unless `exclusive_line`) and only locks to `RINGING_LOCKED` while
+  a physical call rings; `call.accept` consumes the ring and issues
+  the lease; the agent calls `call.release` after the call.
 - `exclusive_line` - durable LineAssignment (survives disconnects,
   no heartbeat).
 
@@ -381,19 +402,27 @@ Profiles are **config presets** over primitive policies
 6. Timeout -> the line's `fallback_policy` (§5.3) -> release back to
    `FREE`.
 
-### §5.3 Per-line inbound fallback policy (round 10b)
+### §5.3 Per-line inbound fallback policy (round 10b, split round 11)
 
 Admin-configured per line; on accept-window expiry (or no
-subscribed/owner agent):
+subscribed/owner agent). Two classes (ADR-01):
+
+**Core policies** - atomic telecom ops executed inside LineManager:
 
 - `no_pickup` - let the carrier handle it (carrier voicemail /
   missed call on the phone itself; default),
+- `reject` - actively reject the call.
+
+**Worker policies** - executed by `FallbackWorker`, an internal
+system agent that connects through the STANDARD agent API
+(`call.accept` + media socket); LineManager never touches Telegram
+HTTP, WAV files, or call bridging:
+
 - `forward_via_line:<line_id>` - the gateway dials OUT on another
   line and bridges (e.g. a call to a personal number is redirected
   out through a second line),
 - `record_and_telegram:<channel>` - answer, record the call/
   voicemail ourselves, post to a Telegram channel,
-- `reject` - actively reject the call,
 - `answer_and_announce` - answer and play an announcement (only if
   the line has an agent registered for inbound; params via admin).
 
@@ -410,9 +439,14 @@ When a call reaches `alerting`, the bridge starts pumping downlink
 frames to the lease owner and accepts uplink frames, so early
 media/ringback is audible. `audio_ready` is the "you may speak"
 gate: the first uplink word sent before it can be truncated by
-Bluetooth SCO bring-up lag. `clear_uplink_buffer` /
-`flush_audio_out` truncate queued playback (barge-in mechanics - the
-bridge owns the uplink buffer).
+Bluetooth SCO bring-up lag. It signals ONLY that the local SCO path
+is up - it does NOT mean the remote party answered (round 11).
+`call_state_changed{state:"active"}` is the remote-answer signal.
+Agent rule: start the greeting only when `state == "active"` AND
+`audio_ready` was received. `clear_uplink_buffer` /
+`flush_audio_out` truncate queued playback (barge-in mechanics -
+the bridge owns the uplink buffer; in-band flush flag 0x02 on the
+media frame, ADR-02).
 
 Open validation spike (30 min, pre-implementation, carried over from
 the founding spec): does `State=active` fire on remote answer or at
@@ -572,8 +606,12 @@ status (mirrors the busctl commands used in Phase-0).
 ## §12. Open questions (still open - marked as such)
 
 1. **WAN media transport**: RTP+Opus vs framed PCM on the dedicated
-   socket - evaluation pending (rounds 5a/6); WSS+raw PCM is the
-   shipping baseline.
+   socket - evaluation pending (rounds 5a/6). Status (round 11):
+   **prod gate for remote Pi lines**, not a v1 blocker - WSS+binary
+   PCM framing (ADR-02) ships for local loopback/LAN, but TCP/WSS
+   head-of-line blocking makes it unfit for unstable WAN; an
+   RTP/UDP (or WebRTC) transport is MANDATORY before remote Pi
+   cold-calling goes live.
 2. **`remote_answered` fidelity** (carried from founding spec):
    pending the §5.5 spike on whether `State=active` fires on remote
    answer or at cellular setup.
@@ -606,3 +644,31 @@ status (mirrors the busctl commands used in Phase-0).
 - PCM streaming vs PipeWire attach -> media is always packetized
   (§6.1); client-side WAV-chunk buffering adapters are acceptable
   for v1, streaming-STT later.
+
+## §13. Implementation roadmap (round 11)
+
+Sequenced into narrow, independently testable PRs:
+
+1. **M1 - Core domain & state machines** (pure Python, no I/O):
+   `RedactedString`, `Intent`, `LineState`, `LineSummary`; in-memory
+   `LineManager` (LineAssignment + CallLease + FIFO queue +
+   RINGING_LOCKED + atomic accept). Unit tests only.
+2. **M2 - Auth/admin SQLite store + bidirectional JSON-RPC**:
+   key scopes (provider|agent|admin) + line configs in SQLite;
+   UDS/WSS JSON-RPC server with Manager vs APICallService
+   namespaces and ownership checks; EventBus (socket subscribers,
+   HMAC webhooks with retry/timeout, exec/file-drop).
+3. **M3 - MediaRouter (loopback binary framing, ADR-02)**:
+   `media.auth` handshake via `media_token`; 20 ms frame routing
+   provider<->agent; flag 0x02 flush. CI loopback test: generated
+   sine from fake provider to fake agent, latency < 100 ms.
+4. **M4 - LineProvider (BlueZ/oFono/PipeWire) + Fake-D-Bus harness**:
+   `adapter_mac` binding (ADR-03), D-Bus adapters
+   (`org.ofono.VoiceCallManager` / `org.pipewire.Telephony`), PipeWire
+   node <-> media socket PCM pump. Tests on isolated
+   `dbus-daemon --session` + PipeWire null-sink.
+5. **M5 - FallbackWorker + phonebridgectl + MCP admin + Docker**:
+   internal system agent for worker fallback policies (ADR-01);
+   admin CLI and private MCP server; single Dockerfile
+   (supervisord: gateway + localline + dbus/bluez/pipewire) with
+   mandatory volumes `/var/lib/bluetooth` + `/var/lib/phonebridge`.
