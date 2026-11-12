@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 state.db*
 queue/
 # .devin canon (agents/, scripts/, project.json, config.json) and
