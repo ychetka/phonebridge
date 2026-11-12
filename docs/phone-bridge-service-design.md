@@ -571,26 +571,28 @@ status (mirrors the busctl commands used in Phase-0).
 
 ## §12. Open questions (still open - marked as such)
 
-1. **Remote Pi lines - outbound too?** (partner round 2, unanswered)
-   Must remote Pi lines support gateway-initiated OUTBOUND calls
-   (cold-call from a remote SIM), or are they inbound-only? The
-   contract technically allows `line.dial` to any registered
-   provider; the product question is open.
-2. **Secretary fallback - mandatory or configurable?** (partner
-   round 3, unanswered) Round 10b made `fallback_policy`
-   per-line configurable with `no_pickup` as default; whether the
-   `secretary` profile must MANDATE a voicemail/hook fallback
-   (vs. letting an admin configure it away) remains open.
-3. **idle_revoke: alert-only vs auto-reassign?** (partner round 3,
-   unanswered) Round 10c set the working behavior to alert-only via
-   escalation channels; whether an idle exclusive line should ever
-   be auto-reassigned remains open.
-4. **WAN media transport**: RTP+Opus vs framed PCM on the dedicated
+1. **WAN media transport**: RTP+Opus vs framed PCM on the dedicated
    socket - evaluation pending (rounds 5a/6); WSS+raw PCM is the
    shipping baseline.
-5. **`remote_answered` fidelity** (carried from founding spec):
+2. **`remote_answered` fidelity** (carried from founding spec):
    pending the §5.5 spike on whether `State=active` fires on remote
    answer or at cellular setup.
+
+### Questions resolved by developer ruling 2026-11-12
+
+- **Remote Pi lines - outbound too?** RESOLVED: YES - remote
+  providers expose the full bidirectional `line.*` surface
+  (`line.dial` included); a remote Pi line is usable for both
+  inbound and outbound cold-calling, not notify-only.
+- **Secretary fallback - mandatory or configurable?** RESOLVED:
+  CONFIGURABLE - `fallback_policy` is per-line admin configuration
+  (§5.3) with `no_pickup` as default; nothing is hard-mandated, all
+  options and parameters live in the admin surface.
+- **idle_revoke: alert-only vs auto-reassign?** RESOLVED:
+  alert-only for exclusive lines - a personal/secretary line is
+  NEVER silently reassigned by the machine; alerts go to
+  admin-configured escalation channels. Pool lines (no owner) may
+  auto-recover/rejoin the pool.
 
 ### Founding-spec questions resolved by later rounds
 
