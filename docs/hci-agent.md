@@ -55,9 +55,10 @@ per-line listener (NAT-safe, consistent with the provider model):
 ### Control channel — TCP
 
 Length-prefixed frames: `uint8 kind · uint16 BE len · uint32 BE
-ctrl_seq · payload`. `ctrl_seq` is a per-session monotonic counter
-assigned by each sender independently (agent→container and
-container→agent sequences are separate).
+ctrl_seq · payload`, where `len` counts `ctrl_seq + payload` (all
+bytes after the `len` field itself). `ctrl_seq` is a per-session
+monotonic counter assigned by each sender independently
+(agent→container and container→agent sequences are separate).
 
 | kind | direction | payload |
 |---|---|---|
@@ -75,7 +76,7 @@ with media. Missed N heartbeats → line `DEGRADED` → `DOWN`.
 **The control channel is strictly lossless.** HCI assumes event and
 ACL delivery with zero loss; a single dropped event (e.g.
 `Synchronous Connection Complete 0x2c`, `Disconnect Complete 0x05`,
-`Command Complete 0x13`) permanently desynchronizes kernel/controller
+`Command Complete 0x0e`) permanently desynchronizes kernel/controller
 state and produces unrecoverable silent failures — this was observed
 live in the vhci experiment. Therefore:
 
@@ -141,9 +142,10 @@ passively from the event stream it forwards:
 | `SCO_FRAMING_ERROR` | datagram shorter than the HCI SCO header, `payload_len` mismatch, or handle 0 / out of range |
 
 These are loud degradation signals feeding the line state machine —
-the kernel-side symptom (BlueZ `SCO packet for unknown connection
-handle`, counted *before* its own drop path, so kernel counters alone
-are unreliable) must be turned into an explicit health event.
+the kernel-side symptom (`hci0: SCO packet for unknown connection
+handle`, an hci-core printk emitted on the *drop* path, so adapter
+`sco` RX counters alone cannot be trusted) must be turned into an
+explicit health event.
 
 ### H4 type split
 
