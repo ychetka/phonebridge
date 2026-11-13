@@ -166,8 +166,9 @@ logging:
 
 Field rules:
 
-- `line_id` + `agent_token` bind the agent to exactly one line at the
-  container; mismatch → `HELLO` rejected, connection closed.
+- `line_id` + the credential in `agent_token_file` bind the agent to
+  exactly one line at the container; mismatch → `HELLO` rejected,
+  connection closed.
 - `dongle.match.adapter_mac` is REQUIRED (hciN-style indices are
   unstable; `usb_path` may *additionally* pin the physical port so a
   second identical dongle cannot be claimed by mistake).

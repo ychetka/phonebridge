@@ -513,6 +513,14 @@ local optimization", and the intermediate `pipewire_local` variant.)
 
 ### §6.2 Two sockets per remote line, server-issued endpoint
 
+(Round 12 rescope: this section describes the provider↔gateway
+media leg, which applies verbatim to container-local providers on
+loopback and — under the unified agent model — only to the fallback
+"smart-remote" deployment. The remote hci-agent↔container legs are a
+different pair: control-TCP + media-UDP inside the `transport_profile`
+tunnel, `docs/hci-agent.md` §2 — the server-issued endpoint idea is
+preserved there as the per-line tunnel port pair.)
+
 - A remote line uses TWO sockets: one control WSS + one dedicated
   media channel.
 - The media endpoint is **SERVER-ISSUED** (round 7a): the gateway
