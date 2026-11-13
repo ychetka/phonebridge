@@ -96,7 +96,10 @@ become `Dial` on the bus:
   `region_code_for_number() == country` — shared calling codes
   (NANP +1, +44 Crown Dependencies, +7) must not false-reject.
 - **Per-line number-type allowlist** (admin config):
-  default `{FIXED_LINE, MOBILE, VOIP, TOLL_FREE}`; an admin may
+  default `{FIXED_LINE, MOBILE, FIXED_LINE_OR_MOBILE, VOIP, TOLL_FREE}` —
+  `FIXED_LINE_OR_MOBILE` is mandatory because `phonenumbers.number_type()`
+  returns this composite type for NANP numbers, so a plain US/CA mobile
+  would otherwise be rejected (round 15); an admin may
   additionally enable `{PREMIUM_RATE, SHARED_COST, PAGER,
   PERSONAL_NUMBER}`. Short codes / emergency numbers are NOT
   representable in E.164 — always rejected on this path (a separate

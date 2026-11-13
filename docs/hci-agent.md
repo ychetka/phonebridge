@@ -89,6 +89,12 @@ live in the vhci experiment. Therefore:
   continuation is forbidden.
 - No control frame is ever intentionally dropped; backpressure is the
   only flow control.
+- Implementation note (CODING_HAZARDS rule 7): although `len` admits
+  up to 65535 bytes, both ends MUST enforce
+  `MAX_CTRL_FRAME_LEN = 4096` when parsing the TCP stream — a
+  desynchronized stream must fail fast instead of letting the
+  allocator chase a garbage length field (HCI ACL/event payloads are
+  ≲1 KiB; HELLO/STATUS JSON fits easily).
 
 ### Media channel — UDP
 

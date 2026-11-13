@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.0.6] - 2026-11-13
+
+### User-facing
+
+- `call.dial` now requires `country` (ISO 3166-1 alpha-2) alongside
+  strict E.164 `number`; `provider.call_state` uses the canonical
+  vocabulary `ringing|dialing|alerting|active|disconnected`;
+  `call.acquire` serves `dial_out` only; new `provider.audio_ready`
+  and `event.fallback_triggered` wire elements; `line.dial`/
+  `line.answer` carry per-lease media credentials.
+
+### Codebase
+
+#### domain contract
+- [contract] `ProviderCallState` canonical vocabulary (breaking);
+  `ProviderCallStateUpdate.lease_id`; `LineManager.dial()` `country`
+  param; `LineAssignment.allowed_number_types`; new `EventName`
+  values + event models (`AudioReadyEvent`, `FallbackTriggeredEvent`,
+  `LineStateChangedEvent`, `MissedCallEvent`);
+  `FallbackDecision.fallback_call_token`; `LineManager.drop_session`
+  (dead-man switch) and `ingest_audio_ready`; `RedactedString`
+  explicit JSON serializer. (issues #25, #29, #31, #33)
+
+#### docs
+- [docs] Unified hci-agent model: `docs/hci-agent.md` agent spec +
+  YAML config format, transport profiles, lossless `ctrl_seq`
+  control channel, agent-side SCO isoc reassembly, feeder SCO handle
+  gate, media health events — locked by the live vhci experiment.
+  (issues #22, #29, #31)
+
 ## [0.0.2] - 2026-11-12
 
 ### User-facing

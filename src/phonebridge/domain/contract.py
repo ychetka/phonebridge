@@ -57,6 +57,7 @@ __all__ = [
     "AssignmentId",
     "AssignmentMode",
     "AssignmentRevokedEvent",
+    "AudioReadyEvent",
     "AwareDatetime",
     "CallLease",
     "CallPhase",
@@ -72,6 +73,7 @@ __all__ = [
     "EventName",
     "FallbackDecision",
     "FallbackPolicy",
+    "FallbackTriggeredEvent",
     "ForwardViaLineFallback",
     "IncomingCallEvent",
     "IncomingRingIngress",
@@ -81,9 +83,11 @@ __all__ = [
     "LineId",
     "LineManager",
     "LineState",
+    "LineStateChangedEvent",
     "LineSummary",
     "LivenessState",
     "MediaToken",
+    "MissedCallEvent",
     "NoPickupFallback",
     "PhonebridgeError",
     "ProviderCallState",
@@ -273,6 +277,10 @@ class EventName(str, Enum):
     CALL_STATE_CHANGED = "call_state_changed"
     QUEUE_READY = "queue_ready"
     ASSIGNMENT_REVOKED = "assignment_revoked"
+    AUDIO_READY = "audio_ready"
+    FALLBACK_TRIGGERED = "fallback_triggered"
+    LINE_STATE_CHANGED = "line_state_changed"
+    MISSED_CALL = "missed_call"
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +375,20 @@ class RedactedString(str):
     def __get_pydantic_core_schema__(
         cls, source_type: Any, handler: GetCoreSchemaHandler
     ) -> core_schema.CoreSchema:
-        """Validate any str into the redacting subclass; serialization
-        is str-native, so JSON output carries the full wire value."""
-        return core_schema.no_info_after_validator_function(cls, core_schema.str_schema())
+        """Validate any str into the redacting subclass; JSON mode uses
+        an explicit serializer so ``model_dump_json()`` always emits
+        ``.to_wire()`` (raw value for the socket) regardless of how
+        pydantic-core treats the str subclass - Python-mode dumps keep
+        the object with its masked repr (round 15)."""
+        return core_schema.no_info_after_validator_function(
+            cls,
+            core_schema.str_schema(),
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                lambda v: v.to_wire(),
+                return_schema=core_schema.str_schema(),
+                when_used="json",
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +550,18 @@ class LineAssignment(ContractModel):
     claimable: bool
     accept_window_sec: float = Field(default=30.0, gt=0)
     fallback_policy: FallbackPolicy = Field(default_factory=NoPickupFallback)
+    allowed_number_types: frozenset[str] = Field(
+        default_factory=lambda: frozenset(
+            {"FIXED_LINE", "MOBILE", "FIXED_LINE_OR_MOBILE", "VOIP", "TOLL_FREE"}
+        )
+    )
+    """Per-line phonenumbers-type allowlist (issue #25, round 15):
+    `number_type()` results outside this set are rejected with
+    DIAL_REJECTED/UNSUPPORTED_NUMBER_TYPE. Premium/shared-cost types
+    are opt-in via admin config. ``FIXED_LINE_OR_MOBILE`` is REQUIRED
+    in the default - phonenumbers returns this composite type for
+    NANP numbers, so a plain US/CA mobile would otherwise be rejected
+    as UNSUPPORTED_NUMBER_TYPE (review round 15)."""
     last_seen_at: AwareDatetime
     idle_revoke_after: timedelta | None = None
 
@@ -735,6 +766,47 @@ class AssignmentRevokedEvent(ContractModel):
     reason: str | None = None
 
 
+class AudioReadyEvent(ContractModel):
+    """audio_ready payload (round 14): the provider's local BT SCO
+    path is up - early media flows, uplink accepted without first-word
+    clipping. Derived from ``provider.audio_ready`` ingress, NOT from
+    remote answer - see ``answer_confidence`` for that distinction."""
+
+    lease_id: LeaseId
+    line_id: LineId
+
+
+class FallbackTriggeredEvent(ContractModel):
+    """fallback_triggered payload (round 14): delivered to the
+    ``system:fallback_worker`` session only. ``call_token`` is the
+    internal fallback_call_token re-issued after accept-window expiry -
+    single-use, TTL-bound, bypasses the exclusive-owner check."""
+
+    line_id: LineId
+    call_token: CallToken
+    caller: RedactedString | None = None
+    policy: FallbackPolicy
+
+
+class LineStateChangedEvent(ContractModel):
+    """line_state_changed payload: LineState transition fact."""
+
+    line_id: LineId
+    old_state: LineState
+    new_state: LineState
+    reason: str | None = None
+
+
+class MissedCallEvent(ContractModel):
+    """missed_call payload: an inbound ring ended unanswered
+    (accept-window expiry, caller hangup, or reject-policy outcome)."""
+
+    line_id: LineId
+    caller: RedactedString | None = None
+    reason: str
+    voicemail_ref: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Provider ingress payloads (narrowed surface: distilled FACTS, not
 # raw WSS register/ping transport)
@@ -807,6 +879,11 @@ class FallbackDecision(ContractModel):
     call_token: CallToken
     policy: FallbackPolicy
     reason: str | None = None
+    fallback_call_token: CallToken | None = None
+    """Re-issued ring token for WORKER policies (round 14): bound to
+    ``system:fallback_worker``, single-use, TTL-bound, bypasses the
+    exclusive-owner check so FallbackWorker can call accept() after
+    the original call_token went stale. None for CORE policies."""
 
 
 # ---------------------------------------------------------------------------
@@ -894,14 +971,25 @@ class LineManager(ABC):
 
     @abstractmethod
     async def dial(
-        self, session_id: SessionId, lease_id: LeaseId, number: RedactedString
+        self,
+        session_id: SessionId,
+        lease_id: LeaseId,
+        number: RedactedString,
+        country: str,
     ) -> DialResult:
         """call.dial: issue line.dial to the owning provider ->
         server-issued media attachment. ``number`` is PII: it arrives
         wrapped in RedactedString and must be unwrapped ONLY at the
-        provider boundary. OWNER_MISMATCH / PROVIDER_UNREACHABLE apply;
-        a duplicate dial on one lease is rejected (INVALID_CALL_STATE
-        reason under STALE_TOKEN is the convention)."""
+        provider boundary. ``country`` (ISO 3166-1 alpha-2, round 12)
+        is the caller's assertion cross-checked against the number via
+        phonenumbers BEFORE the line is touched (DIAL_REJECTED with a
+        typed reason); per-line ``allowed_number_types`` on the
+        LineAssignment gates UNSUPPORTED_NUMBER_TYPE - only LineManager
+        knows which line backs the lease, so this check cannot live in
+        the transport adapter (round 15). OWNER_MISMATCH /
+        PROVIDER_UNREACHABLE / DIAL_REJECTED apply; a duplicate dial on
+        one lease is rejected (INVALID_CALL_STATE reason under
+        STALE_TOKEN is the convention)."""
         ...
 
     @abstractmethod
@@ -980,12 +1068,37 @@ class LineManager(ABC):
         ...
 
     @abstractmethod
+    async def ingest_audio_ready(
+        self, line_id: LineId, assignment_id: AssignmentId, lease_id: LeaseId
+    ) -> None:
+        """provider.audio_ready ingress (round 14): the provider's local
+        BT SCO path is up for ``lease_id`` -> emit AudioReadyEvent to
+        the lease owner. One-shot per lease; a duplicate or unknown-
+        lease report is dropped (idempotent). NOT a call state - it
+        says nothing about remote answer."""
+        ...
+
+    @abstractmethod
     async def decide_fallback(self, line_id: LineId, call_token: CallToken) -> FallbackDecision:
         """Fallback POLICY DECISION point (§5.3): on accept-window
         expiry or no subscribed/owner agent, resolve the line's
         fallback_policy into a concrete decision. Policy selection is
         domain concern; EXECUTION is internal (core ops inline, worker
         policies via FallbackWorker over the agent API - ADR-01)."""
+        ...
+
+    # --- agent session lifecycle ---
+
+    @abstractmethod
+    async def drop_session(self, session_id: SessionId) -> None:
+        """Agent socket teardown fact (round 15): the transport layer
+        reports a disconnected session so the kernel can atomically
+        (a) kill every QueueTicket owned by the session - tickets are
+        socket-bound (§3.4) - and (b) run the dead-man switch on every
+        CallLease owned by it: hangup + lease teardown (§5.4).
+        Idempotent: a repeated drop on an already-gone session is a
+        no-op. This is the ONLY way sessions end; there is no
+        per-ticket/per-lease sweep API."""
         ...
 
     @abstractmethod

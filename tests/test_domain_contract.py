@@ -501,7 +501,11 @@ class _FakeLineManager(LineManager):
         return None
 
     async def dial(
-        self, session_id: SessionId, lease_id: LeaseId, number: RedactedString
+        self,
+        session_id: SessionId,
+        lease_id: LeaseId,
+        number: RedactedString,
+        country: str,
     ) -> DialResult:
         return DialResult(
             lease_id=lease_id, media_endpoint="unix:///run/m.sock", media_token=MediaToken("mt")
@@ -552,8 +556,19 @@ class _FakeLineManager(LineManager):
     async def ingest_call_state(self, update: ProviderCallStateUpdate) -> None:
         return None
 
+    async def ingest_audio_ready(
+        self,
+        line_id: LineId,
+        assignment_id: contract.AssignmentId,
+        lease_id: LeaseId,
+    ) -> None:
+        return None
+
     async def decide_fallback(self, line_id: LineId, call_token: CallToken) -> FallbackDecision:
         return FallbackDecision(line_id=line_id, call_token=call_token, policy=NoPickupFallback())
+
+    async def drop_session(self, session_id: SessionId) -> None:
+        return None
 
     async def tick(self, now: datetime) -> None:
         return None
@@ -566,7 +581,7 @@ def test_line_manager_is_abstract() -> None:
 
 async def test_line_manager_async_surface() -> None:
     """Non-e2e async exercise: EVERY abstract method is awaitable and
-    returns its contracted result type (all 16 methods)."""
+    returns its contracted result type (all 18 methods)."""
     assert set(LineManager.__abstractmethods__) == {
         "register_intent",
         "acquire",
@@ -582,7 +597,9 @@ async def test_line_manager_async_surface() -> None:
         "note_provider_liveness",
         "ingest_ring",
         "ingest_call_state",
+        "ingest_audio_ready",
         "decide_fallback",
+        "drop_session",
         "tick",
     }
     mgr = _FakeLineManager()
@@ -593,7 +610,7 @@ async def test_line_manager_async_surface() -> None:
     assert isinstance(result, AcquireGranted)
     assert isinstance(result.lease_id, str)
     await mgr.cancel_acquire(session, TicketId("ticket-1"))
-    dial = await mgr.dial(session, result.lease_id, RedactedString(_RAW_NUMBER))
+    dial = await mgr.dial(session, result.lease_id, RedactedString(_RAW_NUMBER), "MD")
     assert isinstance(dial.media_token, str)
     accepted = await mgr.accept(session, CallToken("tok-1"))
     assert isinstance(accepted, AcceptResult)
