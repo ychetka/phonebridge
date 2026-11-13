@@ -312,8 +312,8 @@ expires_in_ms}` (first valid `call.accept` wins),
 `event.line_acquired`, `event.queue_updated`,
 `event.missed_call{line_id, caller_id?, reason, voicemail_ref?}`,
 `event.line_state_changed{line_id, old_state, new_state, reason?}`,
-`audio_ready{lease_id, line_id}` (§5.5),
-`call_state_changed{lease_id, line_id, state, reason,
+`event.audio_ready{lease_id, line_id}` (§5.5),
+`event.call_state_changed{lease_id, line_id, state, reason?,
 answer_confidence?}` - `lease_id`
 is the single call identifier everywhere; no `call_id` exists
 (round 11). `event.fallback_triggered{line_id, call_token,
