@@ -54,7 +54,11 @@ per-line listener (NAT-safe, consistent with the provider model):
 
 ### Control channel — TCP
 
-Length-prefixed frames: `uint8 kind · uint16 BE len · payload`.
+Length-prefixed frames: `uint8 kind · uint16 BE len · uint32 BE
+ctrl_seq · payload`, where `len` counts `ctrl_seq + payload` (all
+bytes after the `len` field itself). `ctrl_seq` is a per-session
+monotonic counter assigned by each sender independently
+(agent→container and container→agent sequences are separate).
 
 | kind | direction | payload |
 |---|---|---|
@@ -69,12 +73,79 @@ Length-prefixed frames: `uint8 kind · uint16 BE len · payload`.
 Control traffic is small and latency-critical: it never shares a queue
 with media. Missed N heartbeats → line `DEGRADED` → `DOWN`.
 
+**The control channel is strictly lossless.** HCI assumes event and
+ACL delivery with zero loss; a single dropped event (e.g.
+`Synchronous Connection Complete 0x2c`, `Disconnect Complete 0x05`,
+`Command Complete 0x0e`) permanently desynchronizes kernel/controller
+state and produces unrecoverable silent failures — this was observed
+live in the vhci experiment. Therefore:
+
+- Every control frame carries `ctrl_seq`; the receiver MUST detect
+  gaps.
+- A sequence gap, an unwritable channel that cannot drain within the
+  configured deadline, or a control queue overflow is a **fatal
+  session error**: emit `STATUS state=DEGRADED detail=CTRL_DESYNC`,
+  close the session, and reset/re-attach the line adapter. Silent
+  continuation is forbidden.
+- No control frame is ever intentionally dropped; backpressure is the
+  only flow control.
+
 ### Media channel — UDP
 
-`uint8 kind=0x03 (SCO) · uint32 BE seq · uint32 BE ts_ms · SCO payload`
-— one HCI SCO packet per datagram. Stale frames MAY be dropped; late
-audio is worse than missing audio (isochronous semantics preserved on
-purpose — this is why media is not TCP).
+`uint8 kind=0x03 (SCO) · uint16 BE media_seq · uint32 BE ts_ms ·
+SCO payload` — one **complete HCI SCO packet** per datagram
+(`2 B handle/flags · 1 B payload_len · payload`). Stale frames MAY be
+dropped; late audio is worse than missing audio (isochronous semantics
+preserved on purpose — this is why media is not TCP: head-of-line
+blocking would stall real-time audio). `media_seq` wraps at 2^16 and
+lets the feeder count gaps/reorders for telemetry only.
+
+**SCO framing is the agent's job.** Raw USB isochronous buffers are
+not aligned to HCI packet boundaries (observed: corrupt packets with
+connection handle `0` reaching the kernel). The agent stays dumb about
+Bluetooth/HFP state, but it MUST be framing-aware at the isochronous
+endpoint boundary:
+
+- skip zero-length isoc descriptors and padding,
+- reassemble each HCI SCO packet via its 3-byte header + declared
+  payload length,
+- emit only complete packets, never split a packet across datagrams
+  (a lost datagram would permanently corrupt a reassembled stream),
+- verify `payload_len` equals the actual payload size; malformed
+  frames are counted, not forwarded.
+
+### vhci feeder — SCO handle gate
+
+The split transport means SCO data can outrun the setup event that
+created the synchronous connection. The container-side feeder
+(vhci writer) therefore gates media on connection state learned
+passively from the event stream it forwards:
+
+- Open a gate for sync connection handle H when it forwards a
+  `Synchronous Connection Complete` event `0x2c` (or legacy
+  `Connection Complete` `0x03` reporting a SCO/eSCO link) with
+  `status == 0x00`. The full 16-bit handle field is preserved when
+  writing to `/dev/vhci`; comparisons mask with `0x0FFF`.
+- SCO frames for an unknown handle are either dropped or held in a
+  tiny ring of **≤ 4 frames per handle (≈30 ms)** — never more; the
+  prototype's 200-frame hold would inject ~1.5 s of audio latency.
+- Close the gate on a successful `Disconnect Complete` `0x05`
+  **before** writing that event to the kernel, so trailing media can
+  never reach a connection the kernel has already torn down.
+
+### Media health events (feeder → line health)
+
+| event | trigger |
+|---|---|
+| `SCO_UNEXPECTED_HANDLE` | frames for an unknown handle persist > ~250 ms or > 20 frames after connection setup — sync/event desync suspected |
+| `SCO_RX_STARVATION` | gate open but zero valid SCO frames for > ~500 ms during an active call |
+| `SCO_FRAMING_ERROR` | datagram shorter than the HCI SCO header, `payload_len` mismatch, or handle 0 / out of range |
+
+These are loud degradation signals feeding the line state machine —
+the kernel-side symptom (`hci0: SCO packet for unknown connection
+handle`, an hci-core printk emitted on the *drop* path, so adapter
+`sco` RX counters alone cannot be trusted) must be turned into an
+explicit health event.
 
 ### H4 type split
 
