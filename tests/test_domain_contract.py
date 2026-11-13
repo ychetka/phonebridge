@@ -411,7 +411,7 @@ def test_event_envelope_and_payloads() -> None:
         lease_id=LeaseId("l-1"),
         line_id=LineId("line-main"),
         phase=CallPhase.ACTIVE,
-        reason="provider ANSWERED",
+        reason="provider active",
     )
     qr = QueueReadyEvent(
         ticket_id=TicketId("t-1"),
@@ -634,7 +634,7 @@ async def test_line_manager_async_surface() -> None:
         ProviderCallStateUpdate(
             line_id=LineId("line-main"),
             assignment_id=contract.AssignmentId("asg-1"),
-            state=ProviderCallState.ANSWERED,
+            state=ProviderCallState.ACTIVE,
             observed_at=NOW_UTC,
         )
     )

@@ -49,7 +49,7 @@
 
   <div class="box prov">Line bundle ×N (thin-slice)<span class="small">per line: <code>vhci-feeder</code> + shim/audio-forwarder + <code>LineProvider</code> process; registers with Manager at <code>wss://127.0.0.1:7001/provider</code>; a dead bundle is reaped without touching others</span></div>
   <div class="box core">BlueZ + PipeWire + dbus (shared, hardened)<span class="small">watchdog + fast restart; adapters are kernel <code>vhci</code> devices hci0..hciN — NO real USB inside the container</span></div>
-  <div class="box hw">vhci hci0 ← agent A &nbsp;·&nbsp; vhci hci1 ← agent B</div>
+  <div class="box hw">vhci ← hci-agent A &nbsp;·&nbsp; vhci ← hci-agent B<span class="small">kernel names hci0..hciN are incidental — line identity is bound by adapter_mac (BDADDR, ADR-03)</span></div>
 </div>
 
 <!-- ============ REMOTE / AGENT HOSTS ============ -->
