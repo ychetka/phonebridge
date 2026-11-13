@@ -53,6 +53,7 @@ referenced sections.
 | round 12 (live probes + unified agent model, 2026-11-13) | Live-verified on the real stack: `VoiceCall.Answer` works (incoming→`active` ~0.3 s, SCO ~0.6 s), inbound `Hangup` rejects a ringing call, full E.164 terminates via `Dial` unchanged, `SendTones` is broken on this stack (fallback = in-band DTMF in uplink), WirePlumber auto-routes SCO to the default sink+monitor (echo loop; service must own routing via per-line virtual endpoints + static `node.autoconnect=false` on bluez5 HFP nodes). Architecture: UNIFIED AGENT MODEL — every BT dongle sits behind a dumb `hci-agent` (libusb, btusb detached) feeding a kernel `vhci` adapter inside the container over a pluggable `transport_profile` tunnel (control-TCP + media-UDP; QUIC is a V2 track); container is isolated-netns, sees only virtual adapters; thin-slice per-line worker bundles + shared bluetoothd/PipeWire; `call.dial` requires `number` (strict E.164) + `country` (ISO alpha-2) with phonenumbers cross-validation and a per-line number-type allowlist; agent surface reachable via MCP adapter | §2.1, §2.2, §5.5, §6.4, §9, §10, §12, docs/hci-agent.md |
 | round 13 (vhci experiment — protocol hardening, 2026-11-13) | One-dongle end-to-end experiment PASSED (issue #29): dongle → hci-agent → control-TCP/media-UDP → `/dev/vhci` → bluetoothd/oFono → live call with bidirectional SCO. Silent-audio incident diagnosed and fixed live — media frames outrun the sync-connection event across the split channels, and raw USB isoc buffers are not HCI-frame-aligned. Locked invariants: control channel is strictly lossless + `ctrl_seq` sequenced (gap/overflow = fatal session reset); agent reassembles complete HCI SCO packets at the isoc boundary (`media_seq`, one packet per datagram); feeder gates SCO on `0x2c`/`0x03` events, closes before `0x05`, caps unknown-handle holds at ≤4 frames; loud media health events `SCO_UNEXPECTED_HANDLE`/`SCO_RX_STARVATION`/`SCO_FRAMING_ERROR` | docs/hci-agent.md §2 |
 | round 14 (architect review — edge cases, 2026-11-13) | Second review pass (issue #31): `line.dial`/`line.answer` now carry per-lease `{media_endpoint, media_token}` for the provider's `media.auth`; `call.acquire` restricted to `dial_out` only (inbound via `call.accept`, exclusive via `call.claim_exclusive`); `provider.call_state` uses the canonical state set `ringing\|dialing\|alerting\|active\|disconnected` + `lease_id?`; new `provider.audio_ready` notification feeds `event.audio_ready`; MediaRouter gains pair TTL (~5 s) and bounded frame queues; `fallback_call_token` mechanics defined for FallbackWorker on `accept_window_sec` expiry; `adapter_mac` added to `LineProviderConfig` | §2.2, §5.3, §5.5, docs/api-contract.md |
+| round 15-16 (contract parity + doc tails, 2026-11-13) | contract.py aligned to api-contract (issue #33): `country` in `dial()`, `allowed_number_types` on LineAssignment (+mandatory `FIXED_LINE_OR_MOBILE` for NANP), full EventName vocabulary + event models, `fallback_call_token`, `drop_session`, `ingest_audio_ready`, explicit `RedactedString` JSON serializer, `MAX_CTRL_FRAME_LEN=4096`. Review 4 (SA_hidrogen): `answer_confidence` carried on `event.call_state_changed`; §3.5/§3.6/§13 updated for provider.audio_ready, event.fallback_triggered and the hci-agent/vhci line-bundle topology | §3.5, §3.6, §5.5, §13, docs/api-contract.md |
 
 ## §1. Service boundary
 
@@ -297,7 +298,8 @@ for single-task agents).
 ### §3.5 Provider namespace (`provider.*` up / `line.*` down)
 
 Up: `provider.register`, `provider.reregister`, `provider.ping`,
-`provider.capability_update`, `provider.call_state`.
+`provider.capability_update`, `provider.call_state`,
+`provider.audio_ready` (round 14).
 Down (server-initiated on the provider's own inbound connection):
 `line.dial`, `line.answer`, `line.hangup`, `line.send_dtmf` -
 each carrying `{assignment_id, lease_id, ...}` and returning
@@ -311,9 +313,13 @@ expires_in_ms}` (first valid `call.accept` wins),
 `event.missed_call{line_id, caller_id?, reason, voicemail_ref?}`,
 `event.line_state_changed{line_id, old_state, new_state, reason?}`,
 `audio_ready{lease_id, line_id}` (§5.5),
-`call_state_changed{lease_id, line_id, state, reason}` - `lease_id`
+`call_state_changed{lease_id, line_id, state, reason,
+answer_confidence?}` - `lease_id`
 is the single call identifier everywhere; no `call_id` exists
-(round 11).
+(round 11). `event.fallback_triggered{line_id, call_token,
+caller_id?, policy}` goes to the `system:fallback_worker` session
+only, when the accept window expires on a WORKER-policy line
+(round 14).
 
 `sms_received` and every other SMS surface are removed (§8).
 
@@ -794,13 +800,20 @@ Sequenced into narrow, independently testable PRs:
    `media.auth` handshake via `media_token`; 20 ms frame routing
    provider<->agent; flag 0x02 flush. CI loopback test: generated
    sine from fake provider to fake agent, latency < 100 ms.
-4. **M4 - LineProvider (BlueZ/oFono/PipeWire) + Fake-D-Bus harness**:
-   `adapter_mac` binding (ADR-03), D-Bus adapters
+4. **M4 - Line bundle: vhci-feeder + shim/audio-forwarder +
+   LineProvider + Fake-D-Bus harness** (round 13 topology): per-line
+   kernel `vhci` adapter fed by the line's `hci-agent`
+   (control-TCP/media-UDP per `docs/hci-agent.md` §2), `adapter_mac`
+   binding (ADR-03), D-Bus adapters
    (`org.ofono.VoiceCallManager` / `org.pipewire.Telephony`), PipeWire
-   node <-> media socket PCM pump. Tests on isolated
-   `dbus-daemon --session` + PipeWire null-sink.
+   node <-> media socket PCM pump with owned routing
+   (`node.autoconnect=false`, §6.4). Tests on isolated
+   `dbus-daemon --session` + PipeWire null-sink; the vhci feeder is
+   loopback-testable without a dongle.
 5. **M5 - FallbackWorker + phonebridgectl + MCP admin + Docker**:
    internal system agent for worker fallback policies (ADR-01);
    admin CLI and private MCP server; single Dockerfile
-   (supervisord: gateway + localline + dbus/bluez/pipewire) with
-   mandatory volumes `/var/lib/bluetooth` + `/var/lib/phonebridge`.
+   (supervisord: gateway + per-line bundles + shared
+   dbus/bluez/pipewire + `/dev/vhci`; hci-agents run OUTSIDE the
+   container, one per dongle) with mandatory volumes
+   `/var/lib/bluetooth` + `/var/lib/phonebridge`.
