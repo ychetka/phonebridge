@@ -125,18 +125,19 @@ from these input rejections and from ordinary no-answer termination.
 
 | method | params | returns |
 |---|---|---|
-| `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` |
+| `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` — `media_endpoint` is the static socket address; the per-lease `media_token` arrives later inside `line.dial`/`line.answer` (round 14) |
 | `provider.reregister` | same as register | idempotent; preserves lease state during grace window |
 | `provider.ping` | `{line_id, assignment_id, state_snapshot?}` | `{ok, server_time}` — missed N pings → DEGRADED → DOWN |
 | `provider.capability_update` | `{line_id, assignment_id, caps, profile?}` | `{ok}` |
-| `provider.call_state` | `{line_id, assignment_id, call_token?, state, reason?}` | `{ok}` — RINGING/ANSWERED/ENDED/FAILED |
+| `provider.call_state` | `{line_id, assignment_id, call_token?, lease_id?, state, reason?}` | `{ok}` — `state` is the canonical set `ringing` \| `dialing` \| `alerting` \| `active` \| `disconnected`; `call_token` identifies the inbound ring, `lease_id` an established call |
+| `provider.audio_ready` | `{line_id, assignment_id, lease_id}` | `{ok}` — one-shot notification: the provider's local BT SCO path is up (early media flows, uplink accepted). Gateway emits `event.audio_ready` to the agent from this signal |
 
 ## Manager → Line — `line.*` (down-channel commands)
 
 | method | params | returns |
 |---|---|---|
-| `line.dial` | `{assignment_id, lease_id, number}` | `{accepted}` — `number` is the already-validated E.164 string, passed through unchanged (see Dial validation) |
-| `line.answer` | `{assignment_id, lease_id, call_token}` | `{accepted}` |
+| `line.dial` | `{assignment_id, lease_id, number, media_endpoint, media_token}` | `{accepted}` — `number` is the already-validated E.164 string, passed through unchanged (see Dial validation); `media_endpoint`/`media_token` authorize the provider's `media.auth` for this `lease_id` |
+| `line.answer` | `{assignment_id, lease_id, call_token, media_endpoint, media_token}` | `{accepted}` — same per-lease media credentials as `line.dial` |
 | `line.hangup` | `{assignment_id, lease_id}` | `{accepted}` |
 | `line.send_dtmf` | `{assignment_id, lease_id, digits}` | `{accepted}` |
 | `line.revoke` | `{assignment_id}` | `{accepted}` — **admin scope only** |
@@ -148,7 +149,7 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | method | params | returns / errors |
 |---|---|---|
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` | `{session_id}` |
-| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` | `{granted: true, line_id, lease_id}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — empty free_lines = nothing available, normal result not an error; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) |
+| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` | `{granted: true, line_id, lease_id}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — `intent` must be `dial_out` (round 14; other intents → `INVALID_INTENT`); empty free_lines = nothing available, normal result not an error; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) |
 | `call.cancel_acquire` | `{session_id, ticket_id}` | `{ok}` — withdraw a queued acquire |
 | `call.release` | `{session_id, lease_id}` | `{ok}` / `OWNER_MISMATCH` |
 | `call.dial` | `{session_id, lease_id, number, country}` | `{lease_id, media_endpoint, media_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE`, `DIAL_REJECTED` |
@@ -166,9 +167,10 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `event.line_acquired` | `{session_id, line_id, lease_id, intent}` — also the grant for a queued ticket; agent must act within grant TTL |
 | `event.queue_updated` | `{session_id, ticket_id, position}` |
 | `event.missed_call` | `{line_id, caller_id?, reason, voicemail_ref?}` |
+| `event.fallback_triggered` | `{line_id, call_token, caller_id?, policy}` — delivered to the `system:fallback_worker` session only, when `accept_window_sec` expires on a WORKER-policy line; `call_token` is the internal `fallback_call_token` (round 14) |
 | `event.line_state_changed` | `{line_id, old_state, new_state, reason?}` |
 | `event.audio_ready` | `{lease_id, line_id}` — BT SCO path is up: early media (ringback) audible, uplink accepted without first-word clipping |
-| `event.call_state_changed` | `{lease_id, line_id, state, reason}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected`; agent may start its greeting only on `state == "active"` AND `audio_ready` received |
+| `event.call_state_changed` | `{lease_id, line_id, state, reason}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected` (the provider's `ringing` maps to `event.incoming_call`, not to a lease event); agent may start its greeting only on `state == "active"` AND `audio_ready` received |
 
 ## Queue semantics (mandatory FIFO)
 
@@ -184,12 +186,14 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 
 ## Intent / allocation semantics
 
+- `call.acquire` serves **only `dial_out`** (round 14): inbound rings are consumed atomically by `call.accept(call_token)` without a prior grant, and durable exclusive ownership goes through `call.claim_exclusive` — so `acquire` never needs the other intents, which halves the LineManager grant state machine. `call.get_lines` still accepts any `intent?` for capability filtering.
 - `dial_out` — line granted from pool for dialing; released after `call.hangup` + `call.release`.
 - `receive_inbound` — a registered inbound intent does NOT hold the line `BUSY` (round 11): the line stays `FREE` (available to the pool unless `exclusive_line`) and transitions to `RINGING_LOCKED` only while a physical call rings; `call.accept` consumes the ring and issues the lease; agent calls `call.release` after the call.
 - `exclusive_line` — durable `LineAssignment` (survives disconnects, no heartbeat); granted only via `call.claim_exclusive` + moderator approval or admin assign; conflict → `LINE_EXCLUSIVE_NOT_OWNER` + `data.free_lines[]`.
 - All lines busy → `call.acquire` returns `{granted: false, free_lines: []}` — routine result, not an error; client retries itself. No server-side parked requests (a stale parked request = zombie grant risk; client retry = freshness).
 - Inbound: ring → `RINGING_LOCKED` → hooks + `event.incoming_call{call_token}` → first `call.accept` = atomic lease+answer. Accept window default **30 s**; ALL timeouts/windows admin-configurable. Timeout → per-line `fallback_policy`.
 - Per-line inbound `fallback_policy` (admin config). CORE policies (executed inside LineManager, atomic telecom ops): `no_pickup` (carrier voicemail - default) | `reject`. WORKER policies (executed by the internal `FallbackWorker` - a system agent that connects via the standard agent API, ADR-01): `record_and_telegram:<channel>` | `answer_and_announce` (only if an inbound agent is registered) | `forward_via_line:<line_id>`. NOTE: no `spill_to_pool` - a live-but-slow owner = missed call.
+- **Fallback token mechanics (round 14):** when `accept_window_sec` expires on a WORKER-policy line, the original `call_token` is already stale and an exclusive-owner check would reject the worker's `call.accept`. LineManager therefore re-issues the ring as an internal `fallback_call_token` bound to `agent_id: "system:fallback_worker"` (bypasses `OWNER_MISMATCH`, still single-use and TTL-bound) and delivers `event.incoming_call{call_token: fallback_call_token}` — or `event.fallback_triggered` — to the FallbackWorker session only.
 
 ## LineProvider contract (one codebase)
 
@@ -224,8 +228,9 @@ documented alternative for links too hostile for HCI-over-IP.
 
 Both agents and line providers attach to a server-issued
 `media_endpoint` (`unix:///run/phonebridge/media.sock` local or
-`wss://gw:7003/media` remote) returned by `call.dial` /
-`call.accept` (agent) or `provider.register` (provider).
+`wss://gw:7003/media` remote) and a per-lease `media_token`, returned
+by `call.dial` / `call.accept` (agent) or `line.dial` / `line.answer`
+(provider, round 14).
 
 1. **Auth handshake** — first frame is TEXT JSON:
    - client: `{"type":"media.auth","role":"agent"|"provider","lease_id":"...","media_token":"..."}`
@@ -236,6 +241,17 @@ Both agents and line providers attach to a server-issued
    - `bytes 4..7` `uint32` BE `timestamp_ms` (stream-relative);
    - `bytes 8..647` payload: raw PCM 16 kHz S16_LE mono = 640 B = 20 ms. Flags `0x02`/`0x03` may carry 0-byte payload.
    Flush is in-band — `clear_uplink_buffer`/`flush_audio_out` map to flag `0x02`, no control/media race.
+
+3. **Resource bounds (round 14, CODING_HAZARDS rule 7):**
+   - **Pair TTL** — a `media_token` expires ~5 s after issue if no peer
+     completes `media.auth`; a half-connected pair (one peer authed,
+     the other never arrives) is torn down on the same timer. No
+     socket may outlive its `lease_id`.
+   - **Bounded queues** — the MediaRouter keeps a bounded ring per
+     direction (≈500 frames = 10 s); overflow drops oldest and counts
+     `media.dropped` — an agent that floods faster than realtime is
+     rate-limited by drop+telemetry, not by memory growth. The router
+     never buffers unboundedly between mismatched-rate peers.
 
 ## Decisions (developer, 2026-11-12)
 

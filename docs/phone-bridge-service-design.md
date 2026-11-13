@@ -51,7 +51,8 @@ referenced sections.
 | round 10 | Accept window default 30 s, ALL timeouts admin-configurable; per-line inbound fallback policy set; idle_revoke = alert-only via escalation channels; exclusive binding = claim + moderator approval; admin = private MCP server; `line.revoke` admin-only | §5.3, §4.2, §10 |
 | round 11 (architecture review hardening) | Unified ID taxonomy (`lease_id` is the only call id); `call.dial`/`call.accept` return `media_endpoint`+`media_token`; `call.accept` takes only `{session_id, call_token}`; `receive_inbound` keeps line `FREE` until a physical ring; `line_id:"default"` input-only alias; `RedactedString` PII masking; ADR-01 FallbackWorker owns complex fallbacks; ADR-02 binary 20 ms media framing with in-band flush; ADR-03 BDADDR binding + mandatory `/var/lib/bluetooth` + `/var/lib/phonebridge` volumes; WAN media reclassified to prod gate | §2.1, §3.3, §4.1, §5.3, §5.5, §6.2, §12 |
 | round 12 (live probes + unified agent model, 2026-11-13) | Live-verified on the real stack: `VoiceCall.Answer` works (incoming→`active` ~0.3 s, SCO ~0.6 s), inbound `Hangup` rejects a ringing call, full E.164 terminates via `Dial` unchanged, `SendTones` is broken on this stack (fallback = in-band DTMF in uplink), WirePlumber auto-routes SCO to the default sink+monitor (echo loop; service must own routing via per-line virtual endpoints + static `node.autoconnect=false` on bluez5 HFP nodes). Architecture: UNIFIED AGENT MODEL — every BT dongle sits behind a dumb `hci-agent` (libusb, btusb detached) feeding a kernel `vhci` adapter inside the container over a pluggable `transport_profile` tunnel (control-TCP + media-UDP; QUIC is a V2 track); container is isolated-netns, sees only virtual adapters; thin-slice per-line worker bundles + shared bluetoothd/PipeWire; `call.dial` requires `number` (strict E.164) + `country` (ISO alpha-2) with phonenumbers cross-validation and a per-line number-type allowlist; agent surface reachable via MCP adapter | §2.1, §2.2, §5.5, §6.4, §9, §10, §12, docs/hci-agent.md |
-| round 13 (vhci experiment — protocol hardening, 2026-11-13) | One-dongle end-to-end experiment PASSED (issue #29): dongle → hci-agent → control-TCP/media-UDP → `/dev/vhci` → bluetoothd/oFono → live call with bidirectional SCO. Silent-audio incident diagnosed and fixed live — media frames outran the sync-connection event across the split channels, and raw USB isoc buffers are not HCI-frame-aligned. Locked invariants: control channel is strictly lossless + `ctrl_seq` sequenced (gap/overflow = fatal session reset); agent reassembles complete HCI SCO packets at the isoc boundary (`media_seq`, one packet per datagram); feeder gates SCO on `0x2c`/`0x03` events, closes before `0x05`, caps unknown-handle holds at ≤4 frames; loud media health events `SCO_UNEXPECTED_HANDLE`/`SCO_RX_STARVATION`/`SCO_FRAMING_ERROR` | docs/hci-agent.md §2 |
+| round 13 (vhci experiment — protocol hardening, 2026-11-13) | One-dongle end-to-end experiment PASSED (issue #29): dongle → hci-agent → control-TCP/media-UDP → `/dev/vhci` → bluetoothd/oFono → live call with bidirectional SCO. Silent-audio incident diagnosed and fixed live — media frames outrun the sync-connection event across the split channels, and raw USB isoc buffers are not HCI-frame-aligned. Locked invariants: control channel is strictly lossless + `ctrl_seq` sequenced (gap/overflow = fatal session reset); agent reassembles complete HCI SCO packets at the isoc boundary (`media_seq`, one packet per datagram); feeder gates SCO on `0x2c`/`0x03` events, closes before `0x05`, caps unknown-handle holds at ≤4 frames; loud media health events `SCO_UNEXPECTED_HANDLE`/`SCO_RX_STARVATION`/`SCO_FRAMING_ERROR` | docs/hci-agent.md §2 |
+| round 14 (architect review — edge cases, 2026-11-13) | Second review pass (issue #31): `line.dial`/`line.answer` now carry per-lease `{media_endpoint, media_token}` for the provider's `media.auth`; `call.acquire` restricted to `dial_out` only (inbound via `call.accept`, exclusive via `call.claim_exclusive`); `provider.call_state` uses the canonical state set `ringing\|dialing\|alerting\|active\|disconnected` + `lease_id?`; new `provider.audio_ready` notification feeds `event.audio_ready`; MediaRouter gains pair TTL (~5 s) and bounded frame queues; `fallback_call_token` mechanics defined for FallbackWorker on `accept_window_sec` expiry; `adapter_mac` added to `LineProviderConfig` | §2.2, §5.3, §5.5, docs/api-contract.md |
 
 ## §1. Service boundary
 
@@ -156,6 +157,7 @@ entire identity is its config:
 interface LineProviderConfig {
   manager_endpoint: string;   // wss://127.0.0.1:7001/provider | wss://<wan>:7001/provider
   line_id: string;
+  adapter_mac: string;        // BDADDR binding (ADR-03) — identity, never hciN
   token: string;              // per-line, provisioned out-of-band via admin
   caps: Intent[];             // which intents the line can serve
   profile?: string;           // config preset, see §4.4
@@ -347,7 +349,7 @@ back**.
 | | **LineAssignment** | **CallLease** |
 |---|---|---|
 | Nature | durable, `agent_id`-bound | ephemeral, socket/heartbeat-bound |
-| Lifetime | survives agent sleep/disconnect | only during RINGING/DIALING/ACTIVE |
+| Lifetime | survives agent sleep/disconnect | only during ringing/dialing/active |
 | Ends by | release / `line.revoke` / idle escalation | hangup, release, dead-man switch, orphan grace |
 
 LineAssignment fields: `owner_agent_id`, `mode
@@ -411,7 +413,7 @@ Profiles are **config presets** over primitive policies
 
 ### §5.2 Inbound: wake-and-grant
 
-1. Phone rings -> provider reports `provider.call_state{RINGING}` ->
+1. Phone rings -> provider reports `provider.call_state{ringing}` ->
    gateway marks the line `RINGING_LOCKED` (outbound `call.acquire`
    on it fails `LINE_BUSY_INCOMING`; an inbound intent on a secretary
    profile preempts the outbound queue).
@@ -453,6 +455,15 @@ HTTP, WAV files, or call bridging:
 - `answer_and_announce` - answer and play an announcement (only if
   the line has an agent registered for inbound; params via admin).
 
+**Fallback token mechanics (round 14):** when `accept_window_sec`
+expires on a worker-policy line, the original `call_token` is already
+stale and an exclusive-owner check would reject the worker's
+`call.accept` with `OWNER_MISMATCH`. LineManager therefore re-issues
+the ring internally as a `fallback_call_token` bound to
+`agent_id: "system:fallback_worker"` (bypasses the owner check,
+remains single-use and TTL-bound) and delivers `event.incoming_call`
+/ `event.fallback_triggered` to the FallbackWorker session only.
+
 ### §5.4 Lease teardown and orphan handling
 
 - Dead-man switch: a dead/disconnected agent loses its CallLease and
@@ -468,6 +479,10 @@ media/ringback is audible. `audio_ready` is the "you may speak"
 gate: the first uplink word sent before it can be truncated by
 Bluetooth SCO bring-up lag. It signals ONLY that the local SCO path
 is up - it does NOT mean the remote party answered (round 11).
+The gateway derives `event.audio_ready` from the provider's one-shot
+`provider.audio_ready {line_id, assignment_id, lease_id}`
+notification (round 14) - the provider reports when its local BT SCO
+path is actually up.
 `call_state_changed{state:"active"}` is the remote-answer signal.
 Agent rule: start the greeting only when `state == "active"` AND
 `audio_ready` was received. `clear_uplink_buffer` /

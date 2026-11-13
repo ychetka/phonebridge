@@ -188,16 +188,19 @@ class CallPhase(str, Enum):
 class ProviderCallState(str, Enum):
     """Bounded provider-reported call state (wire: provider.call_state).
 
-    Intentionally coarser than CallPhase: it is the fixed vocabulary a
-    LineProvider may report on the ingress edge; mapping to CallPhase
-    (including the provisional-ACTIVE answer-confidence question) is
-    LineManager business, not provider business.
+    Canonical oFono vocabulary (round 14 amendment): the provider
+    reports what the line actually reports so the gateway can emit
+    ``event.call_state_changed`` faithfully - a coarser vocabulary
+    loses ``dialing``/``alerting`` and breaks early-media gating.
+    Mapping to CallPhase (including the provisional-ACTIVE
+    answer-confidence question) remains LineManager business.
     """
 
-    RINGING = "RINGING"
-    ANSWERED = "ANSWERED"
-    ENDED = "ENDED"
-    FAILED = "FAILED"
+    RINGING = "ringing"
+    DIALING = "dialing"
+    ALERTING = "alerting"
+    ACTIVE = "active"
+    DISCONNECTED = "disconnected"
 
 
 class AssignmentMode(str, Enum):
@@ -764,11 +767,16 @@ class ProviderLiveness(ContractModel):
 
 
 class ProviderCallStateUpdate(ContractModel):
-    """provider.call_state ingress fact (bounded ProviderCallState)."""
+    """provider.call_state ingress fact (bounded ProviderCallState).
+
+    ``call_token`` identifies the inbound ring; ``lease_id`` (round 14)
+    identifies an established call - without it the gateway cannot
+    attribute an update to a lease."""
 
     line_id: LineId
     assignment_id: AssignmentId
     call_token: CallToken | None = None
+    lease_id: LeaseId | None = None
     state: ProviderCallState
     reason: str | None = None
     observed_at: AwareDatetime
@@ -858,6 +866,10 @@ class LineManager(ABC):
     ) -> AcquireResult:
         """call.acquire: immediate grant, clean refusal, or FIFO ticket.
 
+        ``intent`` is restricted to ``Intent.DIAL_OUT`` (round 14):
+        inbound rings are consumed atomically by ``accept(call_token)``
+        and durable exclusive ownership goes through
+        ``claim_exclusive`` - anything else is INVALID_INTENT.
         INVALID_INTENT when the intent is not in the line's caps;
         LINE_EXCLUSIVE_NOT_OWNER (+ ErrorData.free_lines) on exclusive
         conflict; LINE_BUSY_INCOMING on a RINGING_LOCKED line. A busy
@@ -963,7 +975,8 @@ class LineManager(ABC):
     async def ingest_call_state(self, update: ProviderCallStateUpdate) -> None:
         """Call-state ingress: bounded ProviderCallState update mapped
         into lease phase transitions. Stale/out-of-order updates are
-        deduped by observed_at; ENDED triggers lease teardown (§5.4)."""
+        deduped by observed_at; DISCONNECTED triggers lease teardown
+        (§5.4)."""
         ...
 
     @abstractmethod
