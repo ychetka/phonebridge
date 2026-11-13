@@ -24,6 +24,7 @@ from phonebridge.domain.contract import (
     AnswerAndAnnounceFallback,
     AssignmentMode,
     AssignmentRevokedEvent,
+    AudioReadyEvent,
     CallLease,
     CallPhase,
     CallStateChangedEvent,
@@ -35,6 +36,7 @@ from phonebridge.domain.contract import (
     EventEnvelope,
     EventName,
     FallbackDecision,
+    FallbackTriggeredEvent,
     ForwardViaLineFallback,
     IncomingCallEvent,
     IncomingRingIngress,
@@ -44,9 +46,11 @@ from phonebridge.domain.contract import (
     LineId,
     LineManager,
     LineState,
+    LineStateChangedEvent,
     LineSummary,
     LivenessState,
     MediaToken,
+    MissedCallEvent,
     NoPickupFallback,
     PhonebridgeError,
     ProviderCallState,
@@ -55,6 +59,7 @@ from phonebridge.domain.contract import (
     ProviderRegistration,
     QueueReadyEvent,
     QueueTicket,
+    QueueUpdatedEvent,
     RecordAndTelegramFallback,
     RedactedString,
     RejectFallback,
@@ -393,6 +398,10 @@ def test_fallback_policy_union_and_assignment_default() -> None:
 
     # Default is no_pickup (carrier voicemail).
     assert _assignment().fallback_policy.policy == "no_pickup"
+    # Round-15 allowlist default must include the NANP composite type
+    # or ordinary US/CA mobiles are rejected as UNSUPPORTED_NUMBER_TYPE.
+    assert "FIXED_LINE_OR_MOBILE" in _assignment().allowed_number_types
+    assert {"FIXED_LINE", "MOBILE", "VOIP", "TOLL_FREE"} <= _assignment().allowed_number_types
 
 
 def test_event_envelope_and_payloads() -> None:
@@ -416,16 +425,36 @@ def test_event_envelope_and_payloads() -> None:
     )
     qr = QueueReadyEvent(
         ticket_id=TicketId("t-1"),
+        session_id=SessionId("s-1"),
         lease_id=LeaseId("l-1"),
         line_id=LineId("line-main"),
+        intent=Intent.DIAL_OUT,
         expires_at=NOW_UTC,
+    )
+    qu = QueueUpdatedEvent(
+        session_id=SessionId("s-1"),
+        ticket_id=TicketId("t-1"),
+        position=2,
     )
     ar = AssignmentRevokedEvent(
         assignment_id=contract.AssignmentId("asg-1"),
         line_id=LineId("line-main"),
         owner_agent_id="agent-1",
     )
-    for ev in (csc, qr, ar):
+    are = AudioReadyEvent(lease_id=LeaseId("l-1"), line_id=LineId("line-main"))
+    ft = FallbackTriggeredEvent(
+        line_id=LineId("line-main"),
+        call_token=CallToken("fb-tok"),
+        caller=RedactedString(_RAW_NUMBER),
+        policy=NoPickupFallback(),
+    )
+    lsc = LineStateChangedEvent(
+        line_id=LineId("line-main"),
+        old_state=LineState.FREE,
+        new_state=LineState.BUSY,
+    )
+    mc = MissedCallEvent(line_id=LineId("line-main"), reason="accept_window_expired")
+    for ev in (csc, qr, qu, ar, are, ft, lsc, mc):
         assert ev.model_dump_json()
 
 
@@ -658,6 +687,11 @@ async def test_line_manager_async_surface() -> None:
     )
     decision = await mgr.decide_fallback(LineId("line-main"), CallToken("tok-3"))
     assert isinstance(decision, FallbackDecision)
+    assert decision.fallback_call_token is None  # worker tokens only on WORKER policies
+    await mgr.ingest_audio_ready(
+        LineId("line-main"), contract.AssignmentId("asg-1"), result.lease_id
+    )
+    await mgr.drop_session(session)
 
     # --- lifecycle hook ---
     await mgr.tick(NOW_UTC)
