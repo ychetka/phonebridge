@@ -233,7 +233,9 @@ Both agents and line providers attach to a server-issued
 `media_endpoint` (`unix:///run/phonebridge/media.sock` local or
 `wss://gw:7003/media` remote) and a per-lease `media_token`, returned
 by `call.dial` / `call.accept` (agent) or `line.dial` / `line.answer`
-(provider, round 14).
+(provider, round 14). Both endpoint schemes carry the WebSocket
+protocol — `unix://` means a WS handshake over AF_UNIX,
+`wss://` over TCP/TLS; the frames below are identical on either.
 
 The local endpoint is **WebSocket over the Unix socket**, not a raw
 `SOCK_STREAM` (round 18): a bare UDS byte stream has no message

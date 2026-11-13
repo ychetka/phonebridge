@@ -104,7 +104,12 @@ one datagram per media frame. Kinds:
 - `0x03` SCO — one **complete HCI SCO packet** per datagram
   (`2 B handle/flags · 1 B payload_len · payload`).
 - `0x04` MEDIA_PING — empty payload endpoint-binding/keepalive frame
-  (round 18, see below).
+  (round 18, see below). It consumes the shared `media_seq` counter
+  like any other datagram so the feeder's gap telemetry reflects the
+  real transport, not phantom gaps around pings. The media `kind`
+  namespace is the outer datagram discriminator and is disjoint from
+  the H4 type byte carried *inside* an SCO payload — numeric overlap
+  (e.g. `0x04`) is coincidence, not ambiguity.
 
 **Uplink endpoint binding (round 18).** UDP is connectionless: the
 feeder learns the agent's source `(IP, port)` only from received
