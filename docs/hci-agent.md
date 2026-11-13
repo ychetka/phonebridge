@@ -98,9 +98,32 @@ live in the vhci experiment. Therefore:
 
 ### Media channel — UDP
 
-`uint8 kind=0x03 (SCO) · uint16 BE media_seq · uint32 BE ts_ms ·
-SCO payload` — one **complete HCI SCO packet** per datagram
-(`2 B handle/flags · 1 B payload_len · payload`). Stale frames MAY be
+`uint8 kind · uint16 BE media_seq · uint32 BE ts_ms · payload` —
+one datagram per media frame. Kinds:
+
+- `0x03` SCO — one **complete HCI SCO packet** per datagram
+  (`2 B handle/flags · 1 B payload_len · payload`).
+- `0x04` MEDIA_PING — empty payload endpoint-binding/keepalive frame
+  (round 18, see below). It consumes the shared `media_seq` counter
+  like any other datagram so the feeder's gap telemetry reflects the
+  real transport, not phantom gaps around pings. The media `kind`
+  namespace is the outer datagram discriminator and is disjoint from
+  the H4 type byte carried *inside* an SCO payload — numeric overlap
+  (e.g. `0x04`) is coincidence, not ambiguity.
+
+**Uplink endpoint binding (round 18).** UDP is connectionless: the
+feeder learns the agent's source `(IP, port)` only from received
+datagrams. Until the first packet arrives — or after a NAT/firewall
+mapping expires between calls — the container has no return path for
+uplink audio. The agent therefore MUST send a `MEDIA_PING` frame
+immediately after `HELLO_ACK` and then every ~15 s while the session
+is up; the feeder binds its uplink destination to the last
+authenticated source address of the session's media port. A
+`MEDIA_PING` from an address that fails the tunnel peer check
+(WireGuard `/32` source or mTLS-bound identity) is ignored and
+counted as `SCO_UNEXPECTED_HANDLE`-class telemetry.
+
+Stale frames MAY be
 dropped; late audio is worse than missing audio (isochronous semantics
 preserved on purpose — this is why media is not TCP: head-of-line
 blocking would stall real-time audio). `media_seq` wraps at 2^16 and
@@ -269,6 +292,12 @@ every failure source, because a virtual adapter never wedges the kernel.
 - Bootstrap tokens are single-use enrollment credentials; after
   `HELLO_ACK` the tunnel credential (WG peer key or mTLS cert) is the
   line identity.
+- WireGuard peer isolation (round 18): the container-side server
+  config MUST pin each peer to `AllowedIPs = <peer>/32` and MUST NOT
+  forward between peers — a compromised agent host must not be able
+  to inject UDP into a sibling line's media port. The `allowed_ips`
+  in the agent-side example above is the agent's route scope; the
+  server's per-peer `/32` is the isolation boundary.
 - PII hygiene: the agent must not log dialed numbers, caller IDs, or
   HCI payloads containing them (`mask_pii` default on).
 - The agent binds to loopback/WAN only via the tunnel profile; it does

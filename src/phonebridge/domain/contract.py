@@ -406,6 +406,8 @@ def _mask_for_log(value: Any) -> Any:
         return {k: _mask_for_log(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_mask_for_log(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return [_mask_for_log(v) for v in sorted(value, key=str)]
     return value
 
 

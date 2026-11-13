@@ -192,6 +192,30 @@ def test_redacted_string_contract(_gwt: object) -> None:
     assert _RAW_NUMBER not in repr(log_dict)
 
 
+def test_mask_for_log_set_and_frozenset() -> None:
+    """Round-18 hardening: set/frozenset containers of RedactedString
+    must be masked recursively (a future ``set[RedactedString]`` field
+    must not leak raw values through safe_dump), and the dump is a
+    deterministic sorted list."""
+    values = {
+        "tags": {RedactedString("bbb-secret-2"), RedactedString("aaa-secret-1")},
+        "frozen": frozenset({RedactedString("ccc-secret-3")}),
+    }
+    masked = contract._mask_for_log(values)
+    for container in (masked["tags"], masked["frozen"]):
+        assert isinstance(container, list)
+        assert all(isinstance(v, str) for v in container)
+    assert "aaa-secret-1" not in repr(masked)
+    assert "ccc-secret-3" not in repr(masked)
+    # Deterministic ordering for reproducible logs.
+    assert masked["tags"] == sorted(masked["tags"])
+
+    # Existing frozenset field (allowed_number_types) dumps as a
+    # sorted list, never a raw frozenset repr.
+    dumped = _assignment().safe_dump()
+    assert isinstance(dumped["allowed_number_types"], list)
+
+
 @pytest.mark.parametrize("_gwt", [pytest.param(None, id="ITEM-03.GWT-2")])
 def test_validation_error_hides_pii_input(_gwt: object) -> None:
     """hide_input_in_errors: a rejected payload must not echo the raw
