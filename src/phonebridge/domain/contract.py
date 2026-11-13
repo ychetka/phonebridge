@@ -737,12 +737,14 @@ class IncomingCallEvent(ContractModel):
 class CallStateChangedEvent(ContractModel):
     """call_state_changed payload. ``phase`` is the domain CallPhase;
     the wire spelling "disconnected" maps to ENDED at the adapter
-    boundary."""
+    boundary. ``answer_confidence`` mirrors CallLease's hedge: how
+    sure the bridge is that ACTIVE means a human answered (§5.5)."""
 
     lease_id: LeaseId
     line_id: LineId
     phase: CallPhase
     reason: str | None = None
+    answer_confidence: AnswerConfidence | None = None
 
 
 class QueueReadyEvent(ContractModel):

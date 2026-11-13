@@ -412,6 +412,7 @@ def test_event_envelope_and_payloads() -> None:
         line_id=LineId("line-main"),
         phase=CallPhase.ACTIVE,
         reason="provider active",
+        answer_confidence="provisional",
     )
     qr = QueueReadyEvent(
         ticket_id=TicketId("t-1"),

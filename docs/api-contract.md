@@ -173,7 +173,7 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `event.fallback_triggered` | `{line_id, call_token, caller_id?, policy}` — delivered to the `system:fallback_worker` session only, when `accept_window_sec` expires on a WORKER-policy line; `call_token` is the internal `fallback_call_token` (round 14) |
 | `event.line_state_changed` | `{line_id, old_state, new_state, reason?}` |
 | `event.audio_ready` | `{lease_id, line_id}` — BT SCO path is up: early media (ringback) audible, uplink accepted without first-word clipping |
-| `event.call_state_changed` | `{lease_id, line_id, state, reason}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected` (the provider's `ringing` maps to `event.incoming_call`, not to a lease event); agent may start its greeting only on `state == "active"` AND `audio_ready` received |
+| `event.call_state_changed` | `{lease_id, line_id, state, reason?, answer_confidence?}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected` (the provider's `ringing` maps to `event.incoming_call`, not to a lease event); `answer_confidence`: `"provisional"` \| `"confirmed"` — how sure the bridge is that `active` means a human answered (oFono `State=active` observed firing on remote answer, but the guarantee is provisional — design §5.5); agent may start its greeting only on `state == "active"` AND `audio_ready` received |
 
 ## Queue semantics (mandatory FIFO)
 
