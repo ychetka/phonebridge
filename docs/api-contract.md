@@ -113,7 +113,7 @@ become `Dial` on the bus:
 { reason: "INVALID_FORMAT_NOT_E164"
        | "UNKNOWN_COUNTRY_CODE"      // country input is not ISO alpha-2
        | "COUNTRY_MISMATCH"          // valid E.164, not valid for declared region
-       | "INVALID_NUMBER_FOR_REGION" // parses, but not a valid subscriber number
+       | "INVALID_NUMBER"            // parses, but not a valid subscriber number
        | "UNSUPPORTED_NUMBER_TYPE"   // type not in the line's allowlist
        | "LINE_POLICY_REJECT" }      // other per-line policy
 ```

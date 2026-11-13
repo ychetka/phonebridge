@@ -31,10 +31,13 @@ The agent is deliberately *dumb* — it owns hardware and moves frames:
   the agent host at all (zero interference with a host `bluetoothd`,
   which may keep serving the host's own devices). Base implementation:
   the USB transport of Google Bumble.
-- **HCI relay** — forwards raw HCI H4 frames between the dongle and the
+- **HCI relay** — forwards HCI frames between the dongle and the
   container: commands/ACL/events on the **control channel** (TCP), SCO
-  audio on the **media channel** (UDP). The agent performs no protocol
-  interpretation beyond H4 packet framing.
+  audio on the **media channel** (UDP). USB carries each class on its
+  own endpoint (control EP = commands, interrupt EP = events, bulk EP =
+  ACL, isochronous EP = SCO), so the agent tags each frame with the H4
+  type byte implied by its endpoint — no protocol interpretation
+  beyond that mapping.
 - **Liveness** — heartbeat over the control channel; probes the health
   of its own USB/HCI path and reports `DONGLE_DEAD` explicitly.
 - **Local reset** — on command (and/or by policy), power-cycles the
@@ -55,8 +58,8 @@ Length-prefixed frames: `uint8 kind · uint16 BE len · payload`.
 
 | kind | direction | payload |
 |---|---|---|
-| `0x01` HCI_PASSTHRU | both | raw H4 packet (incl. its own type byte: `0x01` cmd / `0x02` ACL / `0x04` evt) |
-| `0x10` HELLO | agent→ | `{line_id, agent_version, dongle:{adapter_mac, usb_path}, caps}` |
+| `0x01` HCI_PASSTHRU | both | HCI packet prefixed with its H4 type byte (`0x01` cmd / `0x02` ACL / `0x04` evt); the byte is synthesized from the USB endpoint class |
+| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the single-use enrollment credential from `agent_token_file`, sent inside the authenticated tunnel only |
 | `0x11` HELLO_ACK | container→ | `{accepted, line_id, heartbeat_interval_ms, server_time}` or reject+close |
 | `0x12` HEARTBEAT | agent→ | `{seq, usb_ok, hci_ok}` every `heartbeat_interval_ms` |
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
@@ -76,7 +79,10 @@ purpose — this is why media is not TCP).
 ### H4 type split
 
 `0x01` command, `0x02` ACL, `0x04` event → control-TCP.
-`0x03` SCO → media-UDP. The agent tags by the H4 type byte only.
+`0x03` SCO → media-UDP. On the USB side the class is implied by the
+endpoint (no literal H4 byte exists on USB); the agent adds/strips it
+when translating to the wire framing, and the container's `vhci`
+adapter consumes the same typed frames.
 
 ## §3. Tunnel profiles (`transport_profile`)
 
@@ -121,7 +127,8 @@ dongle:
   reset:
     on_start: false
     on_watchdog: true                # power-cycle on DONGLE_DEAD
-    command: "uhubctl -l 1-1 -p 2 -a cycle"   # host-specific, optional
+    command: "uhubctl -l 1-1 -p 4 -a cycle"   # host-specific, optional
+                                             # (port 4 of hub 1-1 = usb_path 1-1.4)
 
 transport:
   profile: "wireguard"             # see §3 — admin chooses WHICH;
@@ -139,9 +146,11 @@ transport:
   #   cert_file: /etc/phonebridge-agent/agent.pem
   #   key_file: /etc/phonebridge-agent/agent.key
 
-channels:                          # issued at onboarding; canonical
-  control: { proto: tcp, port: 7300 }
-  media:   { proto: udp, port: 7301 }
+channels:                          # container-side endpoint pair for
+  control: { proto: tcp, port: 7300 }   # THIS line, issued at
+  media:   { proto: udp, port: 7301 }   # onboarding — canonical
+                                      # allocation: one pair per line
+                                      # (7300/7301 shown for line 1)
 
 heartbeat:
   interval_ms: 2000                # canonical default

@@ -112,8 +112,10 @@ Production deployment is a **single Docker container**
   `--device` model): every adapter inside the container is a kernel
   `vhci` device fed by an `hci-agent` on the dongle's machine — see
   §2.2 and `docs/hci-agent.md`. The container runs in an isolated
-  network namespace; the only externally-reachable port is the
-  per-line tunnel listener.
+  network namespace; its declared external exposure is exactly the
+  listeners it serves: the agent-facing API surface (UDS/WSS + media,
+  §2.3) and one control-TCP + media-UDP tunnel endpoint per remote
+  line (the hci-agent dials in - §2.2, `docs/hci-agent.md`).
 
 Motive is host isolation: the host system can be wiped and
 reinstalled and the telephony stack survives entirely inside the
@@ -211,7 +213,7 @@ registration" model:
 | Transport | One: JSON-RPC 2.0 bidirectional + packetized media. Local peers use UDS (bind-mounted out of the container); remote peers use WSS |
 | Namespaces | Two: `provider.*`/`line.*` vs `agent.*`/`call.*`/`event.*`, with **separate token scopes** - a provider token never grants agent methods and vice versa |
 | Intent vs assignment | Intent is a declarative wish; LineAssignment is the durable truth; conflicts are explicit errors; admin assign remains as override |
-| Media hardening | Jitter buffer + audio watchdog exist ONLY on the WAN leg |
+| Media hardening | Jitter buffer + audio watchdog exist ONLY on the hostile-link legs: the hci-agent tunnel media-UDP leg (§6.3) and - if ever used - a WAN agent media socket |
 | Deployment | One container, several processes; the local provider is a separate process, NOT a separate container |
 
 ### §2.4 Multi-dongle / multi-phone first-class
@@ -249,7 +251,9 @@ type LineSummary = { line_id: string, caps: Intent[], state: LineState, profile?
 
 Error codes (contract-level): `OWNER_MISMATCH`,
 `LINE_EXCLUSIVE_NOT_OWNER`, `LINE_BUSY_INCOMING`, `LINE_NOT_FOUND`,
-`INVALID_INTENT`, `STALE_TOKEN`, `PROVIDER_UNREACHABLE`.
+`INVALID_INTENT`, `STALE_TOKEN`, `PROVIDER_UNREACHABLE`,
+`DIAL_REJECTED` (typed `data.reason` - see Dial validation in
+`docs/api-contract.md`).
 
 `NO_FREE_LINE` was REMOVED as an error (round 9): a busy pool is a
 normal result, not an exception.
@@ -261,7 +265,7 @@ normal result, not an exception.
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` -> `{session_id}`; declarative wish resolved by the intent-resolver into a LineAssignment (§4) |
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` -> `{granted:true, line_id, lease_id}` or `{granted:false, free_lines[]}`; `free_lines:[]` = nothing available - routine result, the client retries itself. Optional `enqueue` joins the FIFO queue (§3.4) |
 | `call.release` | release a lease; `OWNER_MISMATCH` on foreign lease |
-| `call.dial` | `{session_id, lease_id, number}` -> `{lease_id, media_endpoint, media_token}` |
+| `call.dial` | `{session_id, lease_id, number, country}` -> `{lease_id, media_endpoint, media_token}`; strict E.164 + ISO alpha-2 cross-check BEFORE the line (round 12) - `DIAL_REJECTED` with a typed `data.reason`, otherwise the validated E.164 passes to `line.dial` unchanged |
 | `call.accept` | `{session_id, call_token}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired, `LINE_BUSY_INCOMING`/`OWNER_MISMATCH` as applicable |
 | `call.hangup` / `call.send_dtmf` / `call.get_lines` | call control and line listing |
 
@@ -394,9 +398,11 @@ Profiles are **config presets** over primitive policies
    (`{granted:true, line_id, lease_id}`), refused cleanly
    (`{granted:false, free_lines[]}`), or queued
    (`{queued:true, ticket_id, position}` + `queue_updated` events).
-2. `call.dial{lease_id, number}` -> gateway issues
-   `line.dial{assignment_id, lease_id, number}` to the owning
-   provider (local or remote - identical path).
+2. `call.dial{lease_id, number, country}` -> gateway validates the
+   pair (`DIAL_REJECTED` on failure, never reaches the line) and
+   issues `line.dial{assignment_id, lease_id, number}` with the
+   validated E.164 to the owning provider (identical path for every
+   line - remoteness lives below, in the hci-agent transport).
 3. Call reaches `alerting` -> implicit media attach (§5.5) ->
    `audio_ready`.
 4. Duplex media flows (§6); `call.send_dtmf` for IVR navigation.
@@ -523,8 +529,12 @@ local optimization", and the intermediate `pipewire_local` variant.)
   for audio streaming) vs framed PCM on the dedicated socket.
   WSS+raw PCM ships first; Opus/WebRTC is the upgrade path if real
   links glitch.
-- **WAN-only** leg hardening: jitter buffer ~60-120 ms + audio
-  watchdog. Local leg needs neither (loopback).
+- **Hostile-link** leg hardening (round 12 rescope): the WAN leg is
+  the hci-agent tunnel's media-UDP channel - stale SCO frames are
+  dropped by design, so the jitter buffer (~60-120 ms) + audio
+  watchdog live at the container-side media-UDP ingress (vhci-feeder),
+  NOT on the agent↔gateway socket. The local loopback leg needs
+  neither.
 - Latency budget: bridge must add < 100 ms node<->socket; verified
   by a loopback test in CI.
 
@@ -640,7 +650,7 @@ status (mirrors the busctl commands used in Phase-0).
   thresholds, orphan grace.
 - **Escalation channels** (round 10c): admin-configured (e.g.
   Telegram) for idle/broken-line alerts; `idle_revoke_after` fires
-  alerts only - see open question §12.3.
+  alerts only - resolved question `idle_revoke` (§12).
 - **Per-line dial policy** (round 12): `allowed_number_types`
   defaults to `{FIXED_LINE, MOBILE, VOIP, TOLL_FREE}`; an admin may
   additionally enable `{PREMIUM_RATE, SHARED_COST, PAGER,
