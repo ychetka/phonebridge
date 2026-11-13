@@ -4,21 +4,43 @@ build-backend = "hatchling.build"
 
 [project]
 name = "phonebridge"
-version = "0.0.2"
+version = "0.0.4"
 description = "Standalone Bluetooth telephony bridge service (oFono/PipeWire over D-Bus) with a JSON-RPC + PCM agent API"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "pydantic>=2.9,<3",
+    "websockets>=14",
+]
 
 [project.optional-dependencies]
 dev = [
+    "mypy>=2.4.1,<3",
     "pytest",
+    "pytest-asyncio>=0.24,<1.5",
     "pytest-timeout",
+    "ruff==0.17.3",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/phonebridge"]
 
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+
+# Future untyped third-party deps from the provider milestone
+# (D-Bus client libraries) - keep strict mode but tolerate their
+# missing type information until stubs land.
+[[tool.mypy.overrides]]
+module = [
+    "dbus_fast.*",
+    "dbus_next.*",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 markers = ["e2e: live tests requiring real Bluetooth/telephony hardware"]
 timeout = 60
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
