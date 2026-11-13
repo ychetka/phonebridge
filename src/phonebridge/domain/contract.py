@@ -96,6 +96,7 @@ __all__ = [
     "ProviderRegistration",
     "QueueReadyEvent",
     "QueueTicket",
+    "QueueUpdatedEvent",
     "RecordAndTelegramFallback",
     "RedactedString",
     "RejectFallback",
@@ -276,6 +277,7 @@ class EventName(str, Enum):
     INCOMING_CALL = "incoming_call"
     CALL_STATE_CHANGED = "call_state_changed"
     QUEUE_READY = "queue_ready"
+    QUEUE_UPDATED = "queue_updated"
     ASSIGNMENT_REVOKED = "assignment_revoked"
     AUDIO_READY = "audio_ready"
     FALLBACK_TRIGGERED = "fallback_triggered"
@@ -748,14 +750,29 @@ class CallStateChangedEvent(ContractModel):
 
 
 class QueueReadyEvent(ContractModel):
-    """queue_ready payload: grant for a queued ticket. The agent must
-    act (dial/release) within ``expires_at`` or the next ticket is
-    served (§3.4 grant TTL)."""
+    """queue_ready payload: grant for a queued ticket (wire:
+    ``event.line_acquired``). The agent must act (dial/release) within
+    ``expires_at`` or the next ticket is served (§3.4 grant TTL).
+    ``session_id`` and ``intent`` ride along so the transport adapter
+    needs no ticket→owner lookup to address the event (round 17)."""
 
     ticket_id: TicketId
+    session_id: SessionId
     lease_id: LeaseId
     line_id: LineId
+    intent: Intent
     expires_at: AwareDatetime
+
+
+class QueueUpdatedEvent(ContractModel):
+    """queue_updated payload (wire: ``event.queue_updated``): FIFO
+    position advance for a pending ticket - emitted on
+    cancel_acquire, drop_session, grant-TTL expiry in tick(), or a
+    line freeing up (round 17)."""
+
+    session_id: SessionId
+    ticket_id: TicketId
+    position: int = Field(ge=1)
 
 
 class AssignmentRevokedEvent(ContractModel):
