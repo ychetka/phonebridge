@@ -125,7 +125,7 @@ from these input rejections and from ordinary no-answer termination.
 
 | method | params | returns |
 |---|---|---|
-| `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` |
+| `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` — `media_endpoint` is the static socket address; the per-lease `media_token` arrives later inside `line.dial`/`line.answer` (round 14) |
 | `provider.reregister` | same as register | idempotent; preserves lease state during grace window |
 | `provider.ping` | `{line_id, assignment_id, state_snapshot?}` | `{ok, server_time}` — missed N pings → DEGRADED → DOWN |
 | `provider.capability_update` | `{line_id, assignment_id, caps, profile?}` | `{ok}` |
@@ -149,7 +149,7 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | method | params | returns / errors |
 |---|---|---|
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` | `{session_id}` |
-| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` | `{granted: true, line_id, lease_id}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — empty free_lines = nothing available, normal result not an error; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) |
+| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` | `{granted: true, line_id, lease_id}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — `intent` must be `dial_out` (round 14; other intents → `INVALID_INTENT`); empty free_lines = nothing available, normal result not an error; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) |
 | `call.cancel_acquire` | `{session_id, ticket_id}` | `{ok}` — withdraw a queued acquire |
 | `call.release` | `{session_id, lease_id}` | `{ok}` / `OWNER_MISMATCH` |
 | `call.dial` | `{session_id, lease_id, number, country}` | `{lease_id, media_endpoint, media_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE`, `DIAL_REJECTED` |
@@ -167,9 +167,10 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `event.line_acquired` | `{session_id, line_id, lease_id, intent}` — also the grant for a queued ticket; agent must act within grant TTL |
 | `event.queue_updated` | `{session_id, ticket_id, position}` |
 | `event.missed_call` | `{line_id, caller_id?, reason, voicemail_ref?}` |
+| `event.fallback_triggered` | `{line_id, call_token, caller_id?, policy}` — delivered to the `system:fallback_worker` session only, when `accept_window_sec` expires on a WORKER-policy line; `call_token` is the internal `fallback_call_token` (round 14) |
 | `event.line_state_changed` | `{line_id, old_state, new_state, reason?}` |
 | `event.audio_ready` | `{lease_id, line_id}` — BT SCO path is up: early media (ringback) audible, uplink accepted without first-word clipping |
-| `event.call_state_changed` | `{lease_id, line_id, state, reason}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected`; agent may start its greeting only on `state == "active"` AND `audio_ready` received |
+| `event.call_state_changed` | `{lease_id, line_id, state, reason}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected` (the provider's `ringing` maps to `event.incoming_call`, not to a lease event); agent may start its greeting only on `state == "active"` AND `audio_ready` received |
 
 ## Queue semantics (mandatory FIFO)
 

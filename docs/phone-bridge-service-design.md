@@ -349,7 +349,7 @@ back**.
 | | **LineAssignment** | **CallLease** |
 |---|---|---|
 | Nature | durable, `agent_id`-bound | ephemeral, socket/heartbeat-bound |
-| Lifetime | survives agent sleep/disconnect | only during RINGING/DIALING/ACTIVE |
+| Lifetime | survives agent sleep/disconnect | only during ringing/dialing/active |
 | Ends by | release / `line.revoke` / idle escalation | hangup, release, dead-man switch, orphan grace |
 
 LineAssignment fields: `owner_agent_id`, `mode
@@ -413,7 +413,7 @@ Profiles are **config presets** over primitive policies
 
 ### §5.2 Inbound: wake-and-grant
 
-1. Phone rings -> provider reports `provider.call_state{RINGING}` ->
+1. Phone rings -> provider reports `provider.call_state{ringing}` ->
    gateway marks the line `RINGING_LOCKED` (outbound `call.acquire`
    on it fails `LINE_BUSY_INCOMING`; an inbound intent on a secretary
    profile preempts the outbound queue).

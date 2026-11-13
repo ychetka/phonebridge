@@ -69,7 +69,7 @@
 
 <h2>INBOUND CALL — wake-and-grant</h2>
 <ol class="seq">
-  <li>Phone rings → provider reports RINGING → gateway marks the line <b>RINGING_LOCKED</b> (outbound acquire on it fails <code class="note">LINE_BUSY_INCOMING</code>).</li>
+  <li>Phone rings → provider reports <code>ringing</code> → gateway marks the line <b>RINGING_LOCKED</b> (outbound acquire on it fails <code class="note">LINE_BUSY_INCOMING</code>).</li>
   <li>Gateway consults LineAssignment: owner exists → wake owner via hooks (webhook/exec/file-drop); no owner → <code class="evt">event.incoming_call{line_id, call_token, caller_id?, expires_in_ms}</code> to live subscribers.</li>
   <li>First <code>call.accept(call_token)</code> is <b>atomic</b>: lease + answer + media attach. Non-owner accept on an owned line → <code class="note">OWNER_MISMATCH</code>; a second accept → <code class="note">STALE_TOKEN</code>.</li>
   <li><code class="evt">event.audio_ready</code> (from <code>provider.audio_ready</code>) + <code>state == "active"</code> → agent says "hello" (waiting for both avoids truncating the first word on Bluetooth lag).</li>
