@@ -1,6 +1,6 @@
 # phonebridge API contract (v0 draft)
 
-Status: design draft (consolidated with design rounds 1-12,
+Status: design draft (consolidated with design rounds 1-18,
 2026-11-13; see docs/phone-bridge-service-design.md decision log).
 Transport: **JSON-RPC 2.0 bidirectional over one connection per peer**.
 - Local peers: Unix-domain socket (bind-mounted out of the container).
@@ -234,6 +234,14 @@ Both agents and line providers attach to a server-issued
 `wss://gw:7003/media` remote) and a per-lease `media_token`, returned
 by `call.dial` / `call.accept` (agent) or `line.dial` / `line.answer`
 (provider, round 14).
+
+The local endpoint is **WebSocket over the Unix socket**, not a raw
+`SOCK_STREAM` (round 18): a bare UDS byte stream has no message
+boundaries, so an 8-byte `flush`/`keepalive` frame (`0x02`/`0x03`)
+would desynchronize a fixed-648-byte parser. WS-over-UDS preserves
+the TEXT/BINARY distinction and gives local and remote peers one
+identical framing code path (`websockets.unix_serve` —
+`websockets>=14` is already a dependency).
 
 1. **Auth handshake** — first frame is TEXT JSON:
    - client: `{"type":"media.auth","role":"agent"|"provider","lease_id":"...","media_token":"..."}`

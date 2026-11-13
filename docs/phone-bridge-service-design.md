@@ -750,9 +750,12 @@ status (mirrors the busctl commands used in Phase-0).
    fallback); the WirePlumber echo loop requires owned routing (§6.4).
 3. **vhci end-to-end feasibility** (NEW, round 12): does the full
    path `dongle → hci-agent → tunnel → vhci → live call with SCO
-   audio` hold, incl. the isochronous endpoint forwarding? This is
-   the gate for the unified agent model — must be proven by the
-   dedicated experiment before the model is locked.
+   audio` hold, incl. the isochronous endpoint forwarding? RESOLVED
+   2026-11-13 — the one-dongle experiment PASSED (issue #29, verdict
+   GO): live outgoing call to `active`, ~8k bidirectional SCO frames,
+   zero kernel unknown-handle errors after feeder gating. The four
+   protocol invariants it exposed are locked in
+   `docs/hci-agent.md` §2.
 
 ### Questions resolved by developer ruling 2026-11-12
 
