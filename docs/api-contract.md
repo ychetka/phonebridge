@@ -1,10 +1,16 @@
 # phonebridge API contract (v0 draft)
 
-Status: design draft (consolidated with design rounds 1-11,
-2026-11-12; see docs/phone-bridge-service-design.md decision log).
+Status: design draft (consolidated with design rounds 1-12,
+2026-11-13; see docs/phone-bridge-service-design.md decision log).
 Transport: **JSON-RPC 2.0 bidirectional over one connection per peer**.
 - Local peers: Unix-domain socket (bind-mounted out of the container).
 - Remote peers: **WSS** — providers/agents always dial *into* the gateway (NAT-safe).
+- The agent surface is also reachable through an **MCP transport
+  adapter** (round 12): the same `agent.*`/`call.*` namespaces and
+  the same token scopes, exposed as MCP tools for AI agents that
+  natively speak MCP (e.g. the developer's secretary agent). The
+  admin UI is just one consumer of the same API — nothing in the
+  contract is UI-specific.
 
 Two endpoint surfaces, one gateway daemon, shared in-process `LineManager` kernel:
 
@@ -65,9 +71,55 @@ type RedactedString = string;
 | `INVALID_INTENT` | intent not in line's caps |
 | `STALE_TOKEN` | call_token/lease expired or consumed |
 | `PROVIDER_UNREACHABLE` | line DEGRADED/DOWN |
+| `DIAL_REJECTED` | dial string failed pre-line validation — `data.reason` carries a typed sub-code (see Dial validation) |
 
 `NO_FREE_LINE` was REMOVED (round 9): a busy pool is a normal
 result, not an exception - see `call.acquire`.
+
+## Dial validation (round 12, issue #25)
+
+`call.dial` takes TWO number-related fields and validates them
+BEFORE the call can reach the line — malformed input must never
+become `Dial` on the bus:
+
+- `number` — STRICT E.164 only: `^\+[1-9]\d{6,14}$`, checked before
+  parsing. Local/national forms, missing `+`, bare-`+` hybrids
+  (e.g. `+77828221` — parses as calling code `+7`), spaces,
+  punctuation, extension markers → rejected.
+- `country` — MANDATORY ISO 3166-1 alpha-2 destination country.
+  It is a cross-check ASSERTION, never a fallback parse region and
+  never a source of prefixes: the system adds nothing to a number,
+  ever.
+- Validation (libphonenumber / `phonenumbers`): `parse(number, None)`
+  → `is_valid_number()` → `is_valid_number_for_region(parsed,
+  country)`. Region check uses `is_valid_number_for_region`, NOT
+  `region_code_for_number() == country` — shared calling codes
+  (NANP +1, +44 Crown Dependencies, +7) must not false-reject.
+- **Per-line number-type allowlist** (admin config):
+  default `{FIXED_LINE, MOBILE, VOIP, TOLL_FREE}`; an admin may
+  additionally enable `{PREMIUM_RATE, SHARED_COST, PAGER,
+  PERSONAL_NUMBER}`. Short codes / emergency numbers are NOT
+  representable in E.164 — always rejected on this path (a separate
+  explicitly-authorized pathway would be required if ever needed).
+- On success the validated E.164 string is passed to `line.dial`
+  UNCHANGED — verified live on the current stack (full E.164
+  terminates correctly; no national-format conversion is needed on
+  this line). Any future per-line dial-format serialization would be
+  an explicit declared adapter capability, never implicit mutation.
+
+`DIAL_REJECTED.data`:
+
+```ts
+{ reason: "INVALID_FORMAT_NOT_E164"
+       | "UNKNOWN_COUNTRY_CODE"      // country input is not ISO alpha-2
+       | "COUNTRY_MISMATCH"          // valid E.164, not valid for declared region
+       | "INVALID_NUMBER_FOR_REGION" // parses, but not a valid subscriber number
+       | "UNSUPPORTED_NUMBER_TYPE"   // type not in the line's allowlist
+       | "LINE_POLICY_REJECT" }      // other per-line policy
+```
+
+Provider/setup failures after a valid dial are a SEPARATE error class
+from these input rejections and from ordinary no-answer termination.
 
 ## Manager namespace — `provider.*` (Line → Manager)
 
@@ -83,7 +135,7 @@ result, not an exception - see `call.acquire`.
 
 | method | params | returns |
 |---|---|---|
-| `line.dial` | `{assignment_id, lease_id, number}` | `{accepted}` |
+| `line.dial` | `{assignment_id, lease_id, number}` | `{accepted}` — `number` is the already-validated E.164 string, passed through unchanged (see Dial validation) |
 | `line.answer` | `{assignment_id, lease_id, call_token}` | `{accepted}` |
 | `line.hangup` | `{assignment_id, lease_id}` | `{accepted}` |
 | `line.send_dtmf` | `{assignment_id, lease_id, digits}` | `{accepted}` |
@@ -99,7 +151,7 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` | `{granted: true, line_id, lease_id}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — empty free_lines = nothing available, normal result not an error; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) |
 | `call.cancel_acquire` | `{session_id, ticket_id}` | `{ok}` — withdraw a queued acquire |
 | `call.release` | `{session_id, lease_id}` | `{ok}` / `OWNER_MISMATCH` |
-| `call.dial` | `{session_id, lease_id, number}` | `{lease_id, media_endpoint, media_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE` |
+| `call.dial` | `{session_id, lease_id, number, country}` | `{lease_id, media_endpoint, media_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE`, `DIAL_REJECTED` |
 | `call.accept` | `{session_id, call_token}` | `{lease_id, line_id, media_endpoint, media_token}` / `STALE_TOKEN`, `LINE_BUSY_INCOMING`, `OWNER_MISMATCH` — atomic: issues the lease, answers the ring, attaches media |
 | `call.hangup` | `{session_id, lease_id}` | `{ok}` |
 | `call.send_dtmf` | `{session_id, lease_id, digits}` | `{ok}` |
@@ -157,6 +209,17 @@ interface LineProviderConfig {
 
 LocalLine and RemoteLine run identical logic end-to-end, including media: audio is ALWAYS packetized and sent over the dedicated media channel (loopback for LocalLine). No local PipeWire fast-path - one MediaSink implementation.
 
+**Unified agent model (round 12, 2026-11-13):** under the vhci-agent
+architecture EVERY line provider process runs inside the container —
+all adapters are kernel `vhci` devices fed by per-line `hci-agent`s
+on the dongle hosts (see `docs/hci-agent.md`). "Remote line" no
+longer means a provider running the BT stack remotely; remoteness
+lives one layer below, in the agent's `transport_profile` tunnel
+(control-TCP + media-UDP HCI relay). The `provider.*`/`line.*`
+contract above is unchanged — it now binds worker processes that are
+always container-local; a smart-remote LineProvider remains a
+documented alternative for links too hostile for HCI-over-IP.
+
 ## Binary media protocol (ADR-02, round 11)
 
 Both agents and line providers attach to a server-issued
@@ -194,7 +257,12 @@ Both agents and line providers attach to a server-issued
    escalation channels (e.g. Telegram) for idle/broken-line alerts;
    exclusive assignment = CLAIM -> moderator approval; private MCP
    server interface so the developer's trusted AI agent can admin.
-4. Remote line (e.g. Raspberry Pi): same provider code, dials OUT to
-   gateway WSS (NAT-safe), per-line token, reconnect = re-register,
-   in-flight call on drop = hangup; WAN leg adds jitter buffer
-   ~60-120 ms + audio watchdog.
+4. Remote line (e.g. Raspberry Pi) — UPDATED round 12: the remote
+   site runs a dumb `hci-agent` (USB↔HCI relay, no bluetoothd, no
+   telephony state) that feeds a kernel `vhci` adapter inside the
+   container over a `transport_profile` tunnel (wireguard default;
+   direct_mtls; sstp/openconnect/vless_xray reserved). Two channels:
+   control-TCP (HCI cmd/ACL/evt + agent mgmt) and media-UDP (SCO).
+   See `docs/hci-agent.md` for the agent config format and wire
+   protocol. The earlier "full provider on the Pi" shape remains an
+   alternative for links too lossy for HCI-over-IP.
