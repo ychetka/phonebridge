@@ -45,19 +45,20 @@
   <div class="box core">LineManager<span class="small">LineAssignment (durable, no heartbeat) + CallLease (ephemeral) + intent-resolver; queues: per-line + global pool</span></div>
   <div class="box core">EventBus<span class="small">fan-out: socket-subscribe · webhook (retry+HMAC) · exec/file-drop — wakes any agent type</span></div>
 
-  <div class="wire">▼ internal call to address <code>127.0.0.1</code> — the same protocol a remote provider uses</div>
+  <div class="wire">▼ internal call to address <code>127.0.0.1</code> — every provider is container-local (all adapters are virtual)</div>
 
-  <div class="box prov">LocalLine (line provider)<span class="small">SEPARATE process in the same container; owns BlueZ+oFono+PipeWire+dbus and the USB dongles (--device); registers with Manager at <code>wss://127.0.0.1:7001/provider</code></span></div>
-  <div class="box hw">BT dongle hci0 → phone A</div>
-  <div class="box hw">BT dongle hci1 → phone B</div>
+  <div class="box prov">Line bundle ×N (thin-slice)<span class="small">per line: <code>vhci-feeder</code> + shim/audio-forwarder + <code>LineProvider</code> process; registers with Manager at <code>wss://127.0.0.1:7001/provider</code>; a dead bundle is reaped without touching others</span></div>
+  <div class="box core">BlueZ + PipeWire + dbus (shared, hardened)<span class="small">watchdog + fast restart; adapters are kernel <code>vhci</code> devices hci0..hciN — NO real USB inside the container</span></div>
+  <div class="box hw">vhci hci0 ← agent A &nbsp;·&nbsp; vhci hci1 ← agent B</div>
 </div>
 
-<!-- ============ REMOTE ============ -->
+<!-- ============ REMOTE / AGENT HOSTS ============ -->
 <div class="zone">
-  <div class="zone-title">Remote site — same provider code, different registration address</div>
-  <div class="box prov">RemoteLine (Raspberry Pi)<span class="small">SAME code, different config: <code>manager_endpoint=wss://&lt;WAN&gt;:7001</code>, per-line token, reconnect=re-register; jitter buffer + audio watchdog</span></div>
-  <div class="box hw">BT dongle → phone C (another city/country)</div>
-  <div class="wire">▲ WSS: <code>provider.register(line_id, caps, token)</code> → gateway — full bidirectional RPC (outbound and inbound calls are equal citizens)</div>
+  <div class="zone-title">Dongle hosts — remote Pi or the very same host machine (uniform)</div>
+  <div class="box prov">hci-agent (Raspberry Pi)<span class="small">dumb USB↔HCI relay: owns dongle via libusb (btusb detached, no bluetoothd on the Pi); heartbeat + remote USB reset; config = one YAML per dongle (<code>docs/hci-agent.md</code>)</span></div>
+  <div class="box prov">hci-agent (host-local)<span class="small">SAME agent on the gateway's own host for a nearby dongle — identical protocol, endpoint = localhost tunnel</span></div>
+  <div class="box hw">BT dongle → phone C (another city/country) &nbsp;·&nbsp; BT dongle → phone A (nearby)</div>
+  <div class="wire">▲ tunnel profile <code>transport_profile</code>: <b>control-TCP</b> (HCI cmd/ACL/evt + mgmt) + <b>media-UDP</b> (SCO audio) over wireguard (default) / direct_mtls / sstp / openconnect / vless_xray — admin picks WHICH, system owns HOW</div>
 </div>
 
 <h2>Unified model: three kinds of registration</h2>

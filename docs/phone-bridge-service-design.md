@@ -50,6 +50,7 @@ referenced sections.
 | round 9 | `NO_FREE_LINE` error REMOVED - busy is a normal result: `call.acquire` returns `{granted:true,...}` or `{granted:false, free_lines[]}` | §3.3 |
 | round 10 | Accept window default 30 s, ALL timeouts admin-configurable; per-line inbound fallback policy set; idle_revoke = alert-only via escalation channels; exclusive binding = claim + moderator approval; admin = private MCP server; `line.revoke` admin-only | §5.3, §4.2, §10 |
 | round 11 (architecture review hardening) | Unified ID taxonomy (`lease_id` is the only call id); `call.dial`/`call.accept` return `media_endpoint`+`media_token`; `call.accept` takes only `{session_id, call_token}`; `receive_inbound` keeps line `FREE` until a physical ring; `line_id:"default"` input-only alias; `RedactedString` PII masking; ADR-01 FallbackWorker owns complex fallbacks; ADR-02 binary 20 ms media framing with in-band flush; ADR-03 BDADDR binding + mandatory `/var/lib/bluetooth` + `/var/lib/phonebridge` volumes; WAN media reclassified to prod gate | §2.1, §3.3, §4.1, §5.3, §5.5, §6.2, §12 |
+| round 12 (live probes + unified agent model, 2026-11-13) | Live-verified on the real stack: `VoiceCall.Answer` works (incoming→`active` ~0.3 s, SCO ~0.6 s), inbound `Hangup` rejects a ringing call, full E.164 terminates via `Dial` unchanged, `SendTones` is broken on this stack (fallback = in-band DTMF in uplink), WirePlumber auto-routes SCO to the default sink+monitor (echo loop; service must own routing via per-line virtual endpoints + static `node.autoconnect=false` on bluez5 HFP nodes). Architecture: UNIFIED AGENT MODEL — every BT dongle sits behind a dumb `hci-agent` (libusb, btusb detached) feeding a kernel `vhci` adapter inside the container over a pluggable `transport_profile` tunnel (control-TCP + media-UDP; QUIC is a V2 track); container is isolated-netns, sees only virtual adapters; thin-slice per-line worker bundles + shared bluetoothd/PipeWire; `call.dial` requires `number` (strict E.164) + `country` (ISO alpha-2) with phonenumbers cross-validation and a per-line number-type allowlist; agent surface reachable via MCP adapter | §2.1, §2.2, §5.5, §6.4, §9, §10, §12, docs/hci-agent.md |
 
 ## §1. Service boundary
 
@@ -101,19 +102,27 @@ Production deployment is a **single Docker container**
 
 - the gateway daemon (Manager + APICallService + LineManager +
   EventBus - §2.3),
-- the LocalLine provider as a **separate PROCESS inside the same
-  container** (process supervisor such as supervisord; code symmetry
-  with RemoteLine plus crash isolation - a provider crash cannot take
-  down the gateway, and vice versa),
-- BlueZ + oFono + PipeWire + dbus-daemon inside the container,
-- USB BT dongles passed through (`--device`), one dongle per line;
-  the host `bluetoothd` **must not claim** those dongles (documented
-  ops requirement; e.g. udev/driver-exclusion rule on the host).
+- one **per-line worker bundle** per line (thin-slice model, round
+  12): a `vhci-feeder` + shim/audio-forwarder + `LineProvider`
+  process, supervised independently so a dead line never takes the
+  gateway or other lines down; BlueZ, PipeWire and dbus-daemon are
+  shared, hardened with watchdogs and fast restart,
+- BlueZ + PipeWire + dbus-daemon inside the container,
+- **no USB dongles passed through** (round 12, replaces the earlier
+  `--device` model): every adapter inside the container is a kernel
+  `vhci` device fed by an `hci-agent` on the dongle's machine — see
+  §2.2 and `docs/hci-agent.md`. The container runs in an isolated
+  network namespace; its declared external exposure is exactly the
+  listeners it serves: the agent-facing API surface (UDS/WSS + media,
+  §2.3) and one control-TCP + media-UDP tunnel endpoint per remote
+  line (the hci-agent dials in - §2.2, `docs/hci-agent.md`).
 
 Motive is host isolation: the host system can be wiped and
 reinstalled and the telephony stack survives entirely inside the
-container. Agents reach the API through the socket directory
-bind-mounted out of the container (UDS) or over WSS remotely.
+container — including its Bluetooth subsystem, because no adapter in
+the container is real hardware. A host-side dongle is served by an
+hci-agent running *on that host* exactly like a remote Pi's agent;
+the host's own `bluetoothd` is left free for host devices.
 
 Persistence requirement (ADR-03, round 11): "wipe-safe" is only true
 with two MANDATORY persistent volumes:
@@ -123,11 +132,15 @@ with two MANDATORY persistent volumes:
 - `/var/lib/phonebridge` - SQLite (keys, LineAssignments, configs)
   and any recorded media.
 
-Dongle binding is by `adapter_mac` (BDADDR), never `hciN` - indices
-are assigned in USB init order and swap across reboots. Hardware
-constraint note: with >2 dongles place them on different root USB
-controllers/hubs - multiple SCO audio streams on one USB 2.0 hub hit
-the isochronous bandwidth allocation limit.
+Line identity binding is by `adapter_mac` (BDADDR), never `hciN` -
+indices are assigned in enumeration order and swap across reboots.
+Under the agent model the BDADDR reported by the agent is the
+physical dongle's address on the remote host. Hardware constraint
+note: with >2 physical dongles ON ONE AGENT HOST place them on
+different root USB controllers/hubs - multiple SCO audio streams on
+one USB 2.0 hub hit the isochronous bandwidth allocation limit. The
+container side has no such limit: virtual adapters are pure kernel
+objects.
 
 (Superseded: founding spec's "systemd user service on the host" as
 the production model - host-native deployment remains legal ONLY as a
@@ -163,15 +176,24 @@ interface LineProviderConfig {
   leases get a **10 s grace** window to re-bind through the
   re-registered provider before teardown.
 
-RemoteLine example - Raspberry Pi site: the same line-agent code
-runs on the Pi with `manager_endpoint` pointing at the gateway's WAN
-address, a per-Pi line token, reconnect-with-backoff, and the
-WAN-only media hardening of §6.3.
+RemoteLine example - Raspberry Pi site (round 12): the Pi no longer
+runs the provider. It runs the **hci-agent** — a dumb USB↔HCI relay
+that owns the dongle in userspace (libusb, `btusb` detached), opens a
+`transport_profile` tunnel to the container, and streams HCI frames:
+control-TCP (commands/ACL/events + heartbeat/reset) and media-UDP
+(SCO). Inside the container the line's `vhci-feeder` re-materializes
+the adapter as a kernel `hciN`; `bluetoothd`, the telephony shim and
+the per-line LineProvider process treat it exactly like a local
+dongle. Remoteness is invisible above the transport layer. A
+"smart-remote" deployment — the full provider stack running on the
+remote host — remains a documented alternative for links too hostile
+for HCI-over-IP timing.
 
 (Superseded: the early "A-REMOTE runs the same binary as a user
 service on the SBC" sketch - remote nodes now run the line-provider
 code only, and registration is provider-initiated rather than the
-gateway reaching in.)
+gateway reaching in. Superseded again round 12: remote nodes now run
+the hci-agent only; the provider is always container-local.)
 
 ### §2.3 Two surfaces, one daemon
 
@@ -191,7 +213,7 @@ registration" model:
 | Transport | One: JSON-RPC 2.0 bidirectional + packetized media. Local peers use UDS (bind-mounted out of the container); remote peers use WSS |
 | Namespaces | Two: `provider.*`/`line.*` vs `agent.*`/`call.*`/`event.*`, with **separate token scopes** - a provider token never grants agent methods and vice versa |
 | Intent vs assignment | Intent is a declarative wish; LineAssignment is the durable truth; conflicts are explicit errors; admin assign remains as override |
-| Media hardening | Jitter buffer + audio watchdog exist ONLY on the WAN leg |
+| Media hardening | Jitter buffer + audio watchdog exist ONLY on the hostile-link legs: the hci-agent tunnel media-UDP leg (§6.3) and - if ever used - a WAN agent media socket |
 | Deployment | One container, several processes; the local provider is a separate process, NOT a separate container |
 
 ### §2.4 Multi-dongle / multi-phone first-class
@@ -229,7 +251,9 @@ type LineSummary = { line_id: string, caps: Intent[], state: LineState, profile?
 
 Error codes (contract-level): `OWNER_MISMATCH`,
 `LINE_EXCLUSIVE_NOT_OWNER`, `LINE_BUSY_INCOMING`, `LINE_NOT_FOUND`,
-`INVALID_INTENT`, `STALE_TOKEN`, `PROVIDER_UNREACHABLE`.
+`INVALID_INTENT`, `STALE_TOKEN`, `PROVIDER_UNREACHABLE`,
+`DIAL_REJECTED` (typed `data.reason` - see Dial validation in
+`docs/api-contract.md`).
 
 `NO_FREE_LINE` was REMOVED as an error (round 9): a busy pool is a
 normal result, not an exception.
@@ -241,7 +265,7 @@ normal result, not an exception.
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` -> `{session_id}`; declarative wish resolved by the intent-resolver into a LineAssignment (§4) |
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` -> `{granted:true, line_id, lease_id}` or `{granted:false, free_lines[]}`; `free_lines:[]` = nothing available - routine result, the client retries itself. Optional `enqueue` joins the FIFO queue (§3.4) |
 | `call.release` | release a lease; `OWNER_MISMATCH` on foreign lease |
-| `call.dial` | `{session_id, lease_id, number}` -> `{lease_id, media_endpoint, media_token}` |
+| `call.dial` | `{session_id, lease_id, number, country}` -> `{lease_id, media_endpoint, media_token}`; strict E.164 + ISO alpha-2 cross-check BEFORE the line (round 12) - `DIAL_REJECTED` with a typed `data.reason`, otherwise the validated E.164 passes to `line.dial` unchanged |
 | `call.accept` | `{session_id, call_token}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired, `LINE_BUSY_INCOMING`/`OWNER_MISMATCH` as applicable |
 | `call.hangup` / `call.send_dtmf` / `call.get_lines` | call control and line listing |
 
@@ -374,9 +398,11 @@ Profiles are **config presets** over primitive policies
    (`{granted:true, line_id, lease_id}`), refused cleanly
    (`{granted:false, free_lines[]}`), or queued
    (`{queued:true, ticket_id, position}` + `queue_updated` events).
-2. `call.dial{lease_id, number}` -> gateway issues
-   `line.dial{assignment_id, lease_id, number}` to the owning
-   provider (local or remote - identical path).
+2. `call.dial{lease_id, number, country}` -> gateway validates the
+   pair (`DIAL_REJECTED` on failure, never reaches the line) and
+   issues `line.dial{assignment_id, lease_id, number}` with the
+   validated E.164 to the owning provider (identical path for every
+   line - remoteness lives below, in the hci-agent transport).
 3. Call reaches `alerting` -> implicit media attach (§5.5) ->
    `audio_ready`.
 4. Duplex media flows (§6); `call.send_dtmf` for IVR navigation.
@@ -448,12 +474,28 @@ Agent rule: start the greeting only when `state == "active"` AND
 the bridge owns the uplink buffer; in-band flush flag 0x02 on the
 media frame, ADR-02).
 
-Open validation spike (30 min, pre-implementation, carried over from
-the founding spec): does `State=active` fire on remote answer or at
-cellular setup? If early, the agent greets a ringback tone - needs a
-`remote_answered` signal or early-media heuristic. `SendTones` is
-already listed in the runbook's expected VoiceCallManager surface, so
-the spike only verifies it *works* during a live call.
+Live-probe results (2026-11-13, real stack, run-3 artifacts): the
+open validation questions are RESOLVED on the current shim:
+
+- `VoiceCall.Answer` on an incoming call works: `incoming`→`active`
+  in ~0.3 s, SCO node up ~0.6 s — the `call.accept` fast path is
+  implementable as designed.
+- `Hangup` on a ringing incoming call rejects it cleanly (call
+  object gone ~1.4 s; caller sees a normal rejection) — the
+  `reject` fallback policy is implementable.
+- `State=active` coincides with remote answer (human answered; the
+  ringback gap matches). Data is provisional (one confirmed sample);
+  `answer_confidence` remains in the contract as a hedge.
+- `SendTones` is BROKEN on this stack (`invalid characters in text
+  string` for valid DTMF) — in-band DTMF synthesis in uplink PCM is
+  the fallback; `call.send_dtmf` must not assume the bus method.
+- Full E.164 passes `Dial` and terminates correctly (previously
+  believed false — the failures were malformed `+`-hybrids without
+  a country code). Pass-through of validated E.164 is the canonical
+  dial path (api-contract §Dial validation).
+- WirePlumber auto-routes SCO to the default sink + its monitor:
+  the remote party hears themselves (echo loop). The service must
+  own the audio graph explicitly — §6.4.
 
 ## §6. Media path
 
@@ -471,6 +513,14 @@ local optimization", and the intermediate `pipewire_local` variant.)
 
 ### §6.2 Two sockets per remote line, server-issued endpoint
 
+(Round 12 rescope: this section describes the provider↔gateway
+media leg, which applies verbatim to container-local providers on
+loopback and — under the unified agent model — only to the fallback
+"smart-remote" deployment. The remote hci-agent↔container legs are a
+different pair: control-TCP + media-UDP inside the `transport_profile`
+tunnel, `docs/hci-agent.md` §2 — the server-issued endpoint idea is
+preserved there as the per-line tunnel port pair.)
+
 - A remote line uses TWO sockets: one control WSS + one dedicated
   media channel.
 - The media endpoint is **SERVER-ISSUED** (round 7a): the gateway
@@ -487,10 +537,51 @@ local optimization", and the intermediate `pipewire_local` variant.)
   for audio streaming) vs framed PCM on the dedicated socket.
   WSS+raw PCM ships first; Opus/WebRTC is the upgrade path if real
   links glitch.
-- **WAN-only** leg hardening: jitter buffer ~60-120 ms + audio
-  watchdog. Local leg needs neither (loopback).
+- **Hostile-link** leg hardening (round 12 rescope): the WAN leg is
+  the hci-agent tunnel's media-UDP channel - stale SCO frames are
+  dropped by design, so the jitter buffer (~60-120 ms) + audio
+  watchdog live at the container-side media-UDP ingress (vhci-feeder),
+  NOT on the agent↔gateway socket. The local loopback leg needs
+  neither.
 - Latency budget: bridge must add < 100 ms node<->socket; verified
   by a loopback test in CI.
+
+### §6.4 Audio-graph ownership and the echo loop (round 12)
+
+Live `pw-link` capture during an active call proved WirePlumber
+auto-routes SCO nodes like a desktop headset:
+
+- downlink `bluez_input.<mac>` → the host's DEFAULT sink playback
+  (the far end's voice played on the host's speakers),
+- uplink ← that same sink's `monitor` → `bluez_output.<mac>`
+  (the remote party hears itself — the echo loop observed live).
+
+Design consequences:
+
+- The service creates **per-line virtual endpoints**
+  (`phonebridge_uplink_<line_id>`, `phonebridge_downlink_<line_id>`)
+  and links them explicitly for the duration of a lease:
+  `bluez_input → downlink node → media pipeline → uplink node →
+  bluez_output`. Agent-facing audio (the media socket) attaches to
+  these endpoints, never directly to transient bluez nodes.
+- Auto-routing is suppressed with a **static WirePlumber rule**
+  matching bluez5 HFP nodes (`node.autoconnect=false`), shipped by
+  the package — NOT by per-call unlinking, which would leak ~50 ms
+  of audio to the default sink before the service could react.
+- Multi-line: endpoints are created/destroyed per lease lifecycle
+  of their line; one SCO channel exists per HFP line, so concurrent
+  calls on ONE line (call waiting) share the audio path — the node
+  proves "line has media", the binding to a call is via
+  `line_id`+`lease_id`, never via the node.
+- In-band DTMF (SendTones is broken on the bus, §5.5) is generated
+  by mixing synthesized tones into the uplink endpoint.
+
+### §6.5 Remote-line audio transport (round 12)
+
+Between the hci-agent and the container, SCO rides the **media-UDP**
+channel of the line's tunnel profile (isochronous semantics: stale
+frames are dropped, never retransmitted); control flows on
+control-TCP. A QUIC/multiplexed-streams unification is a V2 track.
 
 ## §7. Events and universal fan-out
 
@@ -531,9 +622,10 @@ gateway, or a SIP SMS aggregator.
 
 | Deployment | Shape |
 |---|---|
-| **Prod** | ONE container: gateway daemon + LocalLine process + BlueZ/oFono/PipeWire/dbus inside; USB dongles via `--device`; host `bluetoothd` must not claim them; agents via bind-mounted socket dir (UDS) or WSS |
+| **Prod** | ONE container (isolated netns): gateway daemon + per-line worker bundles + BlueZ/PipeWire/dbus inside; every adapter is kernel `vhci` fed by an hci-agent — host-local agents feed dongles on the same machine too; agents via bind-mounted socket dir (UDS) or WSS/MCP |
 | **Prototype** | Host-native systemd user service - capability validation ONLY, never prod (`org.pipewire.Telephony` lives on the USER session bus - a system-level unit cannot reach it and fails silently with `ServiceUnknown`) |
-| **Remote site** | Same line-provider code on e.g. a Raspberry Pi; dials OUT to gateway WSS (NAT-safe); per-line token; reconnect = re-register; WAN media hardening; in-flight call on drop = hangup |
+| **Remote site** | Raspberry Pi etc. runs ONLY the hci-agent (USB↔HCI relay, no bluetoothd); control-TCP + media-UDP over a `transport_profile` tunnel (wireguard default; direct_mtls; sstp/openconnect/vless_xray reserved profiles); heartbeat + remote USB reset; in-flight call on tunnel drop = hangup |
+| **Agent host (any)** | One hci-agent instance per dongle; owns USB via libusb with `btusb` detached; host `bluetoothd` unaffected |
 
 Single-writer applies twice: (a) lease/assignment arbitration inside
 LineManager, (b) exactly one gateway instance per deployment
@@ -566,7 +658,19 @@ status (mirrors the busctl commands used in Phase-0).
   thresholds, orphan grace.
 - **Escalation channels** (round 10c): admin-configured (e.g.
   Telegram) for idle/broken-line alerts; `idle_revoke_after` fires
-  alerts only - see open question §12.3.
+  alerts only - resolved question `idle_revoke` (§12).
+- **Per-line dial policy** (round 12): `allowed_number_types`
+  defaults to `{FIXED_LINE, MOBILE, VOIP, TOLL_FREE}`; an admin may
+  additionally enable `{PREMIUM_RATE, SHARED_COST, PAGER,
+  PERSONAL_NUMBER}`. `line_home_country` (ISO alpha-2) is config +
+  cross-check against the live registration. Short codes and
+  emergency numbers are rejected on the ordinary path.
+- **Per-line transport profile** (round 12): the admin selects
+  `transport_profile` (`wireguard`/`direct_mtls`/`sstp`/
+  `openconnect`/`vless_xray`) for each remote line; protocol
+  parameters are canonical system packs, not user-editable. Line
+  onboarding lifecycle: `PROVISIONING → PAIRING → READY → IN_CALL →
+  DEGRADED → FAULTED`.
 - **Exclusive assignment requires moderator approval** in admin -
   an agent's claim request is never self-granted (round 10d).
 - Webhook events are authenticated via HMAC + `delivery_id`
@@ -605,16 +709,25 @@ status (mirrors the busctl commands used in Phase-0).
 
 ## §12. Open questions (still open - marked as such)
 
-1. **WAN media transport**: RTP+Opus vs framed PCM on the dedicated
-   socket - evaluation pending (rounds 5a/6). Status (round 11):
-   **prod gate for remote Pi lines**, not a v1 blocker - WSS+binary
-   PCM framing (ADR-02) ships for local loopback/LAN, but TCP/WSS
-   head-of-line blocking makes it unfit for unstable WAN; an
-   RTP/UDP (or WebRTC) transport is MANDATORY before remote Pi
-   cold-calling goes live.
+1. **WAN media transport**: largely RE-POSED by round 12 — under the
+   unified agent model the WAN leg carries raw HCI SCO over the
+   tunnel's media-UDP channel (isochronous, drop-stale by design);
+   the RTP+Opus-vs-framed-PCM question now applies only to the
+   agent↔gateway media socket (ADR-02), where framed PCM already
+   ships. QUIC/multiplexed streams is the V2 unification track.
+   The remaining WAN question is SCO-over-UDP quality on hostile
+   links — to be measured by the vhci experiment (§12.3).
 2. **`remote_answered` fidelity** (carried from founding spec):
-   pending the §5.5 spike on whether `State=active` fires on remote
-   answer or at cellular setup.
+   RESOLVED provisionally 2026-11-13 — live probes show `active`
+   fires on remote answer (one confirmed sample); `answer_confidence`
+   stays in the contract as hedge. Also resolved: `Answer`/`Hangup`
+   on incoming calls work; `SendTones` is broken (in-band DTMF
+   fallback); the WirePlumber echo loop requires owned routing (§6.4).
+3. **vhci end-to-end feasibility** (NEW, round 12): does the full
+   path `dongle → hci-agent → tunnel → vhci → live call with SCO
+   audio` hold, incl. the isochronous endpoint forwarding? This is
+   the gate for the unified agent model — must be proven by the
+   dedicated experiment before the model is locked.
 
 ### Questions resolved by developer ruling 2026-11-12
 

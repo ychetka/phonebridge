@@ -44,15 +44,15 @@
   <div class="box core">LineManager (gateway daemon)<span class="small">Line{dongle, phone, oFono modem, caps, profile, state} — N-line architecture, works with one; LineAssignment + CallLease + intent-resolver</span></div>
   <div class="box core">Call queue<span class="small">FIFO, ticket_id, position, grant TTL, socket-bound tickets</span></div>
   <div class="box core">EventBus<span class="small">socket subscribe · webhook (retry+delivery_id+HMAC) · exec/file-drop</span></div>
-  <div class="box sys">LocalLine process<span class="small">separate process in the same container: BlueZ + oFono + PipeWire + dbus, USB dongles via --device; registers at wss://127.0.0.1:7001/provider</span></div>
+  <div class="box sys">Line bundle ×N<span class="small">per line in the same container: vhci-feeder + shim/audio-forwarder + LineProvider process; registers at wss://127.0.0.1:7001/provider</span></div>
   <span class="arrow">▼ D-Bus (container-internal)</span>
-  <div class="box sys">oFono / BlueZ<span class="small">VoiceCallManager: Dial/Answer/Hangup (SMS: OUT OF SCOPE — no MessageManager on bus)</span></div>
-  <div class="box sys">PipeWire<span class="small">SCO audio 16 kHz → packetized media channel to the gateway</span></div>
+  <div class="box sys">oFono-shim / BlueZ (shared)<span class="small">VoiceCallManager: Dial/Answer/Hangup — verified live (SMS: OUT OF SCOPE — no MessageManager on bus)</span></div>
+  <div class="box sys">PipeWire + virtual endpoints<span class="small">per-line phonebridge_uplink/downlink nodes; SCO audio 16 kHz → packetized media channel to the gateway; WirePlumber auto-route suppressed</span></div>
 </div>
 
 <div class="zone">
-  <div class="zone-title">Hardware</div>
-  <div class="box hw">USB BT dongle hci0</div><span class="arrow">→ Bluetooth HFP →</span>
+  <div class="zone-title">Dongle host + hardware (local or remote — identical)</div>
+  <div class="box hw">hci-agent: USB BT dongle (libusb, btusb detached)</div><span class="arrow">─ HCI frames: control-TCP + media-UDP over transport_profile tunnel → vhci hciN in container ─</span>
   <div class="box hw">Phone (SIM)</div><span class="arrow">→ cellular network →</span>
   <div class="box hw">Callee</div>
 </div>
@@ -61,7 +61,7 @@
 <ol class="seq">
   <li>Agent calls <code>call.acquire{intent:"dial_out", enqueue?}</code>.</li>
   <li>Line free → <code>{granted:true, line_id, lease_id}</code>. All busy → <code>{granted:false, free_lines[]}</code> (retry later), or with <code>enqueue:true</code> → <code>{granted:false, queued:true, ticket_id, position}</code> plus <code class="evt">event.queue_updated</code> events as it advances; on grant — <code class="evt">event.line_acquired{lease_id}</code> (short grant TTL to react, else next ticket; tickets are socket-bound).</li>
-  <li>Agent calls <code>call.dial("+373…")</code> → gateway → <code>line.dial</code> to the owning provider (local or remote — identical path) → oFono → phone dials.</li>
+  <li>Agent calls <code>call.dial("+373…", country:"MD")</code> — strict E.164 + ISO alpha-2 cross-check (DIAL_REJECTED on failure, never reaches the line) → gateway → <code>line.dial</code> to the owning provider → oFono → phone dials (validated E.164 passed through unchanged).</li>
   <li>Call reaches <code>alerting</code> → media attaches; <code class="evt">event.audio_ready</code> = "you may speak" (gate vs SCO bring-up lag).</li>
   <li>Duplex: agent sends audio frames (its voice) over the media channel → callee hears; callee's voice arrives as frames → agent listens/transcribes. <code>call.send_dtmf("1")</code> — IVR navigation.</li>
   <li><code>call.hangup</code> → <code>call.release</code> → queue advances to the next agent.</li>
@@ -79,8 +79,8 @@
 <h2>Deployment (target = prod)</h2>
 <table>
 <tr><td>Prototype (now)</td><td>systemd user-service on the host — capability validation ONLY</td></tr>
-<tr><td>Prod</td><td><b>One container</b>: own BlueZ + oFono + PipeWire + dbus-daemon inside, USB dongles passed through via <code>--device</code>, host bluetoothd must not claim them. The host system can be wiped and reinstalled — the telephony stack lives entirely inside the container. Agents reach the container's socket; a LocalLine process lives inside it.</td></tr>
-<tr><td>Remote site</td><td>Same provider code on e.g. a Raspberry Pi; dials OUT to the gateway WSS (NAT-safe); per-line token; reconnect = re-register; WAN-only jitter buffer + audio watchdog; in-flight call on drop = hangup.</td></tr>
+<tr><td>Prod</td><td><b>One container</b> (isolated netns): BlueZ + PipeWire + dbus-daemon inside, all adapters are kernel <code>vhci</code> devices fed by hci-agents — no USB passthrough at all. Host bluetoothd stays free for host devices. Agents reach the container's socket (UDS/WSS/MCP); per-line worker bundles live inside it.</td></tr>
+<tr><td>Remote site / any dongle host</td><td>Only the <b>hci-agent</b>: dumb USB↔HCI relay (libusb, btusb detached), control-TCP + media-UDP over a transport_profile tunnel (wireguard default), heartbeat + remote USB reset; in-flight call on tunnel drop = hangup. A dongle on the gateway's own host uses the identical agent.</td></tr>
 </table>
 </body>
 </html>
