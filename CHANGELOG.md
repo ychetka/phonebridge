@@ -21,7 +21,7 @@
   `LineStateChangedEvent`, `MissedCallEvent`);
   `FallbackDecision.fallback_call_token`; `LineManager.drop_session`
   (dead-man switch) and `ingest_audio_ready`; `RedactedString`
-  explicit JSON serializer. (issues #29, #31)
+  explicit JSON serializer. (issues #25, #29, #31, #33)
 
 #### docs
 - [docs] Unified hci-agent model: `docs/hci-agent.md` agent spec +

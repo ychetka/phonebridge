@@ -551,12 +551,17 @@ class LineAssignment(ContractModel):
     accept_window_sec: float = Field(default=30.0, gt=0)
     fallback_policy: FallbackPolicy = Field(default_factory=NoPickupFallback)
     allowed_number_types: frozenset[str] = Field(
-        default_factory=lambda: frozenset({"FIXED_LINE", "MOBILE", "VOIP", "TOLL_FREE"})
+        default_factory=lambda: frozenset(
+            {"FIXED_LINE", "MOBILE", "FIXED_LINE_OR_MOBILE", "VOIP", "TOLL_FREE"}
+        )
     )
     """Per-line phonenumbers-type allowlist (issue #25, round 15):
     `number_type()` results outside this set are rejected with
     DIAL_REJECTED/UNSUPPORTED_NUMBER_TYPE. Premium/shared-cost types
-    are opt-in via admin config."""
+    are opt-in via admin config. ``FIXED_LINE_OR_MOBILE`` is REQUIRED
+    in the default - phonenumbers returns this composite type for
+    NANP numbers, so a plain US/CA mobile would otherwise be rejected
+    as UNSUPPORTED_NUMBER_TYPE (review round 15)."""
     last_seen_at: AwareDatetime
     idle_revoke_after: timedelta | None = None
 

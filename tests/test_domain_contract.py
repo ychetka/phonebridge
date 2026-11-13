@@ -581,7 +581,7 @@ def test_line_manager_is_abstract() -> None:
 
 async def test_line_manager_async_surface() -> None:
     """Non-e2e async exercise: EVERY abstract method is awaitable and
-    returns its contracted result type (all 16 methods)."""
+    returns its contracted result type (all 18 methods)."""
     assert set(LineManager.__abstractmethods__) == {
         "register_intent",
         "acquire",

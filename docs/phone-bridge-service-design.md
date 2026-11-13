@@ -676,7 +676,10 @@ status (mirrors the busctl commands used in Phase-0).
   Telegram) for idle/broken-line alerts; `idle_revoke_after` fires
   alerts only - resolved question `idle_revoke` (§12).
 - **Per-line dial policy** (round 12): `allowed_number_types`
-  defaults to `{FIXED_LINE, MOBILE, VOIP, TOLL_FREE}`; an admin may
+  defaults to `{FIXED_LINE, MOBILE, FIXED_LINE_OR_MOBILE, VOIP,
+  TOLL_FREE}` — the composite `FIXED_LINE_OR_MOBILE` is mandatory
+  because `phonenumbers.number_type()` returns it for NANP numbers
+  (round 15); an admin may
   additionally enable `{PREMIUM_RATE, SHARED_COST, PAGER,
   PERSONAL_NUMBER}`. `line_home_country` (ISO alpha-2) is config +
   cross-check against the live registration. Short codes and
