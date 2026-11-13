@@ -29,8 +29,11 @@ refs: issue #7, task item_03
   `MediaToken`, `LineId`, `TicketId`, `SessionId` - the contract owns
   type + guarantees (globally unique, opaque, unguessable; tickets
   orderable/monotonic for FIFO), not the generation strategy.
-- `RedactedString`: a `str` subclass - masked `repr`/`str`, raw value
-  on wire via `.expose()`/`.to_wire()` and JSON serialization;
+- `RedactedString`: a `str` subclass - masked `repr`/`str`/`__format__`
+  (any format spec applies to the masked text, never the raw value;
+  the mask never exposes more than half the raw characters and values
+  of 4 chars or less mask fully), raw value on wire via
+  `.expose()`/`.to_wire()` and JSON serialization;
   `ContractModel` adds `hide_input_in_errors` + `safe_dump()`/
   `to_log_dict()`; raw `model_dump()` to logs is prohibited.
 - Records: `LineAssignment` (durable), `CallLease` (ephemeral,

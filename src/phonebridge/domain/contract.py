@@ -285,6 +285,10 @@ AnswerConfidence = Literal["provisional", "confirmed"]
 _MASK = "****"
 _MASK_PREFIX_LEN = 4
 _MASK_SUFFIX_LEN = 2
+_MASK_FULL_LEN = 4
+"""Values up to this length mask completely - a 4-char secret exposes
+nothing. Above it the visible frame is capped at half the length, so a
+masked rendering never reveals more than half the raw characters."""
 
 
 class RedactedString(str):
@@ -294,11 +298,14 @@ class RedactedString(str):
     The instance IS a str holding the raw value, so JSON/wire
     serialization (``model_dump_json()``, ``json.dumps``) emits the
     full value with no special-casing - while ``repr()`` / ``str()``
-    render a MASKED form (e.g. "+373****56"), so accidental
+    render a MASKED form (e.g. "+373****45"), so accidental
     f-string/logging use cannot leak PII.
 
     - ``.expose()`` returns the raw value for in-memory use.
     - ``.to_wire()`` returns the raw value for wire serialization.
+    - ``__format__`` applies any format spec to the MASKED value, so
+      ``f"{s:>20}"`` / ``format(s, ">20")`` pad/align the mask and can
+      never emit the raw string (unlike inherited ``str.__format__``).
     - ``model_dump()`` (python mode) keeps this object - its masked
       repr is safe, but for logs use ``safe_dump()``/``to_log_dict()``
       which render explicit masked strings.
@@ -313,10 +320,17 @@ class RedactedString(str):
 
     @staticmethod
     def _mask(value: str) -> str:
-        """ "+37379012345" -> "+373****45"; short values mask fully."""
-        if len(value) <= _MASK_PREFIX_LEN + _MASK_SUFFIX_LEN:
+        """ "+37379012345" -> "+373****45"; never exposes more than half
+        the raw characters - short secrets degrade to a minimal suffix
+        ("token42" -> "t****42"), and values of _MASK_FULL_LEN chars or
+        less mask completely."""
+        n = len(value)
+        if n <= _MASK_FULL_LEN:
             return _MASK
-        return f"{value[:_MASK_PREFIX_LEN]}{_MASK}{value[-_MASK_SUFFIX_LEN:]}"
+        budget = n // 2
+        suffix = min(_MASK_SUFFIX_LEN, budget)
+        prefix = min(_MASK_PREFIX_LEN, budget - suffix)
+        return f"{value[:prefix]}{_MASK}{value[n - suffix :]}"
 
     def expose(self) -> str:
         """Raw value (plain str) for in-memory use. Never log it."""
@@ -331,6 +345,11 @@ class RedactedString(str):
 
     def __str__(self) -> str:
         return self._mask(str.__str__(self))
+
+    def __format__(self, format_spec: str) -> str:
+        """Apply the spec to the MASKED value: ``f"{s:>20}"`` aligns the
+        mask, so no format spec can ever emit the raw string."""
+        return str.__format__(self._mask(str.__str__(self)), format_spec)
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -961,5 +980,14 @@ class LineManager(ABC):
         unit tests, which inject time instead of sleeping. This is the
         ONLY timer entry point; implementations may no-op if they own
         internal timers.
+
+        ``now`` MUST be a timezone-aware UTC datetime (rule 6). The
+        ``AwareDatetime`` annotation is DOCUMENTARY on method
+        parameters: ``AfterValidator`` runs only under pydantic model
+        validation, so the aware-UTC requirement is a caller/
+        implementation contract, not a runtime check. Implementations
+        SHOULD apply the same rule as :data:`AwareDatetime` (reject
+        naive, normalize to UTC) when tick is driven from an untrusted
+        entry point.
         """
         ...

@@ -215,6 +215,50 @@ def test_provider_token_is_redacted(_gwt: object) -> None:
     assert "line-secret-token-value" not in repr(reg.safe_dump())
 
 
+@pytest.mark.parametrize("_gwt", [pytest.param(None, id="ITEM-03.GWT-2")])
+def test_redacted_string_format_spec_stays_masked(_gwt: object) -> None:
+    """A non-empty format spec must never emit the raw value:
+    __format__ routes through the masked string."""
+    redacted = RedactedString(_RAW_NUMBER)
+    rendered_forms = [
+        f"{redacted}",
+        f"{redacted!s}",
+        f"{redacted!r}",
+        f"{redacted:>20}",
+        f"{redacted:<20}",
+        f"{redacted:^20}",
+        f"{redacted:.3}",
+        format(redacted, ">20"),
+        format(redacted, ""),
+    ]
+    for rendered in rendered_forms:
+        assert _RAW_NUMBER not in rendered
+    # Alignment still works - on the masked text.
+    assert f"{redacted:>20}" == "+373****45".rjust(20)
+
+
+@pytest.mark.parametrize("_gwt", [pytest.param(None, id="ITEM-03.GWT-2")])
+def test_redacted_string_short_values_masked(_gwt: object) -> None:
+    """Short secrets must not expose more than half their characters:
+    <=4 chars mask fully, above that the visible frame is capped at
+    half the length."""
+    expected = {
+        "": "****",
+        "a": "****",
+        "abcd": "****",
+        "abcde": "****de",
+        "abcdef": "a****ef",
+        "token42": "t****42",
+        "123456789": "12****89",
+        "12345678901": "123****01",
+        "+37379012345": "+373****45",
+    }
+    for raw, masked in expected.items():
+        assert str(RedactedString(raw)) == masked
+        visible = len(masked) - masked.count("*")
+        assert visible <= len(raw) // 2
+
+
 # ---------------------------------------------------------------------------
 # ITEM-03.GWT-3: ErrorCode drift test against docs/api-contract.md
 # ---------------------------------------------------------------------------
@@ -521,17 +565,81 @@ def test_line_manager_is_abstract() -> None:
 
 
 async def test_line_manager_async_surface() -> None:
-    """Non-e2e async exercise: every abstract method is awaitable and
-    returns its contracted result type."""
+    """Non-e2e async exercise: EVERY abstract method is awaitable and
+    returns its contracted result type (all 16 methods)."""
+    assert set(LineManager.__abstractmethods__) == {
+        "register_intent",
+        "acquire",
+        "cancel_acquire",
+        "release",
+        "dial",
+        "accept",
+        "hangup",
+        "send_dtmf",
+        "claim_exclusive",
+        "get_lines",
+        "register_provider",
+        "note_provider_liveness",
+        "ingest_ring",
+        "ingest_call_state",
+        "decide_fallback",
+        "tick",
+    }
     mgr = _FakeLineManager()
+
+    # --- agent-facing surface ---
     session = await mgr.register_intent("agent-1", {Intent.DIAL_OUT})
     result = await mgr.acquire(session, Intent.DIAL_OUT)
     assert isinstance(result, AcquireGranted)
     assert isinstance(result.lease_id, str)
+    await mgr.cancel_acquire(session, TicketId("ticket-1"))
     dial = await mgr.dial(session, result.lease_id, RedactedString(_RAW_NUMBER))
     assert isinstance(dial.media_token, str)
+    accepted = await mgr.accept(session, CallToken("tok-1"))
+    assert isinstance(accepted, AcceptResult)
+    await mgr.send_dtmf(session, result.lease_id, "12#")
+    await mgr.hangup(session, result.lease_id)
+    await mgr.release(session, result.lease_id)
     lines = await mgr.get_lines(session)
     assert lines[0].state is LineState.FREE
     claim = await mgr.claim_exclusive(session, LineId("line-main"))
     assert claim.status == "pending_approval"
+
+    # --- provider ingress ---
+    assignment = await mgr.register_provider(
+        ProviderRegistration(
+            line_id=LineId("line-main"),
+            token=RedactedString("line-secret-token-value"),
+            caps=[Intent.DIAL_OUT],
+        )
+    )
+    assert isinstance(assignment, LineAssignment)
+    await mgr.note_provider_liveness(
+        ProviderLiveness(
+            line_id=LineId("line-main"),
+            state=LivenessState.REACHABLE,
+            checked_at=NOW_UTC,
+        )
+    )
+    ring_event = await mgr.ingest_ring(
+        IncomingRingIngress(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("asg-1"),
+            call_token=CallToken("tok-2"),
+            observed_at=NOW_UTC,
+        )
+    )
+    assert isinstance(ring_event, IncomingCallEvent)
+    await mgr.ingest_call_state(
+        ProviderCallStateUpdate(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("asg-1"),
+            state=ProviderCallState.ANSWERED,
+            observed_at=NOW_UTC,
+        )
+    )
+    decision = await mgr.decide_fallback(LineId("line-main"), CallToken("tok-3"))
+    assert isinstance(decision, FallbackDecision)
+
+    # --- lifecycle hook ---
     await mgr.tick(NOW_UTC)
