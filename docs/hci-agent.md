@@ -69,6 +69,31 @@ monotonic counter assigned by each sender independently
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
 | `0x14` STATUS | agent→ | `{state: UP|DEGRADED|DONGLE_DEAD|TUNNEL_FLAP, detail}` |
 | `0x15` SHUTDOWN | both | graceful close |
+| `0x16` SCO_STATE | container→ | `{open: bool, packet_len}` — instructs the agent to enable/disable the USB isochronous path (round 19, see below); `packet_len` is meaningful only on `open: true` — send `0` on close |
+
+**USB SCO altsetting control (round 19).** The Bluetooth USB
+Transport spec keeps Interface 1 (SCO audio) at `altsetting 0` —
+zero bandwidth (`wMaxPacketSize = 0`) — while idle; isochronous
+transfers cannot flow until a working altsetting is selected, and a
+lingering active altsetting reserves isoc bandwidth on the host
+controller forever, even between calls. The kernel `vhci` transport
+(H4) knows nothing about USB altsettings, so the container-side
+feeder — which already parses `Synchronous Connection Complete 0x2c`
+and `Disconnect Complete 0x05` for the SCO handle gate — sends the
+agent `0x16 SCO_STATE`:
+
+- `open: true` (after a successful sync connection complete): the
+  agent selects the working `altsetting` for the negotiated codec
+  (mSBC / transparent 16-bit) on USB Interface 1, starts isoc IN+OUT
+  transfers, and chops outgoing HCI SCO packets into
+  `wMaxPacketSize`-sized isoc frames (`packet_len` mirrors the
+  negotiated payload length).
+- `open: false` (after disconnect): the agent stops isoc transfers
+  and returns Interface 1 to `altsetting 0`, releasing the bandwidth.
+
+This keeps the agent dumb about call state — it reacts to an
+explicit command from the feeder that already knows the ground
+truth.
 
 Control traffic is small and latency-critical: it never shares a queue
 with media. Missed N heartbeats → line `DEGRADED` → `DOWN`.
@@ -282,7 +307,19 @@ Field rules:
 (agent connected, dongle attached, adapter materialized, phone pairing
 via container bluetoothd) → `READY` → `IN_CALL` → `DEGRADED`
 (heartbeat/USB issues) → `FAULTED` (manual or watchdog teardown) →
-back to `READY` on recovery. Container-side teardown of a line:
+back to `READY` on recovery.
+
+**Headless pairing (round 19).** Pairing runs on `bluetoothd` INSIDE
+the container, and modern phones use Secure Simple Pairing (numeric
+comparison on both ends) — an operator cannot be expected to
+`docker exec` into bluetoothctl per line. The container therefore
+ships a managed BlueZ `org.bluez.Agent1` that REJECTS every pairing
+attempt by default; `admin.pair_window {line_id, duration_sec}`
+(default 60 s) sets `Pairable` on that line's adapter only and
+auto-confirms the SSP passkey comparison for the window's duration.
+The window, the adapter (by `adapter_mac`), and any discovered
+devices are exposed through the admin surface (`phonebridgectl` /
+admin MCP) — no shell access required. Container-side teardown of a line:
 destroy the vhci adapter → bluetoothd emits `InterfacesRemoved` →
 per-line worker FSM reaps cleanly — the same deterministic path for
 every failure source, because a virtual adapter never wedges the kernel.
@@ -300,5 +337,12 @@ every failure source, because a virtual adapter never wedges the kernel.
   server's per-peer `/32` is the isolation boundary.
 - PII hygiene: the agent must not log dialed numbers, caller IDs, or
   HCI payloads containing them (`mask_pii` default on).
+- SSP auto-confirm caveat (round 19): `admin.pair_window` trades the
+  numeric-comparison MITM check for operability — during the open
+  window a nearby hostile device could in principle pair. Mitigation
+  is scope, not crypto: the window is short (default 60 s), bound to
+  ONE adapter, requires an admin-scope token, and the operator is
+  expected to hold the target phone at the prompt. Outside the
+  window the managed `Agent1` rejects unconditionally.
 - The agent binds to loopback/WAN only via the tunnel profile; it does
   not expose any local listener.
