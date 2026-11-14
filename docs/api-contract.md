@@ -182,6 +182,7 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `event.line_state_changed` | `{line_id, old_state, new_state, reason?}` |
 | `event.audio_ready` | `{lease_id, line_id}` — BT SCO path is up: early media (ringback) audible, uplink accepted without first-word clipping |
 | `event.call_state_changed` | `{lease_id, line_id, state, reason?, answer_confidence?}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected` (the provider's `ringing` maps to `event.incoming_call`, not to a lease event); `answer_confidence`: `"provisional"` \| `"confirmed"` — how sure the bridge is that `active` means a human answered (oFono `State=active` observed firing on remote answer, but the guarantee is provisional — design §5.5); agent may start its greeting only on `state == "active"` AND `audio_ready` received |
+| `event.assignment_revoked` | `{assignment_id, line_id, owner_agent_id?, reason?}` (round 19b) — the durable binding ended: admin `revoke_assignment`/`line.revoke` or idle escalation. Delivered ONLY to the revoked owner's session(s); `owner_agent_id` is absent for a pool/provider attachment (no agent to notify). Without this event an exclusive owner would learn about the revoke only as an `OWNER_MISMATCH` on its next `call.dial` |
 
 ## Queue semantics (mandatory FIFO)
 
