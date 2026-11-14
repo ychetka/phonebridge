@@ -43,6 +43,7 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     Tag,
+    model_validator,
 )
 from pydantic_core import core_schema
 
@@ -577,6 +578,17 @@ class LineAssignment(ContractModel):
     last_seen_at: AwareDatetime
     idle_revoke_after: timedelta | None = None
 
+    @model_validator(mode="after")
+    def _owner_matches_mode(self) -> LineAssignment:
+        """Enforce the round-19 owner⇔mode invariant at the model
+        boundary: ``exclusive`` requires an owner, ``shared_pool``
+        forbids one - contradictory states cannot be constructed."""
+        if self.mode is AssignmentMode.EXCLUSIVE and self.owner_agent_id is None:
+            raise ValueError("exclusive assignment requires owner_agent_id")
+        if self.mode is AssignmentMode.SHARED_POOL and self.owner_agent_id is not None:
+            raise ValueError("shared_pool assignment cannot carry owner_agent_id")
+        return self
+
 
 class CallLease(ContractModel):
     """Ephemeral call/line-hold record (design §4.2).
@@ -609,9 +621,13 @@ class QueueTicket(ContractModel):
     """FIFO queue entry for a queued acquire (§3.4).
 
     FIFO guarantee: ``seq`` is a strictly monotonic sequence number
-    issued per queue scope; tickets order by ``seq`` (``__lt__`` below),
-    which IS the mandatory FIFO ordering of docs/api-contract.md
-    "Queue semantics". Tickets are socket-bound - disconnect kills them;
+    issued from ONE global counter across all queue scopes (round 19
+    fairness rule): when line L frees, the grant goes to the
+    lowest-seq eligible ticket regardless of scope (per-line and pool
+    tickets compete in a single order - no starvation). Tickets order
+    by ``seq`` (``__lt__`` below), which IS the mandatory FIFO ordering
+    of docs/api-contract.md "Queue semantics". Tickets are
+    socket-bound - disconnect kills them;
     the queue itself must be bounded (rule 7: queue overflow reports
     STALE_TOKEN/QUEUE_FULL reason detail, never an unbounded park).
     """

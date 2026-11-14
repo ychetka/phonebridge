@@ -300,10 +300,15 @@ to the admin adapter:
   `assignment_revoked` (kernel event; wire mapping in c_admin).
 - `admin.configure_line {line_id, fallback_policy?, accept_window_sec?,
   allowed_number_types?, claimable?}` → runtime patch, no restart.
-- `admin.pair_window {line_id, duration_sec}` → opens the pairing
-  window on that line's adapter only (see hci-agent.md §5; the
-  container ships a BlueZ `org.bluez.Agent1` that rejects all pairing
-  attempts outside an open window).
+
+Non-kernel admin operations route to their owning subsystem instead
+(they are NOT `LineAdminKernel` methods — the kernel owns call/line
+state only, not provisioning or bus plumbing):
+
+- `admin.pair_window {line_id, duration_sec}` → routed by the admin
+  adapter to the line-bundle supervisor, which drives the container's
+  BlueZ `Agent1` (see hci-agent.md §5); opens the pairing window on
+  that line's adapter only.
 
 ## Decisions (developer, 2026-11-12)
 

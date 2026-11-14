@@ -69,7 +69,7 @@ monotonic counter assigned by each sender independently
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
 | `0x14` STATUS | agent→ | `{state: UP|DEGRADED|DONGLE_DEAD|TUNNEL_FLAP, detail}` |
 | `0x15` SHUTDOWN | both | graceful close |
-| `0x16` SCO_STATE | container→ | `{open: bool, packet_len}` — instructs the agent to enable/disable the USB isochronous path (round 19, see below) |
+| `0x16` SCO_STATE | container→ | `{open: bool, packet_len}` — instructs the agent to enable/disable the USB isochronous path (round 19, see below); `packet_len` is meaningful only on `open: true` — send `0` on close |
 
 **USB SCO altsetting control (round 19).** The Bluetooth USB
 Transport spec keeps Interface 1 (SCO audio) at `altsetting 0` —
@@ -306,6 +306,8 @@ Field rules:
 `PROVISIONING` (admin created line + issued token/keys) → `PAIRING`
 (agent connected, dongle attached, adapter materialized, phone pairing
 via container bluetoothd) → `READY` → `IN_CALL` → `DEGRADED`
+(heartbeat/USB issues) → `FAULTED` (manual or watchdog teardown) →
+back to `READY` on recovery.
 
 **Headless pairing (round 19).** Pairing runs on `bluetoothd` INSIDE
 the container, and modern phones use Secure Simple Pairing (numeric
@@ -317,9 +319,7 @@ attempt by default; `admin.pair_window {line_id, duration_sec}`
 auto-confirms the SSP passkey comparison for the window's duration.
 The window, the adapter (by `adapter_mac`), and any discovered
 devices are exposed through the admin surface (`phonebridgectl` /
-admin MCP) — no shell access required.
-(heartbeat/USB issues) → `FAULTED` (manual or watchdog teardown) →
-back to `READY` on recovery. Container-side teardown of a line:
+admin MCP) — no shell access required. Container-side teardown of a line:
 destroy the vhci adapter → bluetoothd emits `InterfacesRemoved` →
 per-line worker FSM reaps cleanly — the same deterministic path for
 every failure source, because a virtual adapter never wedges the kernel.
@@ -337,5 +337,12 @@ every failure source, because a virtual adapter never wedges the kernel.
   server's per-peer `/32` is the isolation boundary.
 - PII hygiene: the agent must not log dialed numbers, caller IDs, or
   HCI payloads containing them (`mask_pii` default on).
+- SSP auto-confirm caveat (round 19): `admin.pair_window` trades the
+  numeric-comparison MITM check for operability — during the open
+  window a nearby hostile device could in principle pair. Mitigation
+  is scope, not crypto: the window is short (default 60 s), bound to
+  ONE adapter, requires an admin-scope token, and the operator is
+  expected to hold the target phone at the prompt. Outside the
+  window the managed `Agent1` rejects unconditionally.
 - The agent binds to loopback/WAN only via the tunnel profile; it does
   not expose any local listener.

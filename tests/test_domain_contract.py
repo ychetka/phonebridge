@@ -79,7 +79,7 @@ def _assignment(**overrides: Any) -> LineAssignment:
     kwargs: dict[str, Any] = {
         "assignment_id": contract.AssignmentId("asg-1"),
         "line_id": LineId("line-main"),
-        "owner_agent_id": "agent-1",
+        "owner_agent_id": None,
         "mode": AssignmentMode.SHARED_POOL,
         "claimable": True,
         "last_seen_at": NOW_UTC,
@@ -427,8 +427,15 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     # or ordinary US/CA mobiles are rejected as UNSUPPORTED_NUMBER_TYPE.
     assert "FIXED_LINE_OR_MOBILE" in _assignment().allowed_number_types
     assert {"FIXED_LINE", "MOBILE", "VOIP", "TOLL_FREE"} <= _assignment().allowed_number_types
-    # Round 19: pool/provider attachments have no agent owner.
-    assert _assignment(owner_agent_id=None).owner_agent_id is None
+    # Round 19: pool/provider attachments have no agent owner, and the
+    # owner⇔mode invariant is enforced at the model boundary.
+    assert _assignment().owner_agent_id is None
+    with pytest.raises(ValidationError):
+        _assignment(owner_agent_id="agent-1")  # shared_pool cannot own
+    with pytest.raises(ValidationError):
+        _assignment(mode=AssignmentMode.EXCLUSIVE)  # exclusive needs owner
+    exclusive = _assignment(mode=AssignmentMode.EXCLUSIVE, owner_agent_id="agent-1")
+    assert exclusive.owner_agent_id == "agent-1"
 
 
 def test_line_admin_kernel_surface() -> None:
