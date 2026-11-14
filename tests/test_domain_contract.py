@@ -475,12 +475,10 @@ def test_event_wire_name_parity() -> None:
     # table row `| `event.<name>` |` in docs/api-contract.md — and
     # every such row must be covered by the mapping (no orphans in
     # either direction).
-    api_contract = (
-        Path(__file__).parents[1] / "docs" / "api-contract.md"
-    ).read_text(encoding="utf-8")
-    doc_event_rows = set(
-        re.findall(r"^\|\s*`(event\.[a-z_]+)`\s*\|", api_contract, flags=re.M)
+    api_contract = (Path(__file__).parents[1] / "docs" / "api-contract.md").read_text(
+        encoding="utf-8"
     )
+    doc_event_rows = set(re.findall(r"^\|\s*`(event\.[a-z_]+)`\s*\|", api_contract, flags=re.M))
     assert doc_event_rows == set(EVENT_WIRE_NAMES.values())
 
 
