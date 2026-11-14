@@ -48,6 +48,7 @@ from pydantic import (
 from pydantic_core import core_schema
 
 __all__ = [
+    "EVENT_WIRE_NAMES",
     "AcceptResult",
     "AcquireGranted",
     "AcquireQueued",
@@ -272,8 +273,10 @@ class ErrorReason(str, Enum):
 class EventName(str, Enum):
     """Domain event names carried on EventEnvelope.
 
-    Wire spellings under ``event.*`` (incoming_call, line_acquired,
-    queue_updated, ...) are an adapter-boundary mapping concern.
+    Wire spellings under ``event.*`` are an adapter-boundary mapping
+    concern - the authoritative table is ``EVENT_WIRE_NAMES`` below.
+    Any new member MUST get a wire entry in the same commit (drift
+    test ``test_event_wire_name_parity`` enforces this).
     """
 
     INCOMING_CALL = "incoming_call"
@@ -285,6 +288,27 @@ class EventName(str, Enum):
     FALLBACK_TRIGGERED = "fallback_triggered"
     LINE_STATE_CHANGED = "line_state_changed"
     MISSED_CALL = "missed_call"
+
+
+EVENT_WIRE_NAMES: dict[EventName, str] = {
+    EventName.INCOMING_CALL: "event.incoming_call",
+    EventName.CALL_STATE_CHANGED: "event.call_state_changed",
+    EventName.QUEUE_READY: "event.line_acquired",
+    EventName.QUEUE_UPDATED: "event.queue_updated",
+    EventName.ASSIGNMENT_REVOKED: "event.assignment_revoked",
+    EventName.AUDIO_READY: "event.audio_ready",
+    EventName.FALLBACK_TRIGGERED: "event.fallback_triggered",
+    EventName.LINE_STATE_CHANGED: "event.line_state_changed",
+    EventName.MISSED_CALL: "event.missed_call",
+}
+"""Authoritative domain→wire event mapping (round 19b).
+
+Every EventName resolves to the ``event.<name>`` notification an
+agent session receives. Names are intentionally not always equal:
+``queue_ready`` describes the queue-side grant while the wire
+``line_acquired`` describes what the agent got. Drift between this
+table and docs/api-contract.md's ``event.*`` table is caught by
+``test_event_wire_name_parity``."""
 
 
 # ---------------------------------------------------------------------------

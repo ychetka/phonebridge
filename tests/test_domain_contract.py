@@ -16,6 +16,7 @@ from pydantic import TypeAdapter, ValidationError
 
 import phonebridge.domain.contract as contract
 from phonebridge.domain.contract import (
+    EVENT_WIRE_NAMES,
     AcceptResult,
     AcquireGranted,
     AcquireQueued,
@@ -450,6 +451,24 @@ def test_line_admin_kernel_surface() -> None:
     }
     with pytest.raises(TypeError):
         LineAdminKernel()  # type: ignore[abstract]
+
+
+def test_event_wire_name_parity() -> None:
+    """Round 19b drift test: EVERY domain EventName resolves to a
+    documented ``event.*`` wire name — a new domain event can never
+    be left an orphan on the wire (the pre-round-19b
+    ASSIGNMENT_REVOKED gap)."""
+    assert set(EVENT_WIRE_NAMES) == set(EventName)
+    for wire in EVENT_WIRE_NAMES.values():
+        assert wire.startswith("event.")
+    # Deliberate rename, not drift: domain queue_ready → wire
+    # line_acquired (grant fact, not queue internals).
+    assert EVENT_WIRE_NAMES[EventName.QUEUE_READY] == "event.line_acquired"
+    assert EVENT_WIRE_NAMES[EventName.ASSIGNMENT_REVOKED] == "event.assignment_revoked"
+    # 1:1 names elsewhere.
+    for name in EventName:
+        if name is not EventName.QUEUE_READY:
+            assert EVENT_WIRE_NAMES[name] == f"event.{name.value}"
 
 
 def test_event_envelope_and_payloads() -> None:
