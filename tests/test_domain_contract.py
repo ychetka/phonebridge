@@ -42,6 +42,7 @@ from phonebridge.domain.contract import (
     IncomingRingIngress,
     Intent,
     LeaseId,
+    LineAdminKernel,
     LineAssignment,
     LineId,
     LineManager,
@@ -426,6 +427,22 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     # or ordinary US/CA mobiles are rejected as UNSUPPORTED_NUMBER_TYPE.
     assert "FIXED_LINE_OR_MOBILE" in _assignment().allowed_number_types
     assert {"FIXED_LINE", "MOBILE", "VOIP", "TOLL_FREE"} <= _assignment().allowed_number_types
+    # Round 19: pool/provider attachments have no agent owner.
+    assert _assignment(owner_agent_id=None).owner_agent_id is None
+
+
+def test_line_admin_kernel_surface() -> None:
+    """Round 19: the admin kernel is a separate narrow ABC — the
+    agent-facing LineManager deliberately exposes no privileged
+    mutations (approve/reject/revoke/configure)."""
+    assert set(LineAdminKernel.__abstractmethods__) == {
+        "approve_claim",
+        "reject_claim",
+        "revoke_assignment",
+        "configure_line",
+    }
+    with pytest.raises(TypeError):
+        LineAdminKernel()  # type: ignore[abstract]
 
 
 def test_event_envelope_and_payloads() -> None:

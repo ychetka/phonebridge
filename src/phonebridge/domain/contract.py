@@ -79,6 +79,7 @@ __all__ = [
     "IncomingRingIngress",
     "Intent",
     "LeaseId",
+    "LineAdminKernel",
     "LineAssignment",
     "LineId",
     "LineManager",
@@ -545,11 +546,18 @@ class LineAssignment(ContractModel):
     Survives agent sleep/disconnect and provider reconnects (no
     heartbeat). ``idle_revoke_after`` is ALERT-ONLY (round 10c):
     expiry triggers escalation notifications, not silent reassignment.
+
+    ``owner_agent_id`` is ``None`` for a SHARED_POOL line (round 19):
+    ``register_provider`` produces the assignment when the provider
+    attaches - before any agent has claimed or been granted anything.
+    A non-None value means durable exclusive ownership
+    (``exclusive_line`` mode). This avoids magic placeholder strings
+    ("", "__pool__") in implementations.
     """
 
     assignment_id: AssignmentId
     line_id: LineId
-    owner_agent_id: str
+    owner_agent_id: str | None = None
     mode: AssignmentMode
     claimable: bool
     accept_window_sec: float = Field(default=30.0, gt=0)
@@ -779,11 +787,13 @@ class QueueUpdatedEvent(ContractModel):
 
 class AssignmentRevokedEvent(ContractModel):
     """assignment_revoked payload: durable binding ended (release,
-    admin line.revoke, or idle escalation)."""
+    admin line.revoke, or idle escalation). ``owner_agent_id`` is
+    None when the revoked binding was a pool/provider attachment
+    (round 19)."""
 
     assignment_id: AssignmentId
     line_id: LineId
-    owner_agent_id: str
+    owner_agent_id: str | None = None
     reason: str | None = None
 
 
@@ -1146,4 +1156,55 @@ class LineManager(ABC):
         naive, normalize to UTC) when tick is driven from an untrusted
         entry point.
         """
+        ...
+
+
+class LineAdminKernel(ABC):
+    """Narrow admin-surface kernel interface (round 19).
+
+    The agent-facing ``LineManager`` deliberately has NO mutation
+    methods for claims, revokes, or runtime line config - the wire
+    admin namespace (admin.*, scope ``admin``) maps onto this separate
+    interface so an agent-scope token can never reach a privileged
+    path by accident. ``InMemoryLineManager`` (M1) implements BOTH
+    interfaces; the admin adapter alone holds a reference to this
+    surface.
+    """
+
+    @abstractmethod
+    async def approve_claim(self, claim_id: str) -> LineAssignment:
+        """Approve a pending ``call.claim_exclusive`` request: grants
+        the durable ``exclusive_line`` assignment (moderator action,
+        §4.2). Unknown claim_id -> PhonebridgeError."""
+        ...
+
+    @abstractmethod
+    async def reject_claim(self, claim_id: str, reason: str | None = None) -> None:
+        """Reject a pending claim request with an optional PII-free
+        reason string."""
+        ...
+
+    @abstractmethod
+    async def revoke_assignment(
+        self, assignment_id: AssignmentId, reason: str | None = None
+    ) -> None:
+        """Admin ``line.revoke``: end a durable binding, emit
+        AssignmentRevokedEvent. Covers BOTH exclusive-owner bindings
+        and provider attachments (round 19)."""
+        ...
+
+    @abstractmethod
+    async def configure_line(
+        self,
+        line_id: LineId,
+        *,
+        fallback_policy: FallbackPolicy | None = None,
+        accept_window_sec: float | None = None,
+        allowed_number_types: frozenset[str] | None = None,
+        claimable: bool | None = None,
+    ) -> LineAssignment:
+        """Runtime line-config patch (admin.configure_line): apply only
+        the non-None fields, return the updated LineAssignment. All
+        windows are admin-configurable without a daemon restart
+        (round 10a)."""
         ...

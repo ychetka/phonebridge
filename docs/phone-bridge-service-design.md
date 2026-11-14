@@ -54,11 +54,20 @@ referenced sections.
 | round 13 (vhci experiment — protocol hardening, 2026-11-13) | One-dongle end-to-end experiment PASSED (issue #29): dongle → hci-agent → control-TCP/media-UDP → `/dev/vhci` → bluetoothd/oFono → live call with bidirectional SCO. Silent-audio incident diagnosed and fixed live — media frames outrun the sync-connection event across the split channels, and raw USB isoc buffers are not HCI-frame-aligned. Locked invariants: control channel is strictly lossless + `ctrl_seq` sequenced (gap/overflow = fatal session reset); agent reassembles complete HCI SCO packets at the isoc boundary (`media_seq`, one packet per datagram); feeder gates SCO on `0x2c`/`0x03` events, closes before `0x05`, caps unknown-handle holds at ≤4 frames; loud media health events `SCO_UNEXPECTED_HANDLE`/`SCO_RX_STARVATION`/`SCO_FRAMING_ERROR` | docs/hci-agent.md §2 |
 | round 14 (architect review — edge cases, 2026-11-13) | Second review pass (issue #31): `line.dial`/`line.answer` now carry per-lease `{media_endpoint, media_token}` for the provider's `media.auth`; `call.acquire` restricted to `dial_out` only (inbound via `call.accept`, exclusive via `call.claim_exclusive`); `provider.call_state` uses the canonical state set `ringing\|dialing\|alerting\|active\|disconnected` + `lease_id?`; new `provider.audio_ready` notification feeds `event.audio_ready`; MediaRouter gains pair TTL (~5 s) and bounded frame queues; `fallback_call_token` mechanics defined for FallbackWorker on `accept_window_sec` expiry; `adapter_mac` added to `LineProviderConfig` | §2.2, §5.3, §5.5, docs/api-contract.md |
 | round 15-16 (contract parity + doc tails, 2026-11-13) | contract.py aligned to api-contract (issue #33): `country` in `dial()`, `allowed_number_types` on LineAssignment (+mandatory `FIXED_LINE_OR_MOBILE` for NANP), full EventName vocabulary + event models, `fallback_call_token`, `drop_session`, `ingest_audio_ready`, explicit `RedactedString` JSON serializer, `MAX_CTRL_FRAME_LEN=4096`. Review 4 (SA_hidrogen): `answer_confidence` carried on `event.call_state_changed`; §3.5/§3.6/§13 updated for provider.audio_ready, event.fallback_triggered and the hci-agent/vhci line-bundle topology | §3.5, §3.6, §5.5, §13, docs/api-contract.md |
+| round 17-18 (review tails 5-6, 2026-11-13) | `EventName.QUEUE_UPDATED` + `QueueUpdatedEvent`; `QueueReadyEvent` gains `session_id`+`intent` (wire `event.line_acquired` needs no adapter-side ticket table); full round-15 test coverage; `_mask_for_log` hardened for `set`/`frozenset`; local media endpoint specified as **WebSocket over AF_UNIX** (raw SOCK_STREAM has no message boundaries); `0x04 MEDIA_PING` uplink endpoint binding + WireGuard `/32` peer isolation on the container side | docs/api-contract.md, docs/hci-agent.md §2/§6 |
+| round 19 (architect review 7 — blind spots, 2026-11-14) | `LineAssignment.owner_agent_id` nullable (`None` = pool/provider attachment, no magic strings); `LineAdminKernel` separate admin interface (`approve_claim`/`reject_claim`/`revoke_assignment`/`configure_line`) — agent surface has no privileged mutations; queue fairness = one global monotonic `seq` (lowest eligible seq wins, no scope starvation); incoming ring PREEMPTS an undialed grant (`preempted_by_incoming`, ticket reissued at head); deterministic D-Bus resolution chain `adapter_mac → Adapter1.Address → Device1.Adapter → phone_mac → bluez_input/output.<phone_mac>`; `0x16 SCO_STATE` feeder→agent USB altsetting control; in-container BlueZ `Agent1` + `admin.pair_window` for headless pairing; MCP adapter = control plane only (media via agent audio worker / MediaSidecar) | §2.1, §3.4, §4.2, §10, docs/api-contract.md, docs/hci-agent.md §2/§5 |
 
 ## §1. Service boundary
 
 ### Inside `phonebridge` (owns the telephony plane)
 
+- Multi-line object resolution (round 19): with N virtual adapters
+  the D-Bus graph holds N AG objects (`ag1..agN`) whose ordinals
+  follow reconnect order - LineProvider resolves its own line
+  deterministically, never by `hciN`/`agN` indices:
+  `config.adapter_mac → org.bluez.Adapter1.Address (→ /org/bluez/hciX)
+  → paired org.bluez.Device1.Adapter == hciX (→ phone_mac) → PipeWire
+  nodes bluez_input.<phone_mac> / bluez_output.<phone_mac>`.
 - oFono-compatible call control on `/org/pipewire/Telephony/ag1`:
   `VoiceCallManager.Dial/HangupAll/GetCalls`, per-call
   `org.ofono.VoiceCall.Answer/Hangup`, `AudioGatewayTransport1.Codec`.
@@ -674,7 +683,17 @@ status (mirrors the busctl commands used in Phase-0).
     agent can administer the system (round 10e): key
     generation/revocation, caps/profile/claimable/
     `accept_window_sec`/`fallback_policy` per line, claim approvals,
-    escalation channels.
+    escalation channels;
+  - kernel-side the admin surface binds to the narrow
+    `LineAdminKernel` interface (round 19):
+    `approve_claim`/`reject_claim`/`revoke_assignment`/
+    `configure_line` — the agent-facing `LineManager` deliberately
+    exposes no privileged mutations;
+  - **headless pairing** (round 19): an in-container BlueZ
+    `org.bluez.Agent1` rejects all pairing by default;
+    `admin.pair_window {line_id, duration_sec}` opens `Pairable` on
+    one adapter (by `adapter_mac`) and auto-confirms SSP within the
+    window — no `docker exec bluetoothctl` per line.
 - **ALL timeouts and windows are admin-configurable** (round 10a):
   accept window (default 30 s), queue grant TTL, ping/DEGRADED/DOWN
   thresholds, orphan grace.

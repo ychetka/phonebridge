@@ -11,6 +11,14 @@ Transport: **JSON-RPC 2.0 bidirectional over one connection per peer**.
   natively speak MCP (e.g. the developer's secretary agent). The
   admin UI is just one consumer of the same API — nothing in the
   contract is UI-specific.
+- **MCP adapter boundary (round 19):** the MCP surface is the
+  CONTROL plane only. A standard MCP client cannot stream binary
+  PCM, so a `call.dial`/`call.accept` issued through MCP returns the
+  same `{lease_id, media_endpoint, media_token}` — the media socket
+  is held either by a dedicated audio worker of the calling agent
+  (which receives the endpoint+token out of band) or by a local
+  `MediaSidecar` exposing higher-level tools (`speak_text`,
+  `listen`). The MCP adapter never owns a media socket itself.
 
 Two endpoint surfaces, one gateway daemon, shared in-process `LineManager` kernel:
 
@@ -183,6 +191,17 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 - Position advances via `event.queue_updated`; on grant the agent
   gets `event.line_acquired` and must act within an admin-configured
   grant TTL (~5 s illustrative) or the next ticket is served.
+- **Fairness across scopes (round 19):** one monotonic `seq` counter
+  covers ALL queue scopes. When line `L` frees, the grant goes to the
+  lowest-`seq` eligible ticket — per-line tickets (`line_id == L`)
+  and pool tickets (`line_id` unspecified / `None`) compete in one
+  global order; no starvation of either scope.
+- **Grant vs incoming-ring race (round 19):** a physical
+  `ingest_ring` on a line in the granted-but-undialed window
+  PREEMPTS the grant (if the line profile admits inbound): the
+  unused lease ends with `event.call_state_changed{state:
+  "disconnected", reason: "preempted_by_incoming"}`; a queue-origin
+  ticket is reissued at the head (`position=1`, same `seq` retained).
 - Tickets are **socket-bound**: disconnect kills them.
 - `call.standby` / `line.standby` REMOVED (round 8): no server-side
   parked requests - client retry is the freshness guarantee.
@@ -265,6 +284,26 @@ identical framing code path (`websockets.unix_serve` —
      `media.dropped` — an agent that floods faster than realtime is
      rate-limited by drop+telemetry, not by memory growth. The router
      never buffers unboundedly between mismatched-rate peers.
+
+## Admin surface — kernel operations (round 19, wire contract in c_admin/item_13)
+
+The agent-facing surface has no privileged mutations. Admin-scope
+tokens reach a separate kernel interface (`LineAdminKernel`) —
+implemented by the same `InMemoryLineManager` class but bound only
+to the admin adapter:
+
+- `admin.approve_claim {claim_id}` → grants `exclusive_line`
+  assignment (moderator approval of a pending `call.claim_exclusive`).
+- `admin.reject_claim {claim_id, reason?}`.
+- `admin.revoke_assignment {assignment_id, reason?}` → ends a durable
+  binding (exclusive owner OR provider attachment); emits
+  `assignment_revoked` (kernel event; wire mapping in c_admin).
+- `admin.configure_line {line_id, fallback_policy?, accept_window_sec?,
+  allowed_number_types?, claimable?}` → runtime patch, no restart.
+- `admin.pair_window {line_id, duration_sec}` → opens the pairing
+  window on that line's adapter only (see hci-agent.md §5; the
+  container ships a BlueZ `org.bluez.Agent1` that rejects all pairing
+  attempts outside an open window).
 
 ## Decisions (developer, 2026-11-12)
 
