@@ -21,6 +21,11 @@ from phonebridge.domain.contract import (
     DTMF_PATTERN,
     EVENT_WIRE_NAMES,
     MAX_DTMF_DIGITS,
+    MAX_PENDING_CLAIMS_PER_AGENT,
+    MAX_PENDING_CLAIMS_TOTAL,
+    MAX_PROVIDER_META_ENTRIES,
+    MAX_PROVIDER_META_KEY_LEN,
+    MAX_PROVIDER_META_VALUE_LEN,
     PROVIDER_COMMAND_WIRE_NAMES,
     AcceptResult,
     AcquireGranted,
@@ -73,6 +78,7 @@ from phonebridge.domain.contract import (
     ProviderBinding,
     ProviderCallState,
     ProviderCallStateUpdate,
+    ProviderCapabilityUpdate,
     ProviderCommand,
     ProviderDialCommand,
     ProviderDisconnectReason,
@@ -90,6 +96,7 @@ from phonebridge.domain.contract import (
     SessionAudience,
     SessionId,
     TicketId,
+    TimeoutConfig,
     ensure_aware_utc,
 )
 
@@ -189,10 +196,10 @@ def test_redacted_string_contract(_gwt: object) -> None:
     event = IncomingCallEvent(
         line_id=LineId("line-main"),
         call_token=CallToken("tok-abc"),
-        caller=RedactedString(_RAW_NUMBER),
+        caller_id=RedactedString(_RAW_NUMBER),
         expires_at=NOW_UTC,
     )
-    caller = event.caller
+    caller = event.caller_id
     assert caller is not None
 
     # repr/str are masked; raw number never appears.
@@ -209,11 +216,11 @@ def test_redacted_string_contract(_gwt: object) -> None:
     wire_json = event.model_dump_json()
     assert _RAW_NUMBER in wire_json
     wire_dict = event.model_dump(mode="json")
-    assert wire_dict["caller"] == _RAW_NUMBER
+    assert wire_dict["caller_id"] == _RAW_NUMBER
 
     # Log dumps are masked in both helper spellings.
     safe = event.safe_dump()
-    assert safe["caller"] == "+373****45"
+    assert safe["caller_id"] == "+373****45"
     assert _RAW_NUMBER not in repr(safe)
     log_dict = event.to_log_dict()
     assert _RAW_NUMBER not in repr(log_dict)
@@ -275,7 +282,7 @@ def test_validation_error_hides_pii_input(_gwt: object) -> None:
             {
                 "line_id": "line-main",
                 "call_token": "tok-abc",
-                "caller": {"number": _RAW_NUMBER},  # invalid type, carries PII
+                "caller_id": {"number": _RAW_NUMBER},  # invalid type, carries PII
                 "expires_at": NOW_UTC,
             }
         )
@@ -385,6 +392,7 @@ def test_naive_datetime_rejected_and_aware_normalized() -> None:
         lease_id=LeaseId("lease-1"),
         line_id=LineId("line-main"),
         owner_agent_id="agent-1",
+        session_id=SessionId("sess-1"),
         intent=Intent.DIAL_OUT,
         created_at=NOW_UTC,
     )
@@ -394,6 +402,7 @@ def test_naive_datetime_rejected_and_aware_normalized() -> None:
                 "lease_id": "lease-1",
                 "line_id": "line-main",
                 "owner_agent_id": "agent-1",
+                "session_id": "sess-1",
                 "intent": "dial_out",
                 "created_at": "2026-11-13T12:00:00",  # naive ISO string
             }
@@ -452,11 +461,14 @@ def test_acquire_result_union_discrimination() -> None:
 
 def test_call_lease_answer_defaults_provisional() -> None:
     """'active' is PROVISIONAL: default confidence is provisional and
-    answered_at is None until an answer is observed."""
+    answered_at is None until an answer is observed. Round 22
+    (review-10 CRITICAL-2): the lease carries ``session_id`` - a
+    missing session is a ValidationError."""
     lease = CallLease(
         lease_id=LeaseId("lease-1"),
         line_id=LineId("line-main"),
         owner_agent_id="agent-1",
+        session_id=SessionId("sess-1"),
         intent=Intent.DIAL_OUT,
         created_at=NOW_UTC,
     )
@@ -464,6 +476,19 @@ def test_call_lease_answer_defaults_provisional() -> None:
     assert lease.answer_confidence == "provisional"
     assert lease.phase == CallPhase.ACQUIRED  # round 20: pre-dial phase
     assert lease.grant_expires_at is None
+    assert lease.session_id == SessionId("sess-1")
+    with pytest.raises(ValidationError):
+        CallLease.model_validate(
+            {
+                "lease_id": "lease-1",
+                "line_id": "line-main",
+                "owner_agent_id": "agent-1",
+                "intent": "dial_out",
+                "created_at": NOW_UTC.isoformat(),
+                # session_id absent - (session_id, lease_id) is the
+                # ownership pair, it can never default
+            }
+        )
 
 
 def test_fallback_policy_union_and_assignment_default() -> None:
@@ -476,10 +501,17 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     rec = adapter.validate_python({"policy": "record_and_telegram", "channel": "@ops"})
     assert isinstance(rec, RecordAndTelegramFallback)
     assert rec.channel == "@ops"
-    assert isinstance(
-        adapter.validate_python({"policy": "answer_and_announce"}),
-        AnswerAndAnnounceFallback,
+    announce = adapter.validate_python(
+        {"policy": "answer_and_announce", "announcement_ref": "wav:busy-msg"}
     )
+    assert isinstance(announce, AnswerAndAnnounceFallback)
+    assert announce.announcement_ref == "wav:busy-msg"
+    # Round 22 (review-10 MEDIUM-2): the policy carries the
+    # announcement selector - it cannot be empty or absent.
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"policy": "answer_and_announce"})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"policy": "answer_and_announce", "announcement_ref": ""})
     with pytest.raises(ValidationError):
         adapter.validate_python({"policy": "spill_to_pool"})  # never existed
 
@@ -507,6 +539,7 @@ def test_line_admin_kernel_surface() -> None:
     adds the typed read surface (list_*) so the admin adapter never
     reaches into kernel internals."""
     assert set(LineAdminKernel.__abstractmethods__) == {
+        "assign_line",
         "approve_claim",
         "reject_claim",
         "revoke_assignment",
@@ -519,12 +552,53 @@ def test_line_admin_kernel_surface() -> None:
         LineAdminKernel()  # type: ignore[abstract]
 
 
+def _doc_event_table() -> dict[str, dict[str, bool]]:
+    """Parse the "## APICallService → Agent — `event.*`" table in
+    docs/api-contract.md: wire event name -> {field: is_optional}
+    (round 22, review-10 HIGH-1 - the payload-field counterpart of
+    :func:`_doc_line_command_table`)."""
+    text = API_CONTRACT_MD.read_text(encoding="utf-8")
+    section = text.split("## APICallService → Agent", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    table: dict[str, dict[str, bool]] = {}
+    for m in re.finditer(r"^\|\s*`(event\.[a-z_]+)`\s*\|\s*`\{([^}]*)\}`", section, flags=re.M):
+        params: dict[str, bool] = {}
+        for p in m.group(2).split(","):
+            p = p.strip()
+            if p:
+                params[p.rstrip("?")] = p.endswith("?")
+        table[m.group(1)] = params
+    return table
+
+
+EVENT_PAYLOAD_MODELS: dict[EventName, type[contract.ContractModel]] = {
+    EventName.INCOMING_CALL: IncomingCallEvent,
+    EventName.CALL_STATE_CHANGED: CallStateChangedEvent,
+    EventName.QUEUE_READY: QueueReadyEvent,
+    EventName.QUEUE_UPDATED: QueueUpdatedEvent,
+    EventName.ASSIGNMENT_REVOKED: AssignmentRevokedEvent,
+    EventName.AUDIO_READY: AudioReadyEvent,
+    EventName.FALLBACK_TRIGGERED: FallbackTriggeredEvent,
+    EventName.LINE_STATE_CHANGED: LineStateChangedEvent,
+    EventName.MISSED_CALL: MissedCallEvent,
+}
+"""Domain EventName -> payload model (round 22): the wire-parity
+check below needs one authoritative model per event row."""
+
+
 def test_event_wire_name_parity() -> None:
     """Round 19b drift test: EVERY domain EventName resolves to a
     documented ``event.*`` wire name — a new domain event can never
     be left an orphan on the wire (the pre-round-19b
     ASSIGNMENT_REVOKED gap). The mapping is also verified against the
-    ``event.*`` table rows in docs/api-contract.md."""
+    ``event.*`` table rows in docs/api-contract.md.
+
+    Round 22 (review-10 HIGH-1) extends the check to the payload
+    schema: every event model's fields must match the ``{...}``
+    param list of its wire row by name AND by required-vs-optional
+    (the doc's ``?`` suffix vs the model field carrying a default) -
+    the same discipline ``test_provider_command_wire_parity``
+    applies to ``line.*`` commands."""
     assert set(EVENT_WIRE_NAMES) == set(EventName)
     for wire in EVENT_WIRE_NAMES.values():
         assert wire.startswith("event.")
@@ -547,12 +621,35 @@ def test_event_wire_name_parity() -> None:
     doc_event_rows = set(re.findall(r"^\|\s*`(event\.[a-z_]+)`\s*\|", api_contract, flags=re.M))
     assert doc_event_rows == set(EVENT_WIRE_NAMES.values())
 
+    # Payload parity: every EventName has exactly one payload model,
+    # and the model's field names + optionality match the wire row.
+    assert set(EVENT_PAYLOAD_MODELS) == set(EventName)
+    table = _doc_event_table()
+    assert table, "parsed zero event.* payloads - doc table format changed?"
+    assert set(table) == set(EVENT_WIRE_NAMES.values())
+    for name, model in EVENT_PAYLOAD_MODELS.items():
+        wire_name = EVENT_WIRE_NAMES[name]
+        model_fields = model.__pydantic_fields__
+        doc_params = table[wire_name]
+        assert set(model_fields) == set(doc_params), (
+            f"{model.__name__} drift vs {wire_name}: "
+            f"missing={set(doc_params) - set(model_fields)}, "
+            f"extra={set(model_fields) - set(doc_params)}"
+        )
+        model_optional = {f for f in model_fields if not model_fields[f].is_required()}
+        doc_optional = {p for p, optional in doc_params.items() if optional}
+        assert model_optional == doc_optional, (
+            f"{model.__name__} optionality drift vs {wire_name}: "
+            f"doc-optional-only={doc_optional - model_optional}, "
+            f"model-optional-only={model_optional - doc_optional}"
+        )
+
 
 def test_event_envelope_and_payloads() -> None:
     payload = IncomingCallEvent(
         line_id=LineId("line-main"),
         call_token=CallToken("tok-1"),
-        caller=RedactedString(_RAW_NUMBER),
+        caller_id=RedactedString(_RAW_NUMBER),
         expires_at=NOW_UTC,
     )
     envelope = EventEnvelope[IncomingCallEvent](
@@ -567,7 +664,7 @@ def test_event_envelope_and_payloads() -> None:
     csc = CallStateChangedEvent(
         lease_id=LeaseId("l-1"),
         line_id=LineId("line-main"),
-        phase=CallPhase.ACTIVE,
+        state="active",
         reason=CallEndReason.NORMAL,
         answer_confidence="provisional",
     )
@@ -593,7 +690,7 @@ def test_event_envelope_and_payloads() -> None:
     ft = FallbackTriggeredEvent(
         line_id=LineId("line-main"),
         call_token=CallToken("fb-tok"),
-        caller=RedactedString(_RAW_NUMBER),
+        caller_id=RedactedString(_RAW_NUMBER),
         policy=NoPickupFallback(),
     )
     lsc = LineStateChangedEvent(
@@ -632,11 +729,23 @@ def test_call_end_reason_wired_into_events() -> None:
         {
             "lease_id": "l-1",
             "line_id": "line-main",
-            "phase": "ended",
+            "state": "disconnected",
             "reason": "provider_lost",
         }
     )
     assert csc.reason is CallEndReason.PROVIDER_LOST
+
+    # Round 22 (review-10 HIGH-1): ``state`` rides the WIRE
+    # vocabulary - an internal CallPhase ("ended") has no wire
+    # spelling and is rejected.
+    with pytest.raises(ValidationError):
+        CallStateChangedEvent.model_validate(
+            {
+                "lease_id": "l-1",
+                "line_id": "line-main",
+                "state": "ended",
+            }
+        )
 
     # A reason outside the closed vocabulary is rejected on all three
     # event payloads.
@@ -644,7 +753,7 @@ def test_call_end_reason_wired_into_events() -> None:
         CallStateChangedEvent(
             lease_id=LeaseId("l-1"),
             line_id=LineId("line-main"),
-            phase=CallPhase.ENDED,
+            state="disconnected",
             reason="made_up_reason",
         )
     with pytest.raises(ValidationError):
@@ -745,13 +854,36 @@ def test_ingress_payloads_validate() -> None:
     )
     assert reg.state_snapshot is not None
     assert reg.state_snapshot[1].lease_id is None
-    IncomingRingIngress(
+    # Round 22 (review-10 MEDIUM-3): provider.call_state carries
+    # caller_id on ringing; the token is NO LONGER an ingress input -
+    # the kernel mints it inside ingest_ring and the adapter relays it
+    # back as the provider.call_state response {ok, call_token}.
+    ring = IncomingRingIngress(
         line_id=LineId("line-main"),
         assignment_id=contract.AssignmentId("asg-1"),
-        call_token=CallToken("tok-1"),
-        caller=RedactedString(_RAW_NUMBER),
+        caller_id=RedactedString(_RAW_NUMBER),
         observed_at=NOW_UTC,
     )
+    assert "call_token" not in IncomingRingIngress.__pydantic_fields__
+    assert ring.caller_id is not None
+    # ...and the wire update itself carries caller_id too.
+    ProviderCallStateUpdate(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("asg-1"),
+        caller_id=RedactedString(_RAW_NUMBER),
+        state=ProviderCallState.RINGING,
+        observed_at=NOW_UTC,
+    )
+    # Round 22 (review-10 CRITICAL-1): capability/profile refresh on
+    # an active binding - no token.
+    cap_update = ProviderCapabilityUpdate(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("asg-1"),
+        caps=(Intent.DIAL_OUT, Intent.RECEIVE_INBOUND),
+        profile="secretary",
+    )
+    assert "token" not in ProviderCapabilityUpdate.__pydantic_fields__
+    assert cap_update.profile == "secretary"
     decision = FallbackDecision(
         line_id=LineId("line-main"),
         call_token=CallToken("tok-1"),
@@ -805,6 +937,11 @@ class _FakeLineManager(LineManager):
         return None
 
     async def release(self, session_id: SessionId, lease_id: LeaseId) -> None:
+        return None
+
+    async def release_assignment(
+        self, session_id: SessionId, assignment_id: contract.AssignmentId
+    ) -> None:
         return None
 
     async def dial(
@@ -861,9 +998,21 @@ class _FakeLineManager(LineManager):
     async def ingest_ring(self, ring: IncomingRingIngress) -> IncomingCallEvent:
         return IncomingCallEvent(
             line_id=ring.line_id,
-            call_token=ring.call_token,
-            caller=ring.caller,
+            call_token=CallToken("tok-minted"),
+            caller_id=ring.caller_id,
             expires_at=NOW_UTC,
+        )
+
+    async def update_provider_capabilities(
+        self, update: ProviderCapabilityUpdate
+    ) -> ProviderBinding:
+        return ProviderBinding(
+            assignment_id=update.assignment_id,
+            line_id=update.line_id,
+            caps=update.caps,
+            profile=update.profile,
+            connected_at=NOW_UTC,
+            last_seen_at=NOW_UTC,
         )
 
     async def ingest_call_state(self, update: ProviderCallStateUpdate) -> None:
@@ -913,13 +1062,15 @@ def test_line_manager_is_abstract() -> None:
 
 async def test_line_manager_async_surface() -> None:
     """Non-e2e async exercise: EVERY abstract method is awaitable and
-    returns its contracted result type (all 20 methods - 18 async +
-    the two sync outbox drains, round 20)."""
+    returns its contracted result type (all 22 methods - 20 async +
+    the two sync outbox drains; round 22 adds ``release_assignment``
+    and ``update_provider_capabilities``)."""
     assert set(LineManager.__abstractmethods__) == {
         "register_intent",
         "acquire",
         "cancel_acquire",
         "release",
+        "release_assignment",
         "dial",
         "accept",
         "hangup",
@@ -927,6 +1078,7 @@ async def test_line_manager_async_surface() -> None:
         "claim_exclusive",
         "get_lines",
         "register_provider",
+        "update_provider_capabilities",
         "note_provider_liveness",
         "ingest_ring",
         "ingest_call_state",
@@ -978,11 +1130,20 @@ async def test_line_manager_async_surface() -> None:
         IncomingRingIngress(
             line_id=LineId("line-main"),
             assignment_id=contract.AssignmentId("asg-1"),
-            call_token=CallToken("tok-2"),
             observed_at=NOW_UTC,
         )
     )
     assert isinstance(ring_event, IncomingCallEvent)
+    assert isinstance(ring_event.call_token, str)  # kernel-minted (round 22)
+    updated_binding = await mgr.update_provider_capabilities(
+        ProviderCapabilityUpdate(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            caps=(Intent.DIAL_OUT,),
+        )
+    )
+    assert isinstance(updated_binding, ProviderBinding)
+    await mgr.release_assignment(session, contract.AssignmentId("asg-1"))
     await mgr.ingest_call_state(
         ProviderCallStateUpdate(
             line_id=LineId("line-main"),
@@ -1142,7 +1303,11 @@ class _FakeLineAdminKernel(LineAdminKernel):
     """Minimal admin-kernel stub exercising all privileged and read
     methods (round 20 spec: the admin surface must be drivable
     independently of the agent surface; round 21 adds the list_*
-    reads)."""
+    reads; round 22 adds ``assign_line`` + the timeout patch
+    surface)."""
+
+    async def assign_line(self, line_id: LineId, owner_agent_id: str) -> LineAssignment:
+        return _assignment(mode=AssignmentMode.EXCLUSIVE, owner_agent_id=owner_agent_id)
 
     async def approve_claim(self, claim_id: ClaimId) -> LineAssignment:
         return _assignment()
@@ -1188,12 +1353,19 @@ class _FakeLineAdminKernel(LineAdminKernel):
         accept_window_sec: float | None = None,
         allowed_number_types: frozenset[str] | None = None,
         claimable: bool | None = None,
+        idle_revoke_after: timedelta | None = None,
+        timeouts: TimeoutConfig | None = None,
     ) -> LineAssignment:
         return _assignment()
 
 
 async def test_line_admin_kernel_all_methods() -> None:
     kernel = _FakeLineAdminKernel()
+    # Round 22 (review-10 HIGH-5): admin assign is the durable-owner
+    # override path - no pending claim needed.
+    assigned = await kernel.assign_line(LineId("line-main"), "agent-9")
+    assert assigned.mode is AssignmentMode.EXCLUSIVE
+    assert assigned.owner_agent_id == "agent-9"
     granted = await kernel.approve_claim(ClaimId("claim-1"))
     assert isinstance(granted, LineAssignment)
     await kernel.reject_claim(ClaimId("claim-2"), reason="not claimable")
@@ -1203,9 +1375,76 @@ async def test_line_admin_kernel_all_methods() -> None:
     assert isinstance((await kernel.list_provider_bindings())[0], ProviderBinding)
     await kernel.revoke_assignment(contract.AssignmentId("asg-1"), reason="admin")
     updated = await kernel.configure_line(
-        LineId("line-main"), claimable=False, accept_window_sec=10.0
+        LineId("line-main"),
+        claimable=False,
+        accept_window_sec=10.0,
+        idle_revoke_after=timedelta(hours=24),
+        timeouts=TimeoutConfig(grant_ttl_sec=5.0, heartbeat_down_after=3),
     )
     assert isinstance(updated, LineAssignment)
+
+
+def test_timeout_config_patch_model() -> None:
+    """Round 22 (review-10 HIGH-5): TimeoutConfig is a PATCH model -
+    every knob optional with a positive bound."""
+    empty = TimeoutConfig()
+    assert all(getattr(empty, f) is None for f in TimeoutConfig.__pydantic_fields__)
+    patch = TimeoutConfig(grant_ttl_sec=5.0, orphan_grace_sec=10.0)
+    assert patch.grant_ttl_sec == 5.0
+    assert patch.heartbeat_down_after is None
+    with pytest.raises(ValidationError):
+        TimeoutConfig(grant_ttl_sec=0.0)
+    with pytest.raises(ValidationError):
+        TimeoutConfig(heartbeat_degraded_after=0)
+
+
+def test_provider_registration_meta_bounded() -> None:
+    """Round 22 (review-10 MEDIUM-5): meta is bounded - <=16 keys,
+    keys 1..64 chars, values <=256 chars (rule 7 on a wire-facing
+    field)."""
+    base = {
+        "line_id": "line-main",
+        "token": "line-secret-token-value",
+        "caps": ["dial_out"],
+    }
+    ok = ProviderRegistration.model_validate(
+        {**base, "meta": {f"k{i}": "v" for i in range(MAX_PROVIDER_META_ENTRIES)}}
+    )
+    assert len(ok.meta) == MAX_PROVIDER_META_ENTRIES
+    with pytest.raises(ValidationError):
+        ProviderRegistration.model_validate(
+            {
+                **base,
+                "meta": {f"k{i}": "v" for i in range(MAX_PROVIDER_META_ENTRIES + 1)},
+            }
+        )
+    with pytest.raises(ValidationError):
+        ProviderRegistration.model_validate(
+            {**base, "meta": {"k": "v" * (MAX_PROVIDER_META_VALUE_LEN + 1)}}
+        )
+    with pytest.raises(ValidationError):
+        ProviderRegistration.model_validate(
+            {**base, "meta": {"k" * (MAX_PROVIDER_META_KEY_LEN + 1): "v"}}
+        )
+    with pytest.raises(ValidationError):
+        ProviderRegistration.model_validate({**base, "meta": {"": "v"}})
+
+
+def test_pending_claim_bounds_documented() -> None:
+    """Round 22 (review-10 MEDIUM-4): claim caps exist as contract
+    constants and PendingClaim carries session_id - claims are
+    socket-bound, so drop_session cancels them."""
+    assert MAX_PENDING_CLAIMS_PER_AGENT == 8
+    assert MAX_PENDING_CLAIMS_TOTAL == 256
+    assert "session_id" in PendingClaim.__pydantic_fields__
+    claim = PendingClaim(
+        claim_id=ClaimId("claim-1"),
+        line_id=LineId("line-main"),
+        requester_agent_id="agent-1",
+        session_id=SessionId("sess-1"),
+        created_at=NOW_UTC,
+    )
+    assert claim.session_id == SessionId("sess-1")
 
 
 # ---------------------------------------------------------------------------

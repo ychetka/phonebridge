@@ -44,6 +44,7 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     Tag,
+    field_validator,
     model_validator,
 )
 from pydantic_core import core_schema
@@ -53,6 +54,11 @@ __all__ = [
     "DTMF_PATTERN",
     "EVENT_WIRE_NAMES",
     "MAX_DTMF_DIGITS",
+    "MAX_PENDING_CLAIMS_PER_AGENT",
+    "MAX_PENDING_CLAIMS_TOTAL",
+    "MAX_PROVIDER_META_ENTRIES",
+    "MAX_PROVIDER_META_KEY_LEN",
+    "MAX_PROVIDER_META_VALUE_LEN",
     "PROVIDER_COMMAND_WIRE_NAMES",
     "AcceptResult",
     "AcquireGranted",
@@ -112,6 +118,7 @@ __all__ = [
     "ProviderBinding",
     "ProviderCallState",
     "ProviderCallStateUpdate",
+    "ProviderCapabilityUpdate",
     "ProviderCommand",
     "ProviderDialCommand",
     "ProviderDisconnectReason",
@@ -129,6 +136,7 @@ __all__ = [
     "SessionAudience",
     "SessionId",
     "TicketId",
+    "TimeoutConfig",
     "WireCallState",
     "ensure_aware_utc",
 ]
@@ -483,6 +491,27 @@ DTMF_PATTERN: re.Pattern[str] = re.compile(rf"^[0-9A-D*#,wW]{{1,{MAX_DTMF_DIGITS
 bound derives from MAX_DTMF_DIGITS. Violation -> INVALID_ARGUMENT +
 ErrorReason.INVALID_DTMF."""
 
+MAX_PENDING_CLAIMS_PER_AGENT: int = 8
+"""Bounded pending ``call.claim_exclusive`` requests per agent
+(round 22, review-10 MEDIUM-4; CODING_HAZARDS rule 7): a buggy agent
+spamming claims cannot exhaust kernel memory - overflow is
+RESOURCE_EXHAUSTED."""
+
+MAX_PENDING_CLAIMS_TOTAL: int = 256
+"""Global bound on pending claims across all agents (round 22,
+review-10 MEDIUM-4): the per-agent cap alone is not enough when
+many agents connect; overflow is RESOURCE_EXHAUSTED."""
+
+MAX_PROVIDER_META_ENTRIES: int = 16
+"""Upper bound on ``ProviderRegistration.meta`` entries (round 22,
+review-10 MEDIUM-5; rule 7 on an external JSON-RPC ingress field)."""
+
+MAX_PROVIDER_META_KEY_LEN: int = 64
+"""Upper bound on a ``ProviderRegistration.meta`` key length."""
+
+MAX_PROVIDER_META_VALUE_LEN: int = 256
+"""Upper bound on a ``ProviderRegistration.meta`` value length."""
+
 _MASK = "****"
 _MASK_PREFIX_LEN = 4
 _MASK_SUFFIX_LEN = 2
@@ -722,9 +751,18 @@ class RecordAndTelegramFallback(ContractModel):
 
 class AnswerAndAnnounceFallback(ContractModel):
     """Worker policy: answer and play an announcement. Valid only while
-    an agent is registered for inbound on the line (params via admin)."""
+    an agent is registered for inbound on the line.
+
+    ``announcement_ref`` (round 22, review-10 MEDIUM-2) is the
+    admin-provisioned announcement reference - a WAV asset id or text
+    key the FallbackWorker resolves at execution time. The
+    FallbackWorker connects via the standard agent API only (ADR-01),
+    so the policy model itself MUST carry the announcement selector:
+    the worker has no admin scope to query line config. Wire config
+    spelling: ``answer_and_announce:<announcement_ref>``."""
 
     policy: Literal["answer_and_announce"] = "answer_and_announce"
+    announcement_ref: str = Field(min_length=1)
 
 
 FallbackPolicy = Annotated[
@@ -849,6 +887,17 @@ class CallLease(ContractModel):
     lease_id: LeaseId
     line_id: LineId
     owner_agent_id: str
+    session_id: SessionId
+    """Owning agent session (round 22, review-10 CRITICAL-2): one
+    ``agent_id`` may hold several concurrent sessions (parallel
+    workers, a Control MCP session next to an audio-worker session),
+    so lease ownership is authenticated on the ``(session_id,
+    lease_id)`` pair for ``dial``/``hangup``/``release``/``send_dtmf``;
+    ``drop_session`` tears down ONLY this session's leases without
+    killing sibling sessions' calls, and ``SessionAudience`` events
+    (``audio_ready``, ``call_state_changed``) route on it.
+    ``owner_agent_id`` stays for admin views and durable-binding
+    correlation."""
     intent: Intent
     phase: CallPhase = CallPhase.ACQUIRED
     created_at: AwareDatetime
@@ -986,7 +1035,17 @@ class AcceptResult(ContractModel):
 class PendingClaim(ContractModel):
     """A pending ``call.claim_exclusive`` request awaiting moderator
     approval (round 21, HIGH-7): the admin surface lists these via
-    ``LineAdminKernel.list_pending_claims``."""
+    ``LineAdminKernel.list_pending_claims``.
+
+    Bounded (round 22, review-10 MEDIUM-4; rule 7): at most
+    ``MAX_PENDING_CLAIMS_PER_AGENT`` per ``requester_agent_id`` and
+    ``MAX_PENDING_CLAIMS_TOTAL`` globally - overflow rejects
+    ``claim_exclusive`` with RESOURCE_EXHAUSTED. Claims are
+    SOCKET-BOUND like queue tickets: ``drop_session(session_id)``
+    cancels every pending claim filed by the dead session (the
+    approval-notification routing would otherwise target a dead
+    socket), and approving a cancelled claim id is
+    ``CLAIM_NOT_FOUND``."""
 
     claim_id: ClaimId
     line_id: LineId
@@ -1068,10 +1127,23 @@ class ProviderHangupCommand(ContractModel):
 
 
 class ProviderSendDtmfCommand(ContractModel):
-    """Synthesized DTMF tones on a bound provider (oFono SendTones).
-    `digits` MUST match DTMF_PATTERN; while tones are synthesized the
-    agent-side uplink PCM is muted (§6.4) so tones never race the
-    agent's audio stream."""
+    """In-band DTMF tones on a bound provider - NOT oFono SendTones,
+    which is BROKEN on PipeWire Telephony (live probe §5.5). The
+    LineProvider owns the whole segment (round 22, review-10
+    MEDIUM-1, §6.4): it synthesizes PCM tones and mixes them into
+    the per-line uplink endpoint ``phonebridge_uplink_<line_id>``
+    it owns, while muting the agent's uplink PCM for the tone
+    duration so tones never race the agent's audio stream.
+
+    Coordination with the MediaRouter: the ``0x02`` flush path
+    terminates in the MediaRouter's bounded per-lease uplink buffer
+    (gateway process) - the LineProvider emits the ``0x02`` frame on
+    its provider media socket after a DTMF segment, and the router
+    drops every still-queued older uplink frame for the lease, so
+    buffered agent speech is neither replayed delayed after the
+    tones nor swallowed during the mute.
+
+    `digits` MUST match DTMF_PATTERN."""
 
     command: Literal["send_dtmf"] = "send_dtmf"
     line_id: LineId
@@ -1157,8 +1229,12 @@ PayloadT = TypeVar("PayloadT", bound=ContractModel)
 
 
 class BroadcastAudience(ContractModel):
-    """Every live agent session sees the event: ``line_state_changed``,
-    and ``incoming_call``/``missed_call`` on shared-pool lines."""
+    """Every live agent session sees the event. Round 22 (review-10
+    HIGH-4) narrows the true-broadcast set to ``line_state_changed``
+    only: shared-pool ``incoming_call``/``missed_call`` no longer
+    broadcast raw caller_id PII and a one-shot call_token to
+    dial_out-only sessions - they route as one ``SessionAudience``
+    envelope per live session holding ``Intent.RECEIVE_INBOUND``."""
 
     scope: Literal["broadcast"] = "broadcast"
 
@@ -1168,10 +1244,10 @@ class AgentAudience(ContractModel):
     line owner (``incoming_call``/``missed_call``/``assignment_revoked``
     on owned lines) or the system worker ``system:fallback_worker``
     (``fallback_triggered``). PII or a one-shot ``call_token`` does
-    NOT by itself force this scope - on a shared-pool line
-    ``incoming_call``/``missed_call`` legitimately broadcast because
-    every connected agent is an eligible acceptor
-    (round 21, HIGH-4)."""
+    NOT by itself force this scope - but on a shared-pool line
+    ``incoming_call``/``missed_call`` reach only the sessions that
+    registered ``Intent.RECEIVE_INBOUND`` (one ``SessionAudience``
+    envelope each, round 22, review-10 HIGH-4)."""
 
     scope: Literal["agent"] = "agent"
     agent_id: str
@@ -1181,7 +1257,12 @@ class SessionAudience(ContractModel):
     """Exactly one session sees the event: ``queue_ready``,
     ``queue_updated``, ``audio_ready`` and ``call_state_changed``
     carry session-scoped lease facts that must not leak to other
-    sessions (round 21, HIGH-4)."""
+    sessions (round 21, HIGH-4). One logical event MAY be emitted as
+    several envelopes with distinct session ids - e.g. a shared-pool
+    ``incoming_call`` fans out as one ``SessionAudience`` envelope
+    per live ``Intent.RECEIVE_INBOUND`` session (round 22, review-10
+    HIGH-4); the EventBus stays a stateless router and needs no
+    session-intent table."""
 
     scope: Literal["session"] = "session"
     session_id: SessionId
@@ -1215,19 +1296,29 @@ class EventEnvelope(ContractModel, Generic[PayloadT]):
 
 class IncomingCallEvent(ContractModel):
     """incoming_call payload: first valid call.accept(call_token) wins
-    (wake-and-grant, §4.3/§5.2). ``caller`` is redacted PII; ``expires_at``
-    is the accept-window deadline (default 30 s, admin-configurable)."""
+    (wake-and-grant, §4.3/§5.2). ``caller_id`` is redacted PII
+    (round-22 wire-name fix: the wire field is ``caller_id``, not
+    ``caller``); ``expires_at`` is the absolute accept-window
+    deadline in RFC-3339 UTC - the earlier ``expires_in_ms`` relative
+    form would skew by queue delay unless recomputed against
+    ``emitted_at`` at outbox drain (round 22, review-10 HIGH-1)."""
 
     line_id: LineId
     call_token: CallToken
-    caller: RedactedString | None = None
+    caller_id: RedactedString | None = None
     expires_at: AwareDatetime
 
 
 class CallStateChangedEvent(ContractModel):
-    """call_state_changed payload. ``phase`` is the domain CallPhase;
-    the wire spelling "disconnected" maps to ENDED at the adapter
-    boundary. ``answer_confidence`` mirrors CallLease's hedge: how
+    """call_state_changed payload. ``state`` rides the WIRE vocabulary
+    (:data:`WireCallState`, round 22, review-10 HIGH-1): the earlier
+    ``phase: CallPhase`` field could hold internal phases that have no
+    wire spelling (ACQUIRED/RINGING/TERMINATING), so a naive
+    ``model_dump(mode="json")`` could emit a ``state`` value the wire
+    contract forbids. The kernel maps CallPhase -> WireCallState via
+    :data:`CALL_PHASE_WIRE_STATES` at emission time, so every
+    constructible payload is wire-sendable.
+    ``answer_confidence`` mirrors CallLease's hedge: how
     sure the bridge is that ACTIVE means a human answered (§5.5).
     ``reason`` rides the CLOSED :class:`CallEndReason` vocabulary
     (round-21 review): it carries BOTH provider-reported teardowns
@@ -1237,7 +1328,7 @@ class CallStateChangedEvent(ContractModel):
 
     lease_id: LeaseId
     line_id: LineId
-    phase: CallPhase
+    state: WireCallState
     reason: CallEndReason | None = None
     answer_confidence: AnswerConfidence | None = None
 
@@ -1247,7 +1338,13 @@ class QueueReadyEvent(ContractModel):
     ``event.line_acquired``). The agent must act (dial/release) within
     ``expires_at`` or the next ticket is served (§3.4 grant TTL).
     ``session_id`` and ``intent`` ride along so the transport adapter
-    needs no ticket→owner lookup to address the event (round 17)."""
+    needs no ticket→owner lookup to address the event (round 17).
+    ``ticket_id`` is on the wire (round 22, review-10 HIGH-1): the
+    ticket STAYS REFERENCED until its lease ends, so a preempted
+    queue-origin grant is re-notified as
+    ``event.queue_updated{position: 1}`` on the SAME ``ticket_id``
+    (api-contract.md "Grant vs incoming-ring race", round-22
+    clarification)."""
 
     ticket_id: TicketId
     session_id: SessionId
@@ -1269,16 +1366,25 @@ class QueueUpdatedEvent(ContractModel):
 
 
 class AssignmentRevokedEvent(ContractModel):
-    """assignment_revoked payload: durable binding ended (release,
-    admin line.revoke, or idle escalation). ``owner_agent_id`` is
-    None when the revoked binding was a pool/provider attachment
-    (round 19). ``reason`` stays free-form ``str``: the wire table
-    documents no closed vocabulary for it - an admin-supplied revoke
-    note is legal payload (round-21 review audit)."""
+    """assignment_revoked payload: a durable AGENT-owned
+    ``LineAssignment`` ended (owner ``call.release{assignment_id}``,
+    admin ``revoke_assignment``, or idle escalation). Round 22
+    (review-10 HIGH-6) makes ``owner_agent_id`` REQUIRED: this event
+    is emitted ONLY for an ``EXCLUSIVE`` agent assignment and is
+    delivered to that owner's session(s) via ``AgentAudience`` -
+    there is always an agent to notify. Revoking a
+    ``ProviderBinding`` has no agent audience and emits NO
+    ``assignment_revoked``: it produces ``ProviderRevokeCommand`` +
+    ``LineStateChangedEvent(new_state=DOWN,
+    reason=CallEndReason.ADMIN_REVOKED)`` instead, so an audience
+    can never be stamped ``None``. ``reason`` stays free-form
+    ``str``: the wire table documents no closed vocabulary for it -
+    an admin-supplied revoke note is legal payload (round-21 review
+    audit)."""
 
     assignment_id: AssignmentId
     line_id: LineId
-    owner_agent_id: str | None = None
+    owner_agent_id: str
     reason: str | None = None
 
 
@@ -1294,13 +1400,17 @@ class AudioReadyEvent(ContractModel):
 
 class FallbackTriggeredEvent(ContractModel):
     """fallback_triggered payload (round 14): delivered to the
-    ``system:fallback_worker`` session only. ``call_token`` is the
-    internal fallback_call_token re-issued after accept-window expiry -
-    single-use, TTL-bound, bypasses the exclusive-owner check."""
+    ``system:fallback_worker`` session only. This event is THE
+    fallback delivery channel (round 22, review-10 MEDIUM-2 - the
+    earlier "or ``event.incoming_call``" hedge is removed: the worker
+    needs the ``policy`` field, which ``incoming_call`` cannot
+    carry). ``call_token`` is the internal fallback_call_token
+    re-issued after accept-window expiry - single-use, TTL-bound,
+    bypasses the exclusive-owner check."""
 
     line_id: LineId
     call_token: CallToken
-    caller: RedactedString | None = None
+    caller_id: RedactedString | None = None
     policy: FallbackPolicy
 
 
@@ -1325,7 +1435,7 @@ class MissedCallEvent(ContractModel):
     (round-21 review)."""
 
     line_id: LineId
-    caller: RedactedString | None = None
+    caller_id: RedactedString | None = None
     reason: CallEndReason
     voicemail_ref: str | None = None
 
@@ -1346,7 +1456,7 @@ class ProviderActiveCall(ContractModel):
 
     lease_id: LeaseId | None = None
     state: ProviderCallState
-    caller: RedactedString | None = None
+    caller_id: RedactedString | None = None
 
 
 class ProviderRegistration(ContractModel):
@@ -1361,7 +1471,13 @@ class ProviderRegistration(ContractModel):
     profile: str | None = None
     meta: dict[str, str] = Field(default_factory=dict)
     """Opaque provider metadata (wire: ``provider.register{meta?}``
-    object). Kept as ``dict`` for wire compat: ``frozen=True`` covers
+    object). Bounded (round 22, review-10 MEDIUM-5; CODING_HAZARDS
+    rule 7 on an external JSON-RPC ingress field): at most
+    ``MAX_PROVIDER_META_ENTRIES`` keys, each key non-empty and at
+    most ``MAX_PROVIDER_META_KEY_LEN`` chars, each value at most
+    ``MAX_PROVIDER_META_VALUE_LEN`` chars - a violation is a
+    ValidationError (INVALID_ARGUMENT at the adapter). Kept as
+    ``dict`` for wire compat: ``frozen=True`` covers
     field reassignment only, so the mapping itself stays mutable -
     treat contents as immutable by convention (round-21 review; a
     MappingProxyType wrapper would add a custom validator+serializer
@@ -1372,6 +1488,21 @@ class ProviderRegistration(ContractModel):
     inside the 10 s orphan-grace window so the kernel can verify a
     surviving call still exists on the D-Bus before re-binding its
     lease (design §5.4). ``None`` on a first-time register."""
+
+    @field_validator("meta")
+    @classmethod
+    def _meta_bounds(cls, meta: dict[str, str]) -> dict[str, str]:
+        """Bound the external ``meta`` map (round 22, review-10
+        MEDIUM-5): an unbounded provider-controlled dict on a
+        wire-facing model is a memory/log hazard."""
+        if len(meta) > MAX_PROVIDER_META_ENTRIES:
+            raise ValueError(f"meta has {len(meta)} entries, max {MAX_PROVIDER_META_ENTRIES}")
+        for key, value in meta.items():
+            if not key or len(key) > MAX_PROVIDER_META_KEY_LEN:
+                raise ValueError(f"meta key must be 1..{MAX_PROVIDER_META_KEY_LEN} chars")
+            if len(value) > MAX_PROVIDER_META_VALUE_LEN:
+                raise ValueError(f"meta[{key!r}] value exceeds {MAX_PROVIDER_META_VALUE_LEN} chars")
+        return meta
 
 
 class ProviderLiveness(ContractModel):
@@ -1400,11 +1531,33 @@ class ProviderCallStateUpdate(ContractModel):
 
     ``call_token`` identifies the inbound ring; ``lease_id`` (round 14)
     identifies an established call - without it the gateway cannot
-    attribute an update to a lease.
+    attribute an update to a lease. ``caller_id`` (round 22,
+    review-10 MEDIUM-3) carries the inbound caller's E.164 on
+    ``ringing`` reports - the wire ``provider.call_state`` param was
+    previously missing, so a provider could not report WHO rings.
+
+    Routing rule for adapters (round 22): a ``state="ringing"``
+    report is fed to :meth:`LineManager.ingest_ring`, NOT to this
+    ingress - the ring path mints the ``call_token`` (see
+    :class:`IncomingRingIngress`). This model carries the
+    post-ring/established-call updates correlated by
+    ``call_token``/``lease_id``.
+
+    Correlating an early caller hangup (round 22): the provider
+    learns the minted ``call_token`` from the
+    ``provider.call_state{state:"ringing"}`` RESPONSE
+    (``{ok, call_token}``) and echoes it on every later update for
+    that ring, including a pre-answer ``disconnected``. As a second
+    correlation leg - covering rings the gateway discovered via a
+    ``state_snapshot`` where the provider never received the token -
+    a ``disconnected`` update carrying NEITHER ``call_token`` nor
+    ``lease_id`` on a line in ``RINGING_LOCKED`` resolves to that
+    line's one open ring (at most one ring exists per line).
 
     External calls (round 21, HIGH-6): an update carrying NEITHER
-    ``call_token`` nor ``lease_id`` reports a human-initiated call on
-    the physical phone (dialed or answered on the handset itself).
+    ``call_token`` nor ``lease_id`` on a line NOT in
+    ``RINGING_LOCKED`` reports a human-initiated call on the
+    physical phone (dialed or answered on the handset itself).
     The kernel marks the line BUSY with reason ``"external_call"`` -
     no agent lease is minted, no PipeWire bridge is attached (audio
     stays on the phone) and NO Hangup is ever sent; the state clears
@@ -1418,6 +1571,7 @@ class ProviderCallStateUpdate(ContractModel):
     assignment_id: AssignmentId
     call_token: CallToken | None = None
     lease_id: LeaseId | None = None
+    caller_id: RedactedString | None = None
     state: ProviderCallState
     reason: ProviderDisconnectReason | None = None
     observed_at: AwareDatetime
@@ -1426,14 +1580,45 @@ class ProviderCallStateUpdate(ContractModel):
 class IncomingRingIngress(ContractModel):
     """Ring ingress fact: a physical call is ringing on the line.
 
-    Distilled from the provider's RINGING report; carries the issued
-    call_token and the redacted caller id for wake-and-grant routing."""
+    Distilled from the provider's ``provider.call_state{state:
+    "ringing", caller_id?}`` report (round 22, review-10 MEDIUM-3).
+    The ``call_token`` is NOT an input: the taxonomy in
+    api-contract.md reserves ``call_token`` minting to
+    ``LineManager``, so the kernel mints it inside the ring
+    mutation and hands it back to the caller inside the returned
+    :class:`IncomingCallEvent` - the adapter MUST relay it to the
+    provider as the ``provider.call_state`` response
+    ``{ok, call_token}`` so the provider can correlate a
+    pre-answer caller hangup. Re-ingesting a ring on an already
+    ``RINGING_LOCKED`` line is idempotent and returns the existing
+    event (same ``call_token``) - e.g. a ring re-discovered through
+    the ``GetCalls()``/``state_snapshot`` reconciliation (design
+    §9)."""
 
     line_id: LineId
     assignment_id: AssignmentId
-    call_token: CallToken
-    caller: RedactedString | None = None
+    caller_id: RedactedString | None = None
     observed_at: AwareDatetime
+
+
+class ProviderCapabilityUpdate(ContractModel):
+    """provider.capability_update ingress fact (round 22, review-10
+    CRITICAL-1): a caps/profile refresh on an ACTIVE
+    ``ProviderBinding`` - wire params ``{line_id, assignment_id,
+    caps, profile?} -> {ok}``.
+
+    No ``token`` field: unlike ``provider.register``/
+    ``provider.reregister`` this RPC carries no shared secret - the
+    already-established binding id authenticates the peer on its own
+    connection. That is exactly why the kernel needs a dedicated
+    method: the M2 adapter cannot abuse ``register_provider`` (which
+    requires the token ``capability_update`` does not carry) and
+    cannot mutate the frozen ``ProviderBinding`` DTO directly."""
+
+    line_id: LineId
+    assignment_id: AssignmentId
+    caps: tuple[Intent, ...]
+    profile: str | None = None
 
 
 class FallbackDecision(ContractModel):
@@ -1455,7 +1640,10 @@ class FallbackDecision(ContractModel):
     """Re-issued ring token for WORKER policies (round 14): bound to
     ``system:fallback_worker``, single-use, TTL-bound, bypasses the
     exclusive-owner check so FallbackWorker can call accept() after
-    the original call_token went stale. None for CORE policies."""
+    the original call_token went stale. None for CORE policies.
+    Delivered to the worker inside ``event.fallback_triggered``
+    ONLY - the sole fallback delivery channel (round 22, review-10
+    MEDIUM-2)."""
 
 
 # ---------------------------------------------------------------------------
@@ -1568,6 +1756,28 @@ class LineManager(ABC):
         (subject to the per-session limit, RESOURCE_EXHAUSTED /
         SESSION_LIMIT_EXCEEDED on overflow), so a multi-call agent
         can run N parallel acquires.
+
+        ``system:fallback_worker`` (round 22, review-10 MEDIUM-2): a
+        session owned by that agent id BYPASSES
+        LINE_EXCLUSIVE_NOT_OWNER on this path - the worker executes
+        admin-configured ``forward_via_line`` policy whose target may
+        legitimately be an EXCLUSIVE line owned by a human/secretary;
+        the admin who configured the policy accepted that override.
+        It receives no other privileges (still intent-checked,
+        still lease-scoped).
+
+        Preemption of an undialed grant (round 22, review-10 HIGH-2):
+        when a physical ring preempts a granted-but-undialed lease,
+        the lease ends with ``preempted_by_incoming``. If the grant
+        came from a queue ticket, that SAME ``ticket_id`` is reissued
+        at the head (``seq`` retained) and the agent learns via
+        ``event.queue_updated{position: 1}`` - a granted ticket stays
+        referenced until its lease ends. If an IMMEDIATE grant was
+        taken with ``enqueue=True``, a NEW ticket materializes at
+        the head and the session learns its ``ticket_id`` inside the
+        ``event.queue_updated`` notification (the caller's enqueue
+        wish is honored). ``enqueue=False`` grants are torn down
+        without reissue.
         """
         ...
 
@@ -1579,9 +1789,41 @@ class LineManager(ABC):
 
     @abstractmethod
     async def release(self, session_id: SessionId, lease_id: LeaseId) -> None:
-        """call.release: end the lease (future calls only; an in-flight
-        call finishes, §4.2). OWNER_MISMATCH on a foreign lease.
-        Idempotent: releasing an already-released lease is a no-op."""
+        """call.release{lease_id}: end the EPHEMERAL CallLease (round 22,
+        review-10 HIGH-3 lifecycle fix).
+
+        The lease NEVER outlives the call and the call NEVER outlives
+        the lease: ``release`` on an ``ACQUIRED`` (granted-but-undialed)
+        lease simply frees the line; ``release`` during an in-flight
+        call is hangup-intent - the kernel enqueues a
+        ``ProviderHangupCommand`` and ends the lease, so a call can
+        never stay up with no owning lease (the earlier "an in-flight
+        call finishes" wording of §4.2 applied to the DURABLE
+        assignment, not to a lease). ``hangup``/provider
+        ``disconnected`` already end the lease implicitly, so a
+        trailing ``release`` after them is an idempotent no-op.
+        OWNER_MISMATCH on a foreign ``(session_id, lease_id)`` pair.
+
+        The DURABLE ``LineAssignment`` has its own voluntary-release
+        path - :meth:`release_assignment`."""
+        ...
+
+    @abstractmethod
+    async def release_assignment(self, session_id: SessionId, assignment_id: AssignmentId) -> None:
+        """call.release{assignment_id}: voluntary release of a durable
+        EXCLUSIVE ``LineAssignment`` by its owner (round 22, review-10
+        HIGH-3): the line reverts to the claimable shared pool and the
+        owner receives ``event.assignment_revoked``. This is the
+        "release" in the §4.2 LineAssignment "Ends by" row - and
+        THERE an in-flight call finishes (the durable binding ends,
+        the ephemeral lease completes its call and cannot renew).
+
+        The wire ``call.release`` carries exactly ONE target
+        (``lease_id`` XOR ``assignment_id``); the adapter dispatches
+        to :meth:`release` or this method. OWNER_MISMATCH when the
+        session's ``agent_id`` is not the assignment owner;
+        PhonebridgeError on an id unknown to the LineAssignment
+        object space. Idempotent on an already-released binding."""
         ...
 
     @abstractmethod
@@ -1612,14 +1854,30 @@ class LineManager(ABC):
         """call.accept: ATOMIC lease issue + ring answer + media attach
         (§5.2 step 4). First valid accept wins; a second accept on the
         consumed token gets STALE_TOKEN; owner-scoped lines reject
-        non-owners with OWNER_MISMATCH."""
+        non-owners with OWNER_MISMATCH.
+
+        Inbound-intent gate (round 22, review-10 HIGH-4): the
+        accepting session MUST have registered
+        ``Intent.RECEIVE_INBOUND`` - a ``dial_out``-only agent can
+        neither see the ring nor hijack it on a shared line
+        (INVALID_INTENT otherwise). The ``system:fallback_worker``
+        session is exempt: it accepts with the single-use
+        ``fallback_call_token`` minted for it at accept-window
+        expiry."""
         ...
 
     @abstractmethod
     async def hangup(self, session_id: SessionId, lease_id: LeaseId) -> None:
-        """call.hangup: end the call; lease teardown follows §5.4
-        (dead-man switch / orphan grace are impl concerns). Idempotent
-        on an already-ended call; OWNER_MISMATCH on foreign lease."""
+        """call.hangup: end the call AND the ephemeral lease atomically
+        (auto-release, round 22, review-10 HIGH-3): no separate
+        ``call.release`` is needed afterwards - the lease ends with
+        the call, the queue advances, and a trailing ``release`` is
+        an idempotent no-op (the earlier §5.1 "hangup + release"
+        phrasing is superseded: a line can never stay BUSY because an
+        agent forgot to release). A provider ``disconnected`` report
+        ends the lease the same way. Dead-man switch / orphan grace
+        follow §5.4. OWNER_MISMATCH on a foreign
+        ``(session_id, lease_id)`` pair."""
         ...
 
     @abstractmethod
@@ -1628,7 +1886,8 @@ class LineManager(ABC):
         ``digits`` MUST match ``DTMF_PATTERN`` (<= MAX_DTMF_DIGITS
         chars) - violation is INVALID_ARGUMENT with reason
         INVALID_DTMF (round 20). INVALID_STATE when the lease has no
-        ACTIVE call - tones are synthesized provider-side, so they
+        ACTIVE call - tones are synthesized in-band by the
+        LineProvider (see :class:`ProviderSendDtmfCommand`), so they
         only make sense mid-call."""
         ...
 
@@ -1637,7 +1896,12 @@ class LineManager(ABC):
         """call.claim_exclusive: file a CLAIM REQUEST. Returns
         pending_approval - never self-granted; a moderator approves in
         the admin surface (§4.2 round 10d). Conflict ->
-        LINE_EXCLUSIVE_NOT_OWNER / LINE_NOT_CLAIMABLE reason."""
+        LINE_EXCLUSIVE_NOT_OWNER / LINE_NOT_CLAIMABLE reason.
+        Bounded (round 22, review-10 MEDIUM-4): at most
+        ``MAX_PENDING_CLAIMS_PER_AGENT`` pending claims per agent and
+        ``MAX_PENDING_CLAIMS_TOTAL`` globally - overflow is
+        RESOURCE_EXHAUSTED. Pending claims are socket-bound:
+        ``drop_session`` cancels them."""
         ...
 
     @abstractmethod
@@ -1669,6 +1933,25 @@ class LineManager(ABC):
         ...
 
     @abstractmethod
+    async def update_provider_capabilities(
+        self, update: ProviderCapabilityUpdate
+    ) -> ProviderBinding:
+        """provider.capability_update ingress (round 22, review-10
+        CRITICAL-1): replace ``caps``/``profile`` on the ACTIVE
+        ``ProviderBinding`` identified by ``(line_id,
+        assignment_id)`` and return the updated binding record.
+
+        No shared-secret ``token`` rides this RPC - the binding id
+        authenticates the already-registered peer - so this path can
+        NEVER be folded into ``register_provider``. Unknown/stale
+        binding id -> PhonebridgeError; an update identical to the
+        current caps/profile is an idempotent no-op; a capability
+        shrink does NOT tear down live leases that relied on the old
+        caps (their facts were granted already) but no new grants
+        are made against removed intents."""
+        ...
+
+    @abstractmethod
     async def note_provider_liveness(self, liveness: ProviderLiveness) -> None:
         """Ingest a provider liveness fact (reachable/unreachable +
         timestamp). Drives DEGRADED -> DOWN line-state transitions and
@@ -1679,20 +1962,35 @@ class LineManager(ABC):
     @abstractmethod
     async def ingest_ring(self, ring: IncomingRingIngress) -> IncomingCallEvent:
         """Ring ingress: physical call ringing -> RINGING_LOCKED +
-        wake-and-grant routing (§4.3). Returns the incoming_call event
-        - the same instance is ALSO appended to the outbox inside the
-        mutation transaction; the EventBus publishes exclusively from
-        ``drain_events()``, the return value exists for caller
-        convenience (round 20). Atomic w.r.t. concurrent acquires on
-        the same line (single-event-loop invariant)."""
+        wake-and-grant routing (§4.3). The kernel MINTS the
+        ``call_token`` here (round 22, review-10 MEDIUM-3 - the
+        taxonomy reserves it to LineManager) and returns it inside
+        the ``IncomingCallEvent``; the adapter MUST relay that token
+        to the provider as the ``provider.call_state`` response
+        ``{ok, call_token}`` so a pre-answer caller hangup can be
+        correlated. Audience (round 22, HIGH-4): on an EXCLUSIVE
+        line one ``AgentAudience`` envelope to the owner; on a
+        SHARED_POOL line one ``SessionAudience`` envelope per live
+        session holding ``Intent.RECEIVE_INBOUND`` - never a
+        broadcast to dial_out-only sessions.
+
+        Returns the incoming_call event - the same instance is ALSO
+        appended to the outbox inside the mutation transaction; the
+        EventBus publishes exclusively from ``drain_events()``, the
+        return value exists for caller convenience (round 20).
+        Atomic w.r.t. concurrent acquires on the same line
+        (single-event-loop invariant). Idempotent: re-ingesting a
+        ring on an already RINGING_LOCKED line returns the existing
+        event with the SAME ``call_token``."""
         ...
 
     @abstractmethod
     async def ingest_call_state(self, update: ProviderCallStateUpdate) -> None:
         """Call-state ingress: bounded ProviderCallState update mapped
         into lease phase transitions. Stale/out-of-order updates are
-        deduped by observed_at; DISCONNECTED triggers lease teardown
-        (§5.4)."""
+        deduped by observed_at; DISCONNECTED ends the lease - an
+        ephemeral CallLease NEVER outlives its call (auto-release,
+        round 22, review-10 HIGH-3, §5.4)."""
         ...
 
     @abstractmethod
@@ -1722,8 +2020,15 @@ class LineManager(ABC):
         """Agent socket teardown fact (round 15): the transport layer
         reports a disconnected session so the kernel can atomically
         (a) kill every QueueTicket owned by the session - tickets are
-        socket-bound (§3.4) - and (b) run the dead-man switch on every
-        CallLease owned by it: hangup + lease teardown (§5.4).
+        socket-bound (§3.4) - (b) run the dead-man switch on every
+        CallLease owned BY THAT SESSION - ``CallLease.session_id``
+        pins the lease to one session, so a disconnected session
+        never kills sibling sessions' calls under the same
+        ``agent_id`` (round 22, review-10 CRITICAL-2) - and
+        (c) cancel every :class:`PendingClaim` filed by the session -
+        pending claims are socket-bound like tickets, an approval
+        could never be delivered to a dead socket anyway (round 22,
+        review-10 MEDIUM-4).
         Idempotent: a repeated drop on an already-gone session is a
         no-op. This is the ONLY way sessions end; there is no
         per-ticket/per-lease sweep API."""
@@ -1781,6 +2086,34 @@ class LineManager(ABC):
         ...
 
 
+class TimeoutConfig(ContractModel):
+    """Runtime-configurable kernel timing knobs (round 22, review-10
+    HIGH-5; design §10: "ALL timeouts and windows are
+    admin-configurable without a daemon restart").
+
+    Passed to :meth:`LineAdminKernel.configure_line` as a PATCH:
+    every member is optional, ``None`` means "leave unchanged".
+    Values are scoped per line - the line's provider binding and
+    queue grants share them."""
+
+    grant_ttl_sec: float | None = Field(default=None, gt=0)
+    """Deadline for an agent to consume a grant
+    (``AcquireGranted.expires_at``/``QueueReadyEvent.expires_at``)
+    before the lease ends ``grant_ttl_expired`` (~5 s illustrative
+    default, admin-configured)."""
+    orphan_grace_sec: float | None = Field(default=None, gt=0)
+    """WS-drop re-bind window - feeds
+    ``ProviderBinding.orphan_deadline_at`` (default 10 s, round
+    5b/20)."""
+    heartbeat_interval_sec: float | None = Field(default=None, gt=0)
+    """Required ``provider.ping`` cadence for the line's binding."""
+    heartbeat_degraded_after: int | None = Field(default=None, ge=1)
+    """Missed pings before the line goes DEGRADED."""
+    heartbeat_down_after: int | None = Field(default=None, ge=1)
+    """Missed pings before the line goes DOWN (must exceed the
+    DEGRADED threshold when both are set)."""
+
+
 class LineAdminKernel(ABC):
     """Narrow admin-surface kernel interface (round 19).
 
@@ -1792,6 +2125,22 @@ class LineAdminKernel(ABC):
     interfaces; the admin adapter alone holds a reference to this
     surface.
     """
+
+    @abstractmethod
+    async def assign_line(self, line_id: LineId, owner_agent_id: str) -> LineAssignment:
+        """Admin override (round 22, review-10 HIGH-5; design §4.2
+        "exclusive ownership is granted via claim + moderator approval
+        OR admin assign"): grant a durable EXCLUSIVE
+        ``LineAssignment`` to ``owner_agent_id`` WITHOUT a pending
+        claim - the provisioning path used to pre-assign a line
+        before the agent connects and files a claim.
+
+        ``line_id`` must exist (LINE_NOT_FOUND) and must not already
+        be held exclusive by another agent
+        (LINE_EXCLUSIVE_NOT_OWNER); an existing SHARED_POOL
+        assignment is converted in place (``mode=EXCLUSIVE``,
+        ``owner_agent_id`` set)."""
+        ...
 
     @abstractmethod
     async def approve_claim(self, claim_id: ClaimId) -> LineAssignment:
@@ -1840,11 +2189,15 @@ class LineAdminKernel(ABC):
         resolves to (round 20 - two identifier spaces share the
         AssignmentId tag, api-contract.md Identifier taxonomy): a
         ``LineAssignment`` (agent ownership) -> revert the line to
-        SHARED_POOL and emit AssignmentRevokedEvent to the revoked
-        owner; a ``ProviderBinding`` -> enqueue a
+        SHARED_POOL and emit ``AssignmentRevokedEvent`` to the
+        revoked owner; a ``ProviderBinding`` -> enqueue a
         ``ProviderRevokeCommand`` in the outbox, drop the line to
-        DOWN and tear down its leases. Unknown id in BOTH spaces ->
-        PhonebridgeError."""
+        DOWN and tear down its leases, emitting
+        ``LineStateChangedEvent(new_state=DOWN,
+        reason=CallEndReason.ADMIN_REVOKED)`` - NEVER an
+        ``AssignmentRevokedEvent``, because a provider attachment
+        has no agent audience (round 22, review-10 HIGH-6).
+        Unknown id in BOTH spaces -> PhonebridgeError."""
         ...
 
     @abstractmethod
@@ -1856,9 +2209,16 @@ class LineAdminKernel(ABC):
         accept_window_sec: float | None = None,
         allowed_number_types: frozenset[str] | None = None,
         claimable: bool | None = None,
+        idle_revoke_after: timedelta | None = None,
+        timeouts: TimeoutConfig | None = None,
     ) -> LineAssignment:
         """Runtime line-config patch (admin.configure_line): apply only
         the non-None fields, return the updated LineAssignment. All
         windows are admin-configurable without a daemon restart
-        (round 10a)."""
+        (round 10a). ``idle_revoke_after`` (round 22, review-10
+        HIGH-5) patches the ALERT-ONLY idle-escalation deadline
+        already carried on ``LineAssignment``; ``timeouts`` carries
+        the remaining runtime knobs (grant TTL, orphan grace,
+        heartbeat DEGRADED/DOWN thresholds) as a partial
+        :class:`TimeoutConfig` patch."""
         ...
