@@ -15,7 +15,11 @@ dev_summary: >-
   LineAssignment.timeouts for SQLite write-through;
   ProviderBinding.heartbeat_interval_ms stamps the per-session
   cadence (default 5000, gt>0); TimeoutConfig gains the same
-  ordering validator; validate_e164_country + ForwardViaLineFallback
+  ordering validator; LineTimeouts.apply_patch merges a
+  TimeoutConfig patch atomically via full re-validation of the
+  merged dict (round-24b residual: a lone-field patch that breaks
+  the heartbeat ladder maps to INVALID_ARGUMENT, no partial
+  state); validate_e164_country + ForwardViaLineFallback
   model validator + LineAssignment self-loop ban move dial-target
   validation into constructors; provider caps are non-empty
   telecom-only (no exclusive_line); docstrings freeze the

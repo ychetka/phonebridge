@@ -1,7 +1,7 @@
 # Spec — LineManager contract (Phase-0 freeze)
 
 Normative requirements for `src/phonebridge/domain/contract.py`,
-frozen at round 23 (architect review `SA_carbon_review_12`) ahead of
+frozen at round 24 (architect review `SA_carbon_review_13`) ahead of
 implementation milestones M1–M5. Prose sections carry the
 requirements; each is cited by `.changes` fragments via its heading
 anchor (see `docs/specs/README.md`).
@@ -94,7 +94,13 @@ interval negotiated for the current provider session (default
 the next `provider.reregister`, never retroactively to a live
 session. `heartbeat_down_after` MUST strictly exceed
 `heartbeat_degraded_after` on `LineTimeouts` and on `TimeoutConfig`
-when both fields are set.
+when both fields are set. A `TimeoutConfig` patch MUST be merged
+into the stored `LineTimeouts` atomically via
+`LineTimeouts.apply_patch` — a full `model_validate` of the merged
+dict — so a single-field patch that is legal in isolation but
+breaks the ladder against the stored values is rejected with
+`PhonebridgeError(INVALID_ARGUMENT)` and leaves the effective
+values untouched.
 
 ### Requirement: Dial-target and caps validation is model-level
 

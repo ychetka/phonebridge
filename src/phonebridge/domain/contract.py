@@ -45,6 +45,7 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     Tag,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -984,6 +985,39 @@ class LineTimeouts(ContractModel):
         if self.heartbeat_down_after <= self.heartbeat_degraded_after:
             raise ValueError("heartbeat_down_after must exceed heartbeat_degraded_after")
         return self
+
+    def apply_patch(self, patch: TimeoutConfig) -> LineTimeouts:
+        """Atomically merge a :class:`TimeoutConfig` PATCH into these
+        effective values (round 24b, residual review finding on the
+        round-24 C2 model).
+
+        The merge is a full ``model_validate`` of the merged dict -
+        every ``None`` patch field keeps the stored value, every
+        non-``None`` field replaces it - so ALL invariants are
+        re-checked against the RESULT, not against the patch alone.
+        This closes the single-field hole: a lone
+        ``heartbeat_degraded_after=4`` is a legal
+        :class:`TimeoutConfig` in isolation yet inverts the
+        heartbeat ladder against a stored ``heartbeat_down_after=3``.
+        ``LineAdminKernel.configure_line`` MUST merge through this
+        method so such a violation surfaces as a mapped
+        ``PhonebridgeError(ErrorCode.INVALID_ARGUMENT)`` instead of
+        silently hydrating invalid effective values or leaking a raw
+        ``ValidationError`` at the adapter.
+
+        The operation is ATOMIC: either a fully-validated
+        :class:`LineTimeouts` is returned or the error is raised -
+        the stored values are never half-patched. An all-``None``
+        patch re-validates and returns the same effective values."""
+        merged = {**self.model_dump(), **patch.model_dump(exclude_none=True)}
+        try:
+            return LineTimeouts.model_validate(merged)
+        except ValidationError as exc:
+            detail = exc.errors()[0]["msg"] if exc.errors() else "invalid timeouts patch"
+            raise PhonebridgeError(
+                ErrorCode.INVALID_ARGUMENT,
+                ErrorData(detail=detail),
+            ) from exc
 
 
 class LineSummary(ContractModel):
@@ -2645,6 +2679,13 @@ class TimeoutConfig(ContractModel):
 
     Passed to :meth:`LineAdminKernel.configure_line` as a PATCH:
     every member is optional, ``None`` means "leave unchanged".
+    The merge into the line's stored :class:`LineTimeouts` is
+    ATOMIC and MUST go through :meth:`LineTimeouts.apply_patch`
+    (round 24b): the merged dict is re-validated in full, so a
+    single-field patch that passes THIS model's own checks can
+    still be rejected against the stored effective values -
+    failure maps to ``PhonebridgeError(ErrorCode.INVALID_ARGUMENT)``,
+    never a raw ``ValidationError``, and leaves no partial state.
     Values are scoped per line - the line's provider binding and
     queue grants share them."""
 
@@ -2684,7 +2725,10 @@ class TimeoutConfig(ContractModel):
         ``heartbeat_down_after`` must exceed
         ``heartbeat_degraded_after`` - catching the inverted pair at
         patch time instead of after hydration into the effective
-        values."""
+        values. A LONE threshold passes here and is re-checked
+        against the stored effective values by
+        :meth:`LineTimeouts.apply_patch` at merge time (round
+        24b)."""
         if (
             self.heartbeat_down_after is not None
             and self.heartbeat_degraded_after is not None
@@ -2849,5 +2893,17 @@ class LineAdminKernel(ABC):
         :class:`LineAssignment`). A patched
         ``heartbeat_interval_sec`` takes effect on the provider's
         next reregister, never mid-session (see
-        :class:`TimeoutConfig`)."""
+        :class:`TimeoutConfig`).
+
+        ``timeouts`` merge semantics (round 24b): the patch is
+        merged into the line's stored :class:`LineTimeouts`
+        ATOMICALLY via :meth:`LineTimeouts.apply_patch` - a full
+        ``model_validate`` of the merged dict, so the heartbeat
+        ladder invariant is checked on the RESULT: a lone
+        ``heartbeat_degraded_after`` patch that is legal in
+        isolation can still be rejected when the merged
+        ``heartbeat_down_after`` no longer exceeds it. A failed
+        merge maps to ``PhonebridgeError(ErrorCode.INVALID_ARGUMENT)``
+        - never a raw ``ValidationError`` at the adapter - and
+        leaves the stored values untouched (no partial state)."""
         ...

@@ -1860,6 +1860,37 @@ def test_line_assignment_carries_effective_timeouts() -> None:
     assert hydrated.timeouts == LineTimeouts()
 
 
+def test_line_timeouts_apply_patch_atomic_merge() -> None:
+    """Round 24b (residual MEDIUM-HIGH): ``LineTimeouts.apply_patch``
+    merges a ``TimeoutConfig`` patch via a FULL ``model_validate`` of
+    the merged dict - atomic: a lone patch field that is legal in
+    isolation but breaks the ``down > degraded`` ladder against the
+    stored value maps to ``PhonebridgeError(INVALID_ARGUMENT)``,
+    never a raw ``ValidationError``, and leaves the effective
+    values untouched."""
+    base = LineTimeouts()  # degraded=2, down=3
+    # Valid single-field patch merges cleanly.
+    merged = base.apply_patch(TimeoutConfig(grant_ttl_sec=7.5))
+    assert merged.grant_ttl_sec == 7.5
+    assert merged.heartbeat_degraded_after == 2
+    assert merged.heartbeat_down_after == 3
+    # An all-None patch returns the same effective values.
+    assert base.apply_patch(TimeoutConfig()) == base
+    # Ordering breach visible only after merge: degraded=4 alone is a
+    # legal TimeoutConfig, yet 4 >= the stored down=3.
+    with pytest.raises(PhonebridgeError) as excinfo:
+        base.apply_patch(TimeoutConfig(heartbeat_degraded_after=4))
+    assert excinfo.value.code is ErrorCode.INVALID_ARGUMENT
+    # Same for a lowered down_after that meets the stored degraded.
+    with pytest.raises(PhonebridgeError) as excinfo2:
+        base.apply_patch(TimeoutConfig(heartbeat_down_after=2))
+    assert excinfo2.value.code is ErrorCode.INVALID_ARGUMENT
+    # The stored values are untouched: the frozen model cannot
+    # half-patch and the merge yields a NEW instance.
+    assert base.heartbeat_down_after == 3
+    assert base.heartbeat_degraded_after == 2
+
+
 def test_provider_binding_heartbeat_interval_ms() -> None:
     """Round 24 (review-13 C2): ProviderBinding stamps the ping
     cadence negotiated for THIS provider session so the
