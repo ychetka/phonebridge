@@ -1599,9 +1599,16 @@ class LineSummary(ContractModel):
         UNBOUND (round 26, review-16 item 13): a bound provider
         always contributes non-empty caps, and a provider-less line
         reports neither caps nor health - the two columns can never
-        contradict each other on the listing."""
+        contradict each other on the listing.
+
+        Same-item follow-up: UNBOUND also forces ``state == FREE`` -
+        with no provider attached no call can exist on the line, so
+        an ``UNBOUND`` + ``BUSY``/``RINGING_LOCKED`` row is
+        unconstructible."""
         if (self.caps == ()) != (self.liveness is LivenessState.UNBOUND):
             raise ValueError("caps is non-empty iff liveness is not unbound")
+        if self.liveness is LivenessState.UNBOUND and self.state is not LineState.FREE:
+            raise ValueError("an unbound line can hold no call - state must be FREE")
         return self
 
 
@@ -3633,13 +3640,14 @@ class LineManager(ABC):
         """call.send_dtmf: IVR navigation tones; mandatory from v1.
         ``digits`` MUST match ``DTMF_PATTERN`` (<= MAX_DTMF_DIGITS
         chars) - violation is INVALID_ARGUMENT with reason
-        INVALID_DTMF (round 20). INVALID_STATE when the lease is
-        neither ACTIVE nor ALERTING - tones are synthesized in-band
-        by the LineProvider (see :class:`ProviderSendDtmfCommand`),
-        so they only make sense once media can flow; the wire
-        contract (docs/api-contract.md, round 26, review-16 item 6)
-        allows them already in ALERTING for early-media IVR
-        navigation, not only on an ACTIVE call."""
+        INVALID_DTMF (round 20). INVALID_STATE unless the lease is
+        ACTIVE with ``audio_ready`` received, OR ALERTING
+        (early-media IVR - the ``0.3-0.6 s`` ``State=active`` ->
+        SCO-up gap otherwise swallows tones): tones are synthesized
+        in-band by the LineProvider (see
+        :class:`ProviderSendDtmfCommand`), so they only make sense
+        once media can flow (wire contract: docs/api-contract.md,
+        round 26, review-16 item 6)."""
         ...
 
     @abstractmethod

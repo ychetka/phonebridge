@@ -2509,7 +2509,7 @@ def test_line_health_changed_event() -> None:
     # (review-16 item 13): the default is the derived UNBOUND state
     # for provider-less rows - which requires caps == () - while a
     # bound line reports the binding's health and mirrors its caps.
-    row = LineSummary(line_id=LineId("line-pool"), caps=(), state=LineState.BUSY)
+    row = LineSummary(line_id=LineId("line-pool"), caps=(), state=LineState.FREE)
     assert row.liveness is LivenessState.UNBOUND
     bound = LineSummary(
         line_id=LineId("line-main"),
@@ -3277,6 +3277,18 @@ def test_liveness_unbound_state() -> None:
             state=LineState.FREE,
             liveness=LivenessState.UNBOUND,
         )
+
+    # Same-item follow-up: UNBOUND forces state == FREE - a
+    # provider-less line can hold no call, so BUSY and
+    # RINGING_LOCKED occupancy rows are unconstructible.
+    for occupied in (LineState.BUSY, LineState.RINGING_LOCKED):
+        with pytest.raises(ValidationError):
+            LineSummary(
+                line_id=LineId("line-pool"),
+                caps=(),
+                state=occupied,
+                liveness=LivenessState.UNBOUND,
+            )
 
     # A liveness REPORT always comes from an attached binding -
     # UNBOUND is never a reported fact.
