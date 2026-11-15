@@ -27,7 +27,7 @@ rejected at `configure_line`.
 
 ### Requirement: Outbox soft-cap pre-flight and drain discipline
 
-Load-creating operations (`acquire`, `dial`, `claim_exclusive`)
+Load-creating operations (`acquire`, `dial`, `accept`, `claim_exclusive`)
 MUST check remaining outbox capacity BEFORE mutating state and
 reject with `RESOURCE_EXHAUSTED` when the soft cap would be
 exceeded. Teardown paths (`hangup`, `ingest_call_state`
