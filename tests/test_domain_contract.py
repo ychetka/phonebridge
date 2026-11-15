@@ -5,7 +5,10 @@ renders as ``test_name[ITEM-03.GWT-N]`` (same convention as the
 tooling-baseline tests).
 """
 
+import copy
+import inspect
 import json
+import pickle
 import re
 from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
@@ -19,15 +22,25 @@ import phonebridge.domain.contract as contract
 from phonebridge.domain.contract import (
     CALL_PHASE_WIRE_STATES,
     DTMF_PATTERN,
+    ERROR_CODE_WIRE,
+    EVENT_AUDIENCE_SCOPES,
     EVENT_WIRE_NAMES,
     MAX_DTMF_DIGITS,
     MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_LEASES_PER_SESSION,
     MAX_PENDING_CLAIMS_PER_AGENT,
     MAX_PENDING_CLAIMS_TOTAL,
     MAX_PROVIDER_META_ENTRIES,
     MAX_PROVIDER_META_KEY_LEN,
     MAX_PROVIDER_META_VALUE_LEN,
+    MAX_QUEUE_TICKETS_TOTAL,
+    MAX_SESSIONS_PER_AGENT,
+    MAX_TICKETS_PER_SESSION,
+    MEDIA_AUTH_TIMEOUT_SEC,
+    MEDIA_PAIR_TTL_SEC,
     PROVIDER_COMMAND_WIRE_NAMES,
+    SYSTEM_AGENT_PREFIX,
+    SYSTEM_FALLBACK_WORKER,
     AcceptResult,
     AcquireGranted,
     AcquireQueued,
@@ -36,6 +49,7 @@ from phonebridge.domain.contract import (
     AdminAudience,
     AgentAudience,
     AnswerAndAnnounceFallback,
+    AssignmentGrantedEvent,
     AssignmentMode,
     AssignmentRevokedEvent,
     AudioReadyEvent,
@@ -46,6 +60,7 @@ from phonebridge.domain.contract import (
     CallStateChangedEvent,
     CallToken,
     ClaimId,
+    ClaimResolvedEvent,
     DialResult,
     ErrorCode,
     ErrorData,
@@ -64,6 +79,7 @@ from phonebridge.domain.contract import (
     LeaseId,
     LineAdminKernel,
     LineAssignment,
+    LineHealthChangedEvent,
     LineId,
     LineManager,
     LineState,
@@ -72,6 +88,7 @@ from phonebridge.domain.contract import (
     LineTimeouts,
     LivenessState,
     MediaCredentials,
+    MediaReattachResult,
     MediaToken,
     MissedCallEvent,
     NoPickupFallback,
@@ -88,9 +105,12 @@ from phonebridge.domain.contract import (
     ProviderDisconnectReason,
     ProviderHangupCommand,
     ProviderLiveness,
+    ProviderReattachMediaCommand,
     ProviderRegistration,
     ProviderRevokeCommand,
     ProviderSendDtmfCommand,
+    QueueCancelledEvent,
+    QueueCancelReason,
     QueueReadyEvent,
     QueueTicket,
     QueueUpdatedEvent,
@@ -103,6 +123,7 @@ from phonebridge.domain.contract import (
     TimeoutConfig,
     ensure_aware_utc,
     heartbeat_interval_ms_from_sec,
+    is_system_agent_id,
     validate_e164_country,
 )
 
@@ -110,7 +131,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 API_CONTRACT_MD = REPO_ROOT / "docs" / "api-contract.md"
 
 NOW_UTC = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
-_RAW_NUMBER = "+37379012345"
+# libphonenumber's reserved documentation example for MD (mobile) -
+# never a real subscriber. The fixed-line example "+37322212345" is
+# used where a second valid MD number is needed.
+_RAW_NUMBER = "+37362112345"
 
 
 def _assignment(**overrides: Any) -> LineAssignment:
@@ -173,13 +197,17 @@ def test_public_surface_exists(_gwt: object) -> None:
         "receive_inbound",
         "exclusive_line",
     }
+    # Round 25 (review-15 item 15): pure call-occupancy vocabulary -
+    # provider health moved to LivenessState / line_health_changed.
     assert {s.value for s in LineState} == {
         "FREE",
         "BUSY",
-        "RESERVED",
         "RINGING_LOCKED",
-        "DEGRADED",
-        "DOWN",
+    }
+    assert {s.value for s in LivenessState} == {
+        "reachable",
+        "ws_disconnected",
+        "unreachable",
     }
     assert {p.value for p in CallPhase} == {
         "acquired",
@@ -201,7 +229,7 @@ def test_public_surface_exists(_gwt: object) -> None:
 def test_redacted_string_contract(_gwt: object) -> None:
     event = IncomingCallEvent(
         line_id=LineId("line-main"),
-        call_token=CallToken("tok-abc"),
+        call_token=CallToken(RedactedString("tok-abc")),
         caller_id=RedactedString(_RAW_NUMBER),
         expires_at=NOW_UTC,
     )
@@ -343,7 +371,7 @@ def test_redacted_string_short_values_masked(_gwt: object) -> None:
         "token42": "t****42",
         "123456789": "12****89",
         "12345678901": "123****01",
-        "+37379012345": "+373****45",
+        "+37362112345": "+373****45",
     }
     for raw, masked in expected.items():
         assert str(RedactedString(raw)) == masked
@@ -374,7 +402,8 @@ def test_error_codes_match_contract_doc(_gwt: object) -> None:
     enum_codes = {c.value for c in ErrorCode}
     assert enum_codes == doc_codes, (
         f"ErrorCode drift vs docs/api-contract.md: "
-        f"missing={doc_codes - enum_codes}, extra={enum_codes - doc_codes}"
+        f"missing={doc_codes - enum_codes}, "
+        f"extra={enum_codes - doc_codes}"
     )
 
 
@@ -505,7 +534,7 @@ def test_fallback_policy_union_and_assignment_default() -> None:
         {
             "policy": "forward_via_line",
             "line_id": "line-b",
-            "target_number": "+37379099999",
+            "target_number": "+37322212345",
             "target_country": "MD",
         }
     )
@@ -513,11 +542,11 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     assert fwd.line_id == LineId("line-b")
     # Round 23 (review-12 C2): the policy must carry the full dial
     # target - the FallbackWorker has no admin scope to query config.
-    assert fwd.target_number.to_wire() == "+37379099999"
+    assert fwd.target_number.to_wire() == "+37322212345"
     assert fwd.target_country == "MD"
     # ...the target is PII-safe in log dumps (masked, never raw).
-    assert "+37379099999" not in repr(fwd.safe_dump())
-    for missing in ({}, {"target_country": "MD"}, {"target_number": "+37379099999"}):
+    assert "+37322212345" not in repr(fwd.safe_dump())
+    for missing in ({}, {"target_country": "MD"}, {"target_number": "+37322212345"}):
         with pytest.raises(ValidationError):
             adapter.validate_python({"policy": "forward_via_line", "line_id": "line-b", **missing})
     rec = adapter.validate_python({"policy": "record_and_telegram", "channel": "@ops"})
@@ -569,6 +598,10 @@ def test_line_admin_kernel_surface() -> None:
         "list_pending_claims",
         "list_assignments",
         "list_provider_bindings",
+        # Round 25 (review-15 item 12): the admin surface drains the
+        # SAME shared outbox the agent surface does.
+        "drain_events",
+        "drain_provider_commands",
     }
     with pytest.raises(TypeError):
         LineAdminKernel()  # type: ignore[abstract]
@@ -602,8 +635,12 @@ EVENT_PAYLOAD_MODELS: dict[EventName, type[contract.ContractModel]] = {
     EventName.AUDIO_READY: AudioReadyEvent,
     EventName.FALLBACK_TRIGGERED: FallbackTriggeredEvent,
     EventName.LINE_STATE_CHANGED: LineStateChangedEvent,
+    EventName.LINE_HEALTH_CHANGED: LineHealthChangedEvent,
     EventName.MISSED_CALL: MissedCallEvent,
     EventName.IDLE_ALERT: IdleAlertEvent,
+    EventName.CLAIM_RESOLVED: ClaimResolvedEvent,
+    EventName.ASSIGNMENT_GRANTED: AssignmentGrantedEvent,
+    EventName.QUEUE_CANCELLED: QueueCancelledEvent,
 }
 """Domain EventName -> payload model (round 22): the wire-parity
 check below needs one authoritative model per event row."""
@@ -671,7 +708,7 @@ def test_event_wire_name_parity() -> None:
 def test_event_envelope_and_payloads() -> None:
     payload = IncomingCallEvent(
         line_id=LineId("line-main"),
-        call_token=CallToken("tok-1"),
+        call_token=CallToken(RedactedString("tok-1")),
         caller_id=RedactedString(_RAW_NUMBER),
         expires_at=NOW_UTC,
     )
@@ -681,13 +718,15 @@ def test_event_envelope_and_payloads() -> None:
         emitted_at=NOW_UTC,
         payload=payload,
     )
-    assert envelope.payload.call_token == CallToken("tok-1")
+    assert envelope.payload.call_token == CallToken(RedactedString("tok-1"))
     assert isinstance(envelope.audience, AgentAudience)
 
     csc = CallStateChangedEvent(
         lease_id=LeaseId("l-1"),
         line_id=LineId("line-main"),
-        state="active",
+        # Round 25 (review-15 item 41): reason rides only
+        # "disconnected" - a reason on a live state is a defect.
+        state="disconnected",
         reason=CallEndReason.NORMAL,
         answer_confidence="provisional",
     )
@@ -712,9 +751,11 @@ def test_event_envelope_and_payloads() -> None:
     are = AudioReadyEvent(lease_id=LeaseId("l-1"), line_id=LineId("line-main"))
     ft = FallbackTriggeredEvent(
         line_id=LineId("line-main"),
-        call_token=CallToken("fb-tok"),
+        call_token=CallToken(RedactedString("fb-tok")),
         caller_id=RedactedString(_RAW_NUMBER),
-        policy=NoPickupFallback(),
+        # Round 25 (review-15 item 31): fallback_triggered dispatches
+        # WORKER policies only - a core policy is unconstructible.
+        policy=RecordAndTelegramFallback(channel="@ops"),
         expires_at=NOW_UTC,
     )
     lsc = LineStateChangedEvent(
@@ -789,8 +830,8 @@ def test_call_end_reason_wired_into_events() -> None:
     with pytest.raises(ValidationError):
         LineStateChangedEvent(
             line_id=LineId("line-main"),
-            old_state=LineState.FREE,
-            new_state=LineState.DOWN,
+            old_state=LineState.BUSY,
+            new_state=LineState.FREE,
             reason="made_up_reason",
         )
     with pytest.raises(ValidationError):
@@ -807,7 +848,7 @@ def test_ingress_payloads_validate() -> None:
     ProviderCallStateUpdate(
         line_id=LineId("line-main"),
         assignment_id=contract.AssignmentId("asg-1"),
-        call_token=CallToken("tok-1"),
+        call_token=CallToken(RedactedString("tok-1")),
         state=ProviderCallState.RINGING,
         observed_at=NOW_UTC,
     )
@@ -844,6 +885,9 @@ def test_ingress_payloads_validate() -> None:
         )
     ProviderLiveness(
         line_id=LineId("line-main"),
+        # Round 25 (review-15 item 32): assignment_id is REQUIRED -
+        # a liveness fact names its binding.
+        assignment_id=contract.AssignmentId("bind-1"),
         state=LivenessState.UNREACHABLE,
         checked_at=NOW_UTC,
     )
@@ -916,7 +960,7 @@ def test_ingress_payloads_validate() -> None:
     assert cap_update.profile == "secretary"
     decision = FallbackDecision(
         line_id=LineId("line-main"),
-        call_token=CallToken("tok-1"),
+        call_token=CallToken(RedactedString("tok-1")),
         policy=NoPickupFallback(),
     )
     assert decision.policy.policy == "no_pickup"
@@ -982,7 +1026,9 @@ class _FakeLineManager(LineManager):
         country: str,
     ) -> DialResult:
         return DialResult(
-            lease_id=lease_id, media_endpoint="unix:///run/m.sock", media_token=MediaToken("mt")
+            lease_id=lease_id,
+            media_endpoint="unix:///run/m.sock",
+            media_token=MediaToken(RedactedString("mt")),
         )
 
     async def accept(self, session_id: SessionId, call_token: CallToken) -> AcceptResult:
@@ -990,7 +1036,7 @@ class _FakeLineManager(LineManager):
             lease_id=LeaseId("l-2"),
             line_id=LineId("line-main"),
             media_endpoint="unix:///run/m.sock",
-            media_token=MediaToken("mt"),
+            media_token=MediaToken(RedactedString("mt")),
         )
 
     async def hangup(self, session_id: SessionId, lease_id: LeaseId) -> None:
@@ -998,6 +1044,13 @@ class _FakeLineManager(LineManager):
 
     async def send_dtmf(self, session_id: SessionId, lease_id: LeaseId, digits: str) -> None:
         return None
+
+    async def reattach_media(self, session_id: SessionId, lease_id: LeaseId) -> MediaReattachResult:
+        return MediaReattachResult(
+            lease_id=lease_id,
+            media_endpoint="unix:///run/m.sock",
+            media_token=MediaToken(RedactedString("mt-2")),
+        )
 
     async def claim_exclusive(self, session_id: SessionId, line_id: LineId) -> contract.ClaimResult:
         return contract.ClaimResult(claim_id=ClaimId("claim-1"))
@@ -1018,6 +1071,10 @@ class _FakeLineManager(LineManager):
             assignment_id=contract.AssignmentId("bind-1"),
             line_id=registration.line_id,
             caps=registration.caps,
+            # Round 25 (review-15 item 32): stamped thresholds from the
+            # line's effective LineTimeouts - required, no default.
+            heartbeat_degraded_after=2,
+            heartbeat_down_after=3,
             connected_at=NOW_UTC,
             last_seen_at=NOW_UTC,
         )
@@ -1028,7 +1085,7 @@ class _FakeLineManager(LineManager):
     async def ingest_ring(self, ring: IncomingRingIngress) -> IncomingCallEvent:
         return IncomingCallEvent(
             line_id=ring.line_id,
-            call_token=CallToken("tok-minted"),
+            call_token=CallToken(RedactedString("tok-minted")),
             caller_id=ring.caller_id,
             expires_at=NOW_UTC,
         )
@@ -1041,6 +1098,8 @@ class _FakeLineManager(LineManager):
             line_id=update.line_id,
             caps=update.caps,
             profile=update.profile,
+            heartbeat_degraded_after=2,
+            heartbeat_down_after=3,
             connected_at=NOW_UTC,
             last_seen_at=NOW_UTC,
         )
@@ -1069,7 +1128,10 @@ class _FakeLineManager(LineManager):
         return [
             EventEnvelope[MissedCallEvent](
                 name=EventName.MISSED_CALL,
-                audience=BroadcastAudience(),
+                # Round 25 (review-15 item 31): missed_call carries
+                # caller PII - legal scopes are agent|session only,
+                # never broadcast.
+                audience=AgentAudience(agent_id="agent-1"),
                 emitted_at=NOW_UTC,
                 payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NORMAL),
             )
@@ -1105,6 +1167,7 @@ async def test_line_manager_async_surface() -> None:
         "accept",
         "hangup",
         "send_dtmf",
+        "reattach_media",
         "claim_exclusive",
         "get_lines",
         "register_provider",
@@ -1129,10 +1192,17 @@ async def test_line_manager_async_surface() -> None:
     assert result.expires_at.tzinfo is not None  # grant TTL rides the wire
     await mgr.cancel_acquire(session, TicketId("ticket-1"))
     dial = await mgr.dial(session, result.lease_id, RedactedString(_RAW_NUMBER), "MD")
-    assert isinstance(dial.media_token, str)
-    accepted = await mgr.accept(session, CallToken("tok-1"))
+    # Round 25 (review-15 item 3): media_token is a RedactedString
+    # container, never a raw str.
+    assert isinstance(dial.media_token, RedactedString)
+    accepted = await mgr.accept(session, CallToken(RedactedString("tok-1")))
     assert isinstance(accepted, AcceptResult)
     await mgr.send_dtmf(session, result.lease_id, "12#")
+    reattached = await mgr.reattach_media(session, result.lease_id)
+    # Round 25 (review-15 item 9): fresh agent-side media pair for a
+    # live lease; the token stays a RedactedString container.
+    assert isinstance(reattached, MediaReattachResult)
+    assert isinstance(reattached.media_token, RedactedString)
     await mgr.hangup(session, result.lease_id)
     await mgr.release(session, result.lease_id)
     lines = await mgr.get_lines(session)
@@ -1152,6 +1222,7 @@ async def test_line_manager_async_surface() -> None:
     await mgr.note_provider_liveness(
         ProviderLiveness(
             line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
             state=LivenessState.REACHABLE,
             checked_at=NOW_UTC,
         )
@@ -1164,7 +1235,9 @@ async def test_line_manager_async_surface() -> None:
         )
     )
     assert isinstance(ring_event, IncomingCallEvent)
-    assert isinstance(ring_event.call_token, str)  # kernel-minted (round 22)
+    # kernel-minted (round 22); a RedactedString container since
+    # round 25 (review-15 item 3).
+    assert isinstance(ring_event.call_token, RedactedString)
     updated_binding = await mgr.update_provider_capabilities(
         ProviderCapabilityUpdate(
             line_id=LineId("line-main"),
@@ -1182,7 +1255,7 @@ async def test_line_manager_async_surface() -> None:
             observed_at=NOW_UTC,
         )
     )
-    decision = await mgr.decide_fallback(LineId("line-main"), CallToken("tok-3"))
+    decision = await mgr.decide_fallback(LineId("line-main"), CallToken(RedactedString("tok-3")))
     assert isinstance(decision, FallbackDecision)
     assert decision.fallback_call_token is None  # worker tokens only on WORKER policies
     await mgr.ingest_audio_ready(
@@ -1204,6 +1277,7 @@ async def test_line_manager_async_surface() -> None:
                 ProviderHangupCommand,
                 ProviderSendDtmfCommand,
                 ProviderRevokeCommand,
+                ProviderReattachMediaCommand,
             ),
         )
         for cmd in drained_commands
@@ -1232,8 +1306,9 @@ def test_call_phase_wire_state_parity() -> None:
 
 
 def test_provider_command_union_roundtrip() -> None:
-    """Round 20: all five ProviderCommand variants serialize through
-    TypeAdapter(ProviderCommand) and carry PII-safely."""
+    """Round 20: all six ProviderCommand variants serialize through
+    TypeAdapter(ProviderCommand) and carry PII-safely (round 25
+    batch 2 adds ProviderReattachMediaCommand)."""
     adapter = TypeAdapter(ProviderCommand)
     commands: list[ProviderCommand] = [
         ProviderDialCommand(
@@ -1242,15 +1317,15 @@ def test_provider_command_union_roundtrip() -> None:
             lease_id=LeaseId("l-1"),
             number=RedactedString(_RAW_NUMBER),
             media_endpoint="unix:///run/phonebridge/media.sock",
-            media_token=MediaToken("p-tok-1"),
+            media_token=MediaToken(RedactedString("p-tok-1")),
         ),
         ProviderAnswerCommand(
             line_id=LineId("line-main"),
             assignment_id=contract.AssignmentId("bind-1"),
-            call_token=CallToken("tok-1"),
+            call_token=CallToken(RedactedString("tok-1")),
             lease_id=LeaseId("l-2"),
             media_endpoint="unix:///run/phonebridge/media.sock",
-            media_token=MediaToken("p-tok-2"),
+            media_token=MediaToken(RedactedString("p-tok-2")),
         ),
         ProviderHangupCommand(
             line_id=LineId("line-main"),
@@ -1267,6 +1342,13 @@ def test_provider_command_union_roundtrip() -> None:
             line_id=LineId("line-main"),
             assignment_id=contract.AssignmentId("bind-1"),
             reason="admin_revoke",
+        ),
+        ProviderReattachMediaCommand(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            lease_id=LeaseId("l-3"),
+            media_endpoint="unix:///run/phonebridge/media.sock",
+            media_token=MediaToken(RedactedString("p-tok-3")),
         ),
     ]
     for cmd in commands:
@@ -1387,6 +1469,8 @@ class _FakeLineAdminKernel(LineAdminKernel):
                 assignment_id=contract.AssignmentId("bind-1"),
                 line_id=LineId("line-main"),
                 caps=(Intent.DIAL_OUT,),
+                heartbeat_degraded_after=2,
+                heartbeat_down_after=3,
                 connected_at=NOW_UTC,
                 last_seen_at=NOW_UTC,
             )
@@ -1394,8 +1478,10 @@ class _FakeLineAdminKernel(LineAdminKernel):
 
     async def revoke_assignment(
         self, assignment_id: contract.AssignmentId, reason: str | None = None
-    ) -> None:
-        return None
+    ) -> LineAssignment | None:
+        # Round 25 (review-15 item 14): returns the post-revert
+        # SHARED_POOL snapshot for an agent-owned binding.
+        return _assignment()
 
     async def configure_line(
         self,
@@ -1406,9 +1492,21 @@ class _FakeLineAdminKernel(LineAdminKernel):
         allowed_number_types: frozenset[str] | None = None,
         claimable: bool | None = None,
         idle_revoke_after: timedelta | None = None,
+        clear_idle_revoke_after: bool = False,
         timeouts: TimeoutConfig | None = None,
     ) -> LineAssignment:
         return _assignment()
+
+    def drain_events(self) -> list[EventEnvelope[Any]]:
+        return []
+
+    def drain_provider_commands(self) -> list[ProviderCommand]:
+        return [
+            ProviderRevokeCommand(
+                line_id=LineId("line-main"),
+                assignment_id=contract.AssignmentId("bind-1"),
+            )
+        ]
 
 
 async def test_line_admin_kernel_all_methods() -> None:
@@ -1425,7 +1523,11 @@ async def test_line_admin_kernel_all_methods() -> None:
     assert pending[0].claim_id == ClaimId("claim-1")
     assert isinstance((await kernel.list_assignments())[0], LineAssignment)
     assert isinstance((await kernel.list_provider_bindings())[0], ProviderBinding)
-    await kernel.revoke_assignment(contract.AssignmentId("asg-1"), reason="admin")
+    post_revert = await kernel.revoke_assignment(contract.AssignmentId("asg-1"), reason="admin")
+    assert isinstance(post_revert, LineAssignment)  # round 25 item 14
+    # Round 25 (item 12): admin surface drains the shared outbox.
+    assert isinstance(kernel.drain_events(), list)
+    assert isinstance(kernel.drain_provider_commands()[0], ProviderRevokeCommand)
     updated = await kernel.configure_line(
         LineId("line-main"),
         claimable=False,
@@ -1434,6 +1536,10 @@ async def test_line_admin_kernel_all_methods() -> None:
         timeouts=TimeoutConfig(grant_ttl_sec=5.0, heartbeat_down_after=3),
     )
     assert isinstance(updated, LineAssignment)
+    # Round 25 (review-15 item 22): the explicit off switch for the
+    # alert-only idle window.
+    cleared = await kernel.configure_line(LineId("line-main"), clear_idle_revoke_after=True)
+    assert isinstance(cleared, LineAssignment)
 
 
 def test_timeout_config_patch_model() -> None:
@@ -1546,6 +1652,7 @@ def test_provider_command_wire_parity() -> None:
         ProviderHangupCommand,
         ProviderSendDtmfCommand,
         ProviderRevokeCommand,
+        ProviderReattachMediaCommand,
     ]
     assert len(command_models) == len(PROVIDER_COMMAND_WIRE_NAMES)
     for model in command_models:
@@ -1570,19 +1677,34 @@ def test_provider_command_wire_parity() -> None:
 def test_media_credentials_distinct_role_tokens() -> None:
     """Round 21 (CRITICAL-2): the per-lease credential pair issues two
     INDEPENDENT one-time tokens - agent and provider roles can never
-    share one token (media.auth role spoofing fix)."""
+    share one token (media.auth role spoofing fix). Round 25
+    (review-15 item 6) splits the endpoint the same way:
+    agent_media_endpoint vs provider_media_endpoint."""
     creds = MediaCredentials(
-        media_endpoint="unix:///run/phonebridge/media.sock",
-        agent_media_token=MediaToken("a-tok"),
-        provider_media_token=MediaToken("p-tok"),
+        agent_media_endpoint="unix:///run/phonebridge/media.sock",
+        provider_media_endpoint="wss://media.internal/provider",
+        agent_media_token=MediaToken(RedactedString("a-tok")),
+        provider_media_token=MediaToken(RedactedString("p-tok")),
     )
     assert creds.agent_media_token != creds.provider_media_token
+    assert creds.agent_media_endpoint != creds.provider_media_endpoint
     with pytest.raises(ValidationError):
         MediaCredentials(
-            media_endpoint="unix:///run/phonebridge/media.sock",
-            agent_media_token=MediaToken("same"),
-            provider_media_token=MediaToken("same"),
+            agent_media_endpoint="unix:///run/phonebridge/media.sock",
+            provider_media_endpoint="wss://media.internal/provider",
+            agent_media_token=MediaToken(RedactedString("same")),
+            provider_media_token=MediaToken(RedactedString("same")),
         )
+    for missing_endpoint in (
+        {"provider_media_endpoint": "wss://media.internal/provider"},
+        {"agent_media_endpoint": "unix:///run/phonebridge/media.sock"},
+    ):
+        with pytest.raises(ValidationError):
+            MediaCredentials(
+                agent_media_token=MediaToken(RedactedString("a")),
+                provider_media_token=MediaToken(RedactedString("p")),
+                **missing_endpoint,
+            )
 
 
 def test_event_audience_union_and_envelope() -> None:
@@ -1632,13 +1754,13 @@ def test_hangup_command_xor_target() -> None:
     }
     by_lease = ProviderHangupCommand(**base, lease_id=LeaseId("l-1"))
     assert by_lease.call_token is None
-    by_token = ProviderHangupCommand(**base, call_token=CallToken("tok-1"))
+    by_token = ProviderHangupCommand(**base, call_token=CallToken(RedactedString("tok-1")))
     assert by_token.lease_id is None
     with pytest.raises(ValidationError):
         ProviderHangupCommand(**base)  # neither target
     with pytest.raises(ValidationError):
         ProviderHangupCommand(
-            **base, lease_id=LeaseId("l-1"), call_token=CallToken("tok-1")
+            **base, lease_id=LeaseId("l-1"), call_token=CallToken(RedactedString("tok-1"))
         )  # both - ambiguous
 
 
@@ -1698,12 +1820,15 @@ def test_media_allocator_port_lifecycle() -> None:
     calls: list[str] = []
 
     class FakeAllocator:
-        def allocate(self, lease_id: LeaseId, line_id: LineId) -> MediaCredentials:
-            calls.append(f"allocate:{lease_id}")
+        def allocate(
+            self, lease_id: LeaseId, line_id: LineId, session_id: SessionId | None = None
+        ) -> MediaCredentials:
+            calls.append(f"allocate:{lease_id}:{session_id}")
             return MediaCredentials(
-                media_endpoint="unix:///run/phonebridge/media.sock",
-                agent_media_token=MediaToken("a-tok"),
-                provider_media_token=MediaToken("p-tok"),
+                agent_media_endpoint="unix:///run/phonebridge/media.sock",
+                provider_media_endpoint="wss://media.internal/provider",
+                agent_media_token=MediaToken(RedactedString("a-tok")),
+                provider_media_token=MediaToken(RedactedString("p-tok")),
             )
 
         def revoke(self, lease_id: LeaseId) -> None:
@@ -1712,11 +1837,15 @@ def test_media_allocator_port_lifecycle() -> None:
     allocator: contract.MediaAllocator = FakeAllocator()
     creds = allocator.allocate(LeaseId("l-1"), LineId("line-main"))
     assert creds.agent_media_token != creds.provider_media_token
+    # Round 25 (item 6): session_id selects the agent-side endpoint.
+    remote = allocator.allocate(LeaseId("l-2"), LineId("line-main"), session_id=SessionId("sess-9"))
+    assert remote.agent_media_endpoint == "unix:///run/phonebridge/media.sock"
     allocator.revoke(LeaseId("l-1"))
     allocator.revoke(LeaseId("l-1"))  # idempotent - safe to call twice
     allocator.revoke(LeaseId("never-allocated"))  # unknown lease: no-op
     assert calls == [
-        "allocate:l-1",
+        "allocate:l-1:None",
+        "allocate:l-2:sess-9",
         "revoke:l-1",
         "revoke:l-1",
         "revoke:never-allocated",
@@ -1732,13 +1861,14 @@ def test_round23_event_schema_freeze() -> None:
     with pytest.raises(ValidationError):
         FallbackTriggeredEvent(
             line_id=LineId("line-main"),  # type: ignore[call-arg]
-            call_token=CallToken("fb-tok"),
-            policy=NoPickupFallback(),
+            call_token=CallToken(RedactedString("fb-tok")),
+            policy=RecordAndTelegramFallback(channel="@ops"),
         )
     ft = FallbackTriggeredEvent(
         line_id=LineId("line-main"),
-        call_token=CallToken("fb-tok"),
-        policy=NoPickupFallback(),
+        call_token=CallToken(RedactedString("fb-tok")),
+        # Round 25 (review-15 item 31): worker policies only.
+        policy=RecordAndTelegramFallback(channel="@ops"),
         expires_at=NOW_UTC,
     )
     assert ft.expires_at == NOW_UTC
@@ -1931,6 +2061,8 @@ def test_provider_binding_heartbeat_interval_ms() -> None:
         assignment_id=contract.AssignmentId("bind-1"),
         line_id=LineId("line-main"),
         caps=(Intent.DIAL_OUT,),
+        heartbeat_degraded_after=2,
+        heartbeat_down_after=3,
         connected_at=NOW_UTC,
         last_seen_at=NOW_UTC,
     )
@@ -1940,6 +2072,8 @@ def test_provider_binding_heartbeat_interval_ms() -> None:
         line_id=LineId("line-main"),
         caps=(Intent.DIAL_OUT,),
         heartbeat_interval_ms=7500,
+        heartbeat_degraded_after=2,
+        heartbeat_down_after=3,
         connected_at=NOW_UTC,
         last_seen_at=NOW_UTC,
     )
@@ -1950,6 +2084,8 @@ def test_provider_binding_heartbeat_interval_ms() -> None:
             line_id=LineId("line-main"),
             caps=(Intent.DIAL_OUT,),
             heartbeat_interval_ms=0,
+            heartbeat_degraded_after=2,
+            heartbeat_down_after=3,
             connected_at=NOW_UTC,
             last_seen_at=NOW_UTC,
         )
@@ -1960,10 +2096,10 @@ def test_validate_e164_country_helper() -> None:
     E.164 shape gate, then phonenumbers parse + validity +
     region cross-check, returning the raw number on success."""
     assert validate_e164_country(RedactedString(_RAW_NUMBER), "MD") == _RAW_NUMBER
-    assert validate_e164_country(RedactedString("+12025551234"), "US") == "+12025551234"
+    assert validate_e164_country(RedactedString("+12015550123"), "US") == "+12015550123"
     # Shape gate: local/national forms, missing +, leading 0 country
     # code, punctuation and extensions never reach phonenumbers.
-    for bad in ("79012345", "+01234567", "+373 790 12345", "+37379012345 ext.5"):
+    for bad in ("62112345", "+01234567", "+373 621 12345", "+37362112345 ext.5"):
         with pytest.raises(ValueError):
             validate_e164_country(RedactedString(bad), "MD")
     # Parses E.164 but not a valid subscriber number.
@@ -1972,7 +2108,7 @@ def test_validate_e164_country_helper() -> None:
     # Valid number, wrong declared region (country is a cross-check
     # ASSERTION, never a fallback parse region).
     with pytest.raises(ValueError):
-        validate_e164_country(RedactedString("+12025551234"), "MD")
+        validate_e164_country(RedactedString("+12015550123"), "MD")
     # country must be ISO alpha-2 (uppercase two letters).
     for bad_country in ("md", "MDA", "M1", ""):
         with pytest.raises(ValueError):
@@ -1987,7 +2123,7 @@ def test_forward_via_line_model_level_validation() -> None:
     # Valid policy constructs (the pre-existing wire-parity cases).
     fwd = ForwardViaLineFallback(
         line_id=LineId("line-b"),
-        target_number=RedactedString("+37379099999"),
+        target_number=RedactedString("+37322212345"),
         target_country="MD",
     )
     assert fwd.target_country == "MD"
@@ -2002,13 +2138,13 @@ def test_forward_via_line_model_level_validation() -> None:
     with pytest.raises(ValidationError):
         ForwardViaLineFallback(
             line_id=LineId("line-b"),
-            target_number=RedactedString("+12025551234"),  # valid US, declared MD
+            target_number=RedactedString("+12015550123"),  # valid US, declared MD
             target_country="MD",
         )
     with pytest.raises(ValidationError):
         ForwardViaLineFallback(
             line_id=LineId("line-b"),
-            target_number=RedactedString("+37379099999"),
+            target_number=RedactedString("+37322212345"),
             target_country="md",  # not ISO alpha-2 uppercase
         )
     # Self-loop: a forward target equal to the configured line is a
@@ -2040,6 +2176,8 @@ def test_provider_caps_are_telecom_only() -> None:
             {
                 "line_id": "line-main",
                 "assignment_id": "bind-1",
+                "heartbeat_degraded_after": 2,
+                "heartbeat_down_after": 3,
                 "connected_at": NOW_UTC.isoformat(),
                 "last_seen_at": NOW_UTC.isoformat(),
             },
@@ -2054,3 +2192,828 @@ def test_provider_caps_are_telecom_only() -> None:
                 model.model_validate({**base, "caps": bad_caps})
         ok = model.model_validate({**base, "caps": ["dial_out", "receive_inbound"]})
         assert Intent.EXCLUSIVE_LINE not in ok.caps
+
+
+# ---------------------------------------------------------------------------
+# Round 25 (architect review 15 - SA_carbon_review_15), Phase-0 contract
+# hardening v0.0.20 batch 1 - item 3 token redaction, item 4 JSON-RPC
+# error-code wire map, items 21/37 reserved system identity + id
+# hygiene, item 31 audience scoping + fallback delivery invariants,
+# items 39/40 log-mask hardening.
+# ---------------------------------------------------------------------------
+
+
+def test_error_code_wire_map() -> None:
+    """Round 25 (review-15 item 4): every ErrorCode member resolves to
+    a unique JSON-RPC ``error.code`` integer inside the
+    application-reserved band -32099..-32000."""
+    assert set(ERROR_CODE_WIRE) == set(ErrorCode)
+    codes = list(ERROR_CODE_WIRE.values())
+    assert len(codes) == len(set(codes))
+    for code in codes:
+        assert -32099 <= code <= -32000
+
+
+def test_dial_result_media_token_masked_in_log_dumps() -> None:
+    """Round 25 (review-15 item 3): the media token is a
+    RedactedString container - ``safe_dump()``/``to_log_dict()`` emit
+    only the masked form, and ``json.dumps`` on the log dict succeeds
+    with no raw secret."""
+    result = DialResult(
+        lease_id=LeaseId("l-1"),
+        media_endpoint="unix:///run/m.sock",
+        media_token=MediaToken(RedactedString("media-secret-token")),
+    )
+    safe = result.safe_dump()
+    assert safe["media_token"] == str(RedactedString("media-secret-token"))
+    assert "media-secret-token" not in repr(safe)
+    rendered = json.dumps(result.to_log_dict())  # must not raise
+    assert "media-secret-token" not in rendered
+
+
+def test_mask_for_log_dict_keys_and_set_determinism() -> None:
+    """Round 25 (review-15 items 39/40): dict KEYS are masked too -
+    a RedactedString or Enum key can neither leak nor crash
+    ``json.dumps`` - and set/frozenset elements are masked BEFORE the
+    deterministic sort, so the ordering never depends on raw secrets
+    or container iteration order."""
+    masked = contract._mask_for_log({RedactedString("secret-key-value"): "v"})
+    assert list(masked) == [str(RedactedString("secret-key-value"))]
+    assert "secret-key-value" not in repr(masked)
+    json.dumps(masked)  # must not raise
+    enum_keyed = contract._mask_for_log({CallEndReason.NORMAL: "v"})
+    assert enum_keyed == {"normal": "v"}
+    # Two different secrets masking to the same string still produce
+    # the same sorted output regardless of insertion order.
+    a, b = RedactedString("aaaaxyzab"), RedactedString("aaaaqwrab")
+    assert str(a) == str(b)  # equal masks, different raw secrets
+    out1 = contract._mask_for_log({a, b})
+    out2 = contract._mask_for_log({b, a})
+    assert out1 == out2 == sorted(out1)
+
+
+def test_event_audience_scopes_enforced() -> None:
+    """Round 25 (review-15 item 31): EVENT_AUDIENCE_SCOPES covers
+    every EventName, and the envelope rejects a ``(name, scope)``
+    pair outside the table - a PII-bearing event can never be
+    constructed with BroadcastAudience."""
+    assert set(EVENT_AUDIENCE_SCOPES) == set(EventName)
+    payload = MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NORMAL)
+    # Legal scopes still construct (agent owner / per-session fanout).
+    for audience in (
+        AgentAudience(agent_id="agent-1"),
+        SessionAudience(session_id=SessionId("sess-1")),
+    ):
+        EventEnvelope[MissedCallEvent](
+            name=EventName.MISSED_CALL,
+            audience=audience,
+            emitted_at=NOW_UTC,
+            payload=payload,
+        )
+    # A caller-PII event is unconstructible with broadcast routing.
+    with pytest.raises(ValidationError):
+        EventEnvelope[MissedCallEvent](
+            name=EventName.MISSED_CALL,
+            audience=BroadcastAudience(),
+            emitted_at=NOW_UTC,
+            payload=payload,
+        )
+    # Session-scoped lease facts cannot widen to agent routing.
+    with pytest.raises(ValidationError):
+        EventEnvelope[CallStateChangedEvent](
+            name=EventName.CALL_STATE_CHANGED,
+            audience=AgentAudience(agent_id="agent-1"),
+            emitted_at=NOW_UTC,
+            payload=CallStateChangedEvent(
+                lease_id=LeaseId("l-1"), line_id=LineId("line-main"), state="active"
+            ),
+        )
+    # line_state_changed keeps the documented true-broadcast scope.
+    EventEnvelope[LineStateChangedEvent](
+        name=EventName.LINE_STATE_CHANGED,
+        audience=BroadcastAudience(),
+        emitted_at=NOW_UTC,
+        payload=LineStateChangedEvent(
+            line_id=LineId("line-main"),
+            old_state=LineState.FREE,
+            new_state=LineState.BUSY,
+        ),
+    )
+
+
+def test_fallback_decision_token_matches_worker_policy() -> None:
+    """Round 25 (review-15 item 31): the re-issued
+    ``fallback_call_token`` IS the worker delivery - a worker policy
+    must carry it, a core policy must never carry it, and
+    ``fallback_triggered`` dispatches worker policies only."""
+    worker = RecordAndTelegramFallback(channel="@ops")
+    core = NoPickupFallback()
+    tok = CallToken(RedactedString("fb-tok"))
+    base = {
+        "line_id": LineId("line-main"),
+        "call_token": CallToken(RedactedString("tok-1")),
+    }
+    # Legal pairs: worker+token, core without token.
+    FallbackDecision(**base, policy=worker, fallback_call_token=tok)
+    FallbackDecision(**base, policy=core)
+    # Worker without token / core with token are rejected.
+    with pytest.raises(ValidationError):
+        FallbackDecision(**base, policy=worker)
+    with pytest.raises(ValidationError):
+        FallbackDecision(**base, policy=core, fallback_call_token=tok)
+    # fallback_triggered rejects core policies outright.
+    for core_policy in (NoPickupFallback(), RejectFallback()):
+        with pytest.raises(ValidationError):
+            FallbackTriggeredEvent(
+                line_id=LineId("line-main"),
+                call_token=tok,
+                policy=core_policy,
+                expires_at=NOW_UTC,
+            )
+
+
+def test_system_agent_identity_and_id_hygiene() -> None:
+    """Round 25 (review-15 items 21/37): the reserved ``system:*``
+    prefix identifies kernel-internal identities; domain identifiers
+    reject empty/overlong/colon-bearing values, and the ``default``
+    alias never reaches a domain ``line_id``."""
+    assert SYSTEM_AGENT_PREFIX == "system:"
+    assert SYSTEM_FALLBACK_WORKER == "system:fallback_worker"
+    assert is_system_agent_id(SYSTEM_FALLBACK_WORKER)
+    assert not is_system_agent_id("agent-1")
+    # The reserved identity stays legal on agent-scoped fields.
+    assert AgentAudience(agent_id=SYSTEM_FALLBACK_WORKER).agent_id == SYSTEM_FALLBACK_WORKER
+    # External ids: empty, colon-bearing and overlong are rejected.
+    for bad in ("", "a" * 129, "agent:x"):
+        with pytest.raises(ValidationError):
+            AgentAudience(agent_id=bad)
+    # "default" is an API-boundary alias, never a domain line_id.
+    for bad_line in ("default", "", "line:x", "x" * 129):
+        with pytest.raises(ValidationError):
+            LineSummary(line_id=LineId(bad_line), caps=[Intent.DIAL_OUT], state=LineState.FREE)
+
+
+# ---------------------------------------------------------------------------
+# Round 25 batch 2 (v0.0.20) - item 2 claim/assignment events, item 6
+# endpoint split, item 9 media reissue, item 14 revoke return, item 15
+# LineState/liveness split, item 23 queue fate events, item 26
+# ProviderActiveCall.call_token.
+# ---------------------------------------------------------------------------
+
+
+def test_claim_lifecycle_events() -> None:
+    """Round 25 (review-15 item 2): claim_resolved reaches the claiming
+    SESSION (assignment_id present iff approved); assignment_granted
+    reaches the owner's AGENT audience."""
+    approved = ClaimResolvedEvent(
+        claim_id=ClaimId("claim-1"),
+        line_id=LineId("line-main"),
+        status="approved",
+        assignment_id=contract.AssignmentId("asg-9"),
+    )
+    rejected = ClaimResolvedEvent(
+        claim_id=ClaimId("claim-2"),
+        line_id=LineId("line-main"),
+        status="rejected",
+        reason="not claimable",
+    )
+    # assignment_id iff approved - both mismatches are unconstructible.
+    with pytest.raises(ValidationError):
+        ClaimResolvedEvent(
+            claim_id=ClaimId("claim-3"),
+            line_id=LineId("line-main"),
+            status="approved",
+        )
+    with pytest.raises(ValidationError):
+        ClaimResolvedEvent(
+            claim_id=ClaimId("claim-4"),
+            line_id=LineId("line-main"),
+            status="rejected",
+            assignment_id=contract.AssignmentId("asg-9"),
+        )
+    granted = AssignmentGrantedEvent(
+        assignment_id=contract.AssignmentId("asg-9"),
+        line_id=LineId("line-main"),
+        mode=AssignmentMode.EXCLUSIVE,
+    )
+    # Audience scoping is enforced at the envelope boundary.
+    EventEnvelope[ClaimResolvedEvent](
+        name=EventName.CLAIM_RESOLVED,
+        audience=SessionAudience(session_id=SessionId("sess-1")),
+        emitted_at=NOW_UTC,
+        payload=approved,
+    )
+    EventEnvelope[ClaimResolvedEvent](
+        name=EventName.CLAIM_RESOLVED,
+        audience=SessionAudience(session_id=SessionId("sess-1")),
+        emitted_at=NOW_UTC,
+        payload=rejected,
+    )
+    EventEnvelope[AssignmentGrantedEvent](
+        name=EventName.ASSIGNMENT_GRANTED,
+        audience=AgentAudience(agent_id="agent-1"),
+        emitted_at=NOW_UTC,
+        payload=granted,
+    )
+    # ...and the wrong scope is rejected for both events.
+    for audience in (BroadcastAudience(), AgentAudience(agent_id="agent-1")):
+        with pytest.raises(ValidationError):
+            EventEnvelope[ClaimResolvedEvent](
+                name=EventName.CLAIM_RESOLVED,
+                audience=audience,
+                emitted_at=NOW_UTC,
+                payload=approved,
+            )
+    with pytest.raises(ValidationError):
+        EventEnvelope[AssignmentGrantedEvent](
+            name=EventName.ASSIGNMENT_GRANTED,
+            audience=SessionAudience(session_id=SessionId("sess-1")),
+            emitted_at=NOW_UTC,
+            payload=granted,
+        )
+
+
+def test_line_health_changed_event() -> None:
+    """Round 25 (review-15 item 15): line_health_changed is the
+    provider-health axis event - broadcast+admin scopes, old != new,
+    LivenessState vocabulary (never LineState)."""
+    health = LineHealthChangedEvent(
+        line_id=LineId("line-main"),
+        old_state=LivenessState.REACHABLE,
+        new_state=LivenessState.UNREACHABLE,
+    )
+    for audience in (BroadcastAudience(), AdminAudience()):
+        EventEnvelope[LineHealthChangedEvent](
+            name=EventName.LINE_HEALTH_CHANGED,
+            audience=audience,
+            emitted_at=NOW_UTC,
+            payload=health,
+        )
+    # agent/session scopes are not legal for the health axis.
+    for bad_audience in (
+        AgentAudience(agent_id="agent-1"),
+        SessionAudience(session_id=SessionId("sess-1")),
+    ):
+        with pytest.raises(ValidationError):
+            EventEnvelope[LineHealthChangedEvent](
+                name=EventName.LINE_HEALTH_CHANGED,
+                audience=bad_audience,
+                emitted_at=NOW_UTC,
+                payload=health,
+            )
+    # A no-change "transition" is a defect, not a notification.
+    with pytest.raises(ValidationError):
+        LineHealthChangedEvent(
+            line_id=LineId("line-main"),
+            old_state=LivenessState.REACHABLE,
+            new_state=LivenessState.REACHABLE,
+        )
+    # LineSummary carries the separate liveness column with a
+    # REACHABLE default for unbound/pool lines.
+    row = LineSummary(line_id=LineId("line-main"), caps=[Intent.DIAL_OUT], state=LineState.BUSY)
+    assert row.liveness is LivenessState.REACHABLE
+
+
+def test_queue_cancelled_event() -> None:
+    """Round 25 (review-15 item 23): queue_cancelled names the ticket
+    and the CLOSED QueueCancelReason; session-scoped only."""
+    assert {r.value for r in QueueCancelReason} == {
+        "line_exclusive",
+        "provider_lost",
+        "capability_removed",
+        "claim_resolved",
+    }
+    cancelled = QueueCancelledEvent(
+        session_id=SessionId("sess-1"),
+        ticket_id=TicketId("t-1"),
+        reason=QueueCancelReason.PROVIDER_LOST,
+    )
+    EventEnvelope[QueueCancelledEvent](
+        name=EventName.QUEUE_CANCELLED,
+        audience=SessionAudience(session_id=SessionId("sess-1")),
+        emitted_at=NOW_UTC,
+        payload=cancelled,
+    )
+    for audience in (BroadcastAudience(), AdminAudience(), AgentAudience(agent_id="a")):
+        with pytest.raises(ValidationError):
+            EventEnvelope[QueueCancelledEvent](
+                name=EventName.QUEUE_CANCELLED,
+                audience=audience,
+                emitted_at=NOW_UTC,
+                payload=cancelled,
+            )
+    # reason is required and closed - no free-form string.
+    with pytest.raises(ValidationError):
+        QueueCancelledEvent(  # type: ignore[call-arg]
+            session_id=SessionId("sess-1"), ticket_id=TicketId("t-1")
+        )
+    with pytest.raises(ValidationError):
+        QueueCancelledEvent(
+            session_id=SessionId("sess-1"),
+            ticket_id=TicketId("t-1"),
+            reason="made_up",
+        )
+
+
+def test_reattach_media_surfaces() -> None:
+    """Round 25 (review-15 item 9): MediaReattachResult carries fresh
+    agent-side credentials; ProviderReattachMediaCommand rides the
+    union + wire-name map."""
+    result = MediaReattachResult(
+        lease_id=LeaseId("l-1"),
+        media_endpoint="wss://media.internal/agent",
+        media_token=MediaToken(RedactedString("fresh-agent-token")),
+    )
+    safe = result.safe_dump()
+    assert "fresh-agent-token" not in repr(safe)
+    assert result.model_dump(mode="json")["media_token"] == "fresh-agent-token"
+
+    # Union/wire parity: reattach_media resolves to line.reattach_media.
+    assert PROVIDER_COMMAND_WIRE_NAMES["reattach_media"] == "line.reattach_media"
+    adapter = TypeAdapter(ProviderCommand)
+    parsed = adapter.validate_python(
+        {
+            "command": "reattach_media",
+            "line_id": "line-main",
+            "assignment_id": "bind-1",
+            "lease_id": "l-1",
+            "media_endpoint": "wss://media.internal/provider",
+            "media_token": "p-tok",
+        }
+    )
+    assert isinstance(parsed, ProviderReattachMediaCommand)
+    assert parsed.media_token == MediaToken(RedactedString("p-tok"))
+
+
+def test_provider_active_call_token_masked() -> None:
+    """Round 25 (review-15 item 26): the optional call_token on a
+    reregister snapshot element stays a RedactedString container -
+    masked in safe_dump, raw on the wire dump."""
+    with_token = ProviderActiveCall(
+        lease_id=LeaseId("l-1"),
+        call_token=CallToken(RedactedString("ring-token-secret")),
+        state=ProviderCallState.RINGING,
+    )
+    safe = with_token.safe_dump()
+    assert "ring-token-secret" not in repr(safe)
+    assert safe["call_token"] == str(RedactedString("ring-token-secret"))
+    rendered = json.dumps(with_token.to_log_dict())  # must not raise
+    assert "ring-token-secret" not in rendered
+    assert with_token.model_dump(mode="json")["call_token"] == "ring-token-secret"
+    assert ProviderActiveCall(state=ProviderCallState.ACTIVE).call_token is None
+
+
+# ---------------------------------------------------------------------------
+# Round 25 batch 3 (v0.0.20) - item 22 numeric bounds, item 30 resource
+# constants, item 32 binding health stamping, item 36 country/number-type
+# validation, item 38 discriminator strictness, item 41 cross-field
+# validators, item 42 error/clock/apply_patch hardening.
+# ---------------------------------------------------------------------------
+
+
+def _binding(**overrides: Any) -> ProviderBinding:
+    kwargs: dict[str, Any] = {
+        "assignment_id": contract.AssignmentId("bind-1"),
+        "line_id": LineId("line-main"),
+        "caps": (Intent.DIAL_OUT,),
+        "heartbeat_degraded_after": 2,
+        "heartbeat_down_after": 3,
+        "connected_at": NOW_UTC,
+        "last_seen_at": NOW_UTC,
+    }
+    kwargs.update(overrides)
+    return ProviderBinding(**kwargs)
+
+
+def test_inf_nan_rejected_everywhere() -> None:
+    """Round 25 (review-15 item 22): ``allow_inf_nan=False`` on the
+    ContractModel base - inf/nan can never ride a float knob and
+    explode ``timedelta`` arithmetic downstream."""
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            LineTimeouts(grant_ttl_sec=bad)
+        with pytest.raises(ValidationError):
+            TimeoutConfig(orphan_grace_sec=bad)
+        with pytest.raises(ValidationError):
+            _assignment(accept_window_sec=bad)
+        with pytest.raises(ValidationError):
+            LineTimeouts.model_validate({"grant_ttl_sec": bad})
+
+
+def test_time_knobs_one_day_ceiling() -> None:
+    """Round 25 (review-15 item 22): every float time knob is capped
+    at ``le=86400.0`` - one day; larger is a config bug, not a knob."""
+    float_knobs = (
+        "grant_ttl_sec",
+        "orphan_grace_sec",
+        "heartbeat_interval_sec",
+        "fallback_accept_ttl_sec",
+        "ring_drain_ttl_sec",
+        "max_call_duration_sec",
+    )
+    for knob in float_knobs:
+        assert getattr(LineTimeouts(**{knob: 86400.0}), knob) == 86400.0
+        with pytest.raises(ValidationError):
+            LineTimeouts(**{knob: 86400.01})
+        assert getattr(TimeoutConfig(**{knob: 86400.0}), knob) == 86400.0
+        with pytest.raises(ValidationError):
+            TimeoutConfig(**{knob: 86400.01})
+        with pytest.raises(ValidationError):
+            LineTimeouts(**{knob: 1e20})
+    assert _assignment(accept_window_sec=86400.0).accept_window_sec == 86400.0
+    with pytest.raises(ValidationError):
+        _assignment(accept_window_sec=86400.01)
+
+
+def test_idle_revoke_after_positive_and_clear_flag() -> None:
+    """Round 25 (review-15 item 22): a set ``idle_revoke_after`` must
+    be strictly positive - ``None`` is the disabled state - and
+    ``configure_line`` carries the explicit ``clear_idle_revoke_after``
+    off switch the None-means-unchanged patch convention cannot
+    express."""
+    assert _assignment().idle_revoke_after is None
+    assert _assignment(
+        mode=AssignmentMode.EXCLUSIVE,
+        owner_agent_id="agent-1",
+        idle_revoke_after=timedelta(hours=24),
+    ).idle_revoke_after == timedelta(hours=24)
+    for bad in (timedelta(0), timedelta(seconds=-1), timedelta(days=-30)):
+        with pytest.raises(ValidationError):
+            _assignment(
+                mode=AssignmentMode.EXCLUSIVE,
+                owner_agent_id="agent-1",
+                idle_revoke_after=bad,
+            )
+    # The off switch exists as a keyword param defaulting to False.
+    params = inspect.signature(LineAdminKernel.configure_line).parameters
+    assert params["clear_idle_revoke_after"].default is False
+    assert params["idle_revoke_after"].default is None
+
+
+def test_resource_bound_constants() -> None:
+    """Round 25 (review-15 item 30): the resource caps are exported
+    contract constants - sessions, tickets, leases and the two media
+    socket deadlines."""
+    assert MAX_SESSIONS_PER_AGENT == 32
+    assert MAX_TICKETS_PER_SESSION == 16
+    assert MAX_QUEUE_TICKETS_TOTAL == 1024
+    assert MAX_LEASES_PER_SESSION == 8
+    assert MEDIA_PAIR_TTL_SEC == 30
+    assert MEDIA_AUTH_TIMEOUT_SEC == 5
+    for name in (
+        "MAX_SESSIONS_PER_AGENT",
+        "MAX_TICKETS_PER_SESSION",
+        "MAX_QUEUE_TICKETS_TOTAL",
+        "MAX_LEASES_PER_SESSION",
+        "MEDIA_PAIR_TTL_SEC",
+        "MEDIA_AUTH_TIMEOUT_SEC",
+    ):
+        assert name in contract.__all__
+
+
+def test_provider_binding_stamped_thresholds() -> None:
+    """Round 25 (review-15 item 32): the binding carries the missed-
+    ping thresholds STAMPED at register/reregister - required fields,
+    ``down > degraded`` enforced on the binding itself, and
+    ``orphan_deadline_at`` legal only while WS_DISCONNECTED (item 41)."""
+    binding = _binding()
+    assert binding.heartbeat_degraded_after == 2
+    assert binding.heartbeat_down_after == 3
+    # Required: no implicit default may stand in for the stamped value.
+    for missing in ("heartbeat_degraded_after", "heartbeat_down_after"):
+        kwargs = {
+            "assignment_id": contract.AssignmentId("bind-1"),
+            "line_id": LineId("line-main"),
+            "caps": (Intent.DIAL_OUT,),
+            "heartbeat_degraded_after": 2,
+            "heartbeat_down_after": 3,
+            "connected_at": NOW_UTC,
+            "last_seen_at": NOW_UTC,
+        }
+        del kwargs[missing]
+        with pytest.raises(ValidationError):
+            ProviderBinding(**kwargs)
+    # The ladder invariant is re-checked on the stamped pair.
+    with pytest.raises(ValidationError):
+        _binding(heartbeat_degraded_after=3, heartbeat_down_after=3)
+    with pytest.raises(ValidationError):
+        _binding(heartbeat_degraded_after=5, heartbeat_down_after=3)
+    with pytest.raises(ValidationError):
+        _binding(heartbeat_degraded_after=0)
+    # orphan_deadline_at exists only inside the WS-drop grace window.
+    with pytest.raises(ValidationError):
+        _binding(orphan_deadline_at=NOW_UTC)  # liveness defaults REACHABLE
+    with pytest.raises(ValidationError):
+        _binding(liveness=LivenessState.UNREACHABLE, orphan_deadline_at=NOW_UTC)
+    orphan = _binding(liveness=LivenessState.WS_DISCONNECTED, orphan_deadline_at=NOW_UTC)
+    assert orphan.orphan_deadline_at == NOW_UTC
+
+
+def test_provider_liveness_requires_assignment_id() -> None:
+    """Round 25 (review-15 item 32): a liveness fact without the
+    binding id is unconstructible - it could cross-apply a stale
+    close event to a re-registered binding."""
+    fact = ProviderLiveness(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("bind-1"),
+        state=LivenessState.REACHABLE,
+        checked_at=NOW_UTC,
+    )
+    assert fact.assignment_id == contract.AssignmentId("bind-1")
+    with pytest.raises(ValidationError):
+        ProviderLiveness(  # type: ignore[call-arg]
+            line_id=LineId("line-main"),
+            state=LivenessState.REACHABLE,
+            checked_at=NOW_UTC,
+        )
+
+
+def test_validate_e164_country_region_membership() -> None:
+    """Round 25 (review-15 item 36): ``country`` must be a KNOWN ISO
+    3166-1 alpha-2 region (UNKNOWN_COUNTRY_CODE branch, distinct
+    message) - a syntactic but unknown code like "ZZ" never degrades
+    to a COUNTRY_MISMATCH."""
+    for bad_country in ("ZZ", "AA", "QO"):
+        with pytest.raises(ValueError, match="not a known ISO 3166-1"):
+            validate_e164_country(RedactedString(_RAW_NUMBER), bad_country)
+    # Real regions still validate; the message stayed distinct from
+    # the shape gate and the mismatch branch.
+    assert validate_e164_country(RedactedString(_RAW_NUMBER), "MD") == _RAW_NUMBER
+    with pytest.raises(ValueError, match="not ISO 3166-1 alpha-2"):
+        validate_e164_country(RedactedString(_RAW_NUMBER), "md")
+    with pytest.raises(ValueError, match="not valid for the declared country"):
+        validate_e164_country(RedactedString("+12015550123"), "MD")
+
+
+def test_validate_e164_country_non_geographic_001() -> None:
+    """Round 25 (review-15 item 36): ``country == "001"`` is legal
+    ONLY for genuinely non-geographic numbering plans (+800 global
+    toll-free); both mixed pairings are COUNTRY_MISMATCH."""
+    assert validate_e164_country(RedactedString("+80012345678"), "001") == "+80012345678"
+    # Non-001 number declared "001" -> mismatch.
+    with pytest.raises(ValueError, match="not valid for the declared country"):
+        validate_e164_country(RedactedString("+12015550123"), "001")
+    # 001-region number declared a geographic country -> mismatch.
+    with pytest.raises(ValueError, match="not valid for the declared country"):
+        validate_e164_country(RedactedString("+80012345678"), "US")
+
+
+def test_allowed_number_types_vocabulary() -> None:
+    """Round 25 (review-15 item 36): ``allowed_number_types`` members
+    must come from the phonenumbers type vocabulary - unknown/typo'd
+    or lowercase members and an empty set are rejected, and the
+    rejection never echoes the raw input."""
+    assert _assignment(
+        allowed_number_types=frozenset({"MOBILE", "FIXED_LINE_OR_MOBILE"})
+    ).allowed_number_types == frozenset({"MOBILE", "FIXED_LINE_OR_MOBILE"})
+    with pytest.raises(ValidationError):
+        _assignment(allowed_number_types=frozenset())
+    for bad in (frozenset({"NOT_A_TYPE"}), frozenset({"mobile"}), frozenset({"MOBILE", "XX"})):
+        with pytest.raises(ValidationError) as excinfo:
+            _assignment(allowed_number_types=bad)
+        # Rule 10: the invalid member name is never echoed back.
+        assert "XX" not in str(excinfo.value)
+        assert "NOT_A_TYPE" not in str(excinfo.value)
+
+
+def test_acquire_discriminator_strict() -> None:
+    """Round 25 (review-15 item 38): ``granted`` is required and must
+    be a bool - an empty dict can no longer silently produce
+    AcquireRefused."""
+    adapter = TypeAdapter(AcquireResult)
+    for malformed in (
+        {},
+        {"queued": True, "ticket_id": "t-1", "position": 1},  # no granted
+        {"granted": "yes"},
+        {"granted": 1},  # int is not the bool True
+        {"granted": None},
+    ):
+        # The discriminator's own ValueError propagates unwrapped
+        # (ValidationError is itself a ValueError subclass).
+        with pytest.raises(ValueError):
+            adapter.validate_python(malformed)
+    assert isinstance(adapter.validate_python({"granted": False}), AcquireRefused)
+    assert isinstance(
+        adapter.validate_python(
+            {"granted": False, "queued": True, "ticket_id": "t-1", "position": 1}
+        ),
+        AcquireQueued,
+    )
+    assert isinstance(
+        adapter.validate_python(
+            {
+                "granted": True,
+                "line_id": "line-main",
+                "lease_id": "l-1",
+                "expires_at": NOW_UTC.isoformat(),
+            }
+        ),
+        AcquireGranted,
+    )
+
+
+def test_call_state_changed_reason_scoping() -> None:
+    """Round 25 (review-15 item 41): ``reason`` is a teardown fact -
+    only ``state == "disconnected"`` may carry it; and
+    ``reissued_ticket_id`` exists only on a preempted_by_incoming
+    teardown."""
+    base = {"lease_id": LeaseId("l-1"), "line_id": LineId("line-main")}
+    for live_state in ("dialing", "alerting", "active"):
+        with pytest.raises(ValidationError):
+            CallStateChangedEvent(**base, state=live_state, reason=CallEndReason.NORMAL)
+    # disconnected may carry a reason - and may omit it.
+    CallStateChangedEvent(**base, state="disconnected", reason=CallEndReason.NORMAL)
+    CallStateChangedEvent(**base, state="disconnected")
+    # reissued_ticket_id only under PREEMPTED_BY_INCOMING.
+    CallStateChangedEvent(
+        **base,
+        state="disconnected",
+        reason=CallEndReason.PREEMPTED_BY_INCOMING,
+        reissued_ticket_id=TicketId("t-9"),
+    )
+    with pytest.raises(ValidationError):
+        CallStateChangedEvent(**base, state="disconnected", reissued_ticket_id=TicketId("t-9"))
+    with pytest.raises(ValidationError):
+        CallStateChangedEvent(
+            **base,
+            state="disconnected",
+            reason=CallEndReason.NORMAL,
+            reissued_ticket_id=TicketId("t-9"),
+        )
+
+
+def test_cross_field_validators_batch3() -> None:
+    """Round 25 (review-15 item 41) remaining cross-field rules:
+    ProviderCallStateUpdate correlator XOR, LineStateChangedEvent
+    old != new, CallLease intent/time invariants, LineSummary caps."""
+    # Alternative correlators: call_token XOR lease_id (neither is
+    # the documented external-call/open-ring case).
+    update_base = {
+        "line_id": LineId("line-main"),
+        "assignment_id": contract.AssignmentId("bind-1"),
+        "state": ProviderCallState.ACTIVE,
+        "observed_at": NOW_UTC,
+    }
+    ProviderCallStateUpdate(**update_base)  # neither - external call fact
+    ProviderCallStateUpdate(**update_base, lease_id=LeaseId("l-1"))
+    with pytest.raises(ValidationError):
+        ProviderCallStateUpdate(
+            **update_base,
+            call_token=CallToken(RedactedString("tok-1")),
+            lease_id=LeaseId("l-1"),
+        )
+
+    # A no-change line-state "transition" is a defect.
+    with pytest.raises(ValidationError):
+        LineStateChangedEvent(
+            line_id=LineId("line-main"),
+            old_state=LineState.BUSY,
+            new_state=LineState.BUSY,
+        )
+
+    # A lease can never hold the durable exclusivity intent, and
+    # answered_at can never precede created_at.
+    lease_base = {
+        "lease_id": LeaseId("l-1"),
+        "line_id": LineId("line-main"),
+        "owner_agent_id": "agent-1",
+        "session_id": SessionId("sess-1"),
+        "created_at": NOW_UTC,
+    }
+    with pytest.raises(ValidationError):
+        CallLease(**lease_base, intent=Intent.EXCLUSIVE_LINE)
+    with pytest.raises(ValidationError):
+        CallLease(
+            **lease_base,
+            intent=Intent.DIAL_OUT,
+            answered_at=NOW_UTC - timedelta(seconds=1),
+        )
+    ok_lease = CallLease(**lease_base, intent=Intent.RECEIVE_INBOUND, answered_at=NOW_UTC)
+    assert ok_lease.answered_at == NOW_UTC
+
+    # LineSummary mirrors the binding's telecom-only caps.
+    for bad_caps in ([], [Intent.EXCLUSIVE_LINE], [Intent.DIAL_OUT, Intent.EXCLUSIVE_LINE]):
+        with pytest.raises(ValidationError):
+            LineSummary(line_id=LineId("line-main"), caps=bad_caps, state=LineState.FREE)
+    summary = LineSummary(
+        line_id=LineId("line-main"),
+        caps=[Intent.DIAL_OUT, Intent.RECEIVE_INBOUND],
+        state=LineState.FREE,
+    )
+    assert summary.liveness is LivenessState.REACHABLE
+
+
+def test_clock_and_media_allocator_runtime_checkable() -> None:
+    """Round 25 (review-15 item 41): the injected pure ports are
+    ``@runtime_checkable`` - wiring code can isinstance-probe them."""
+
+    class _FakeClock:
+        def __call__(self) -> datetime:
+            return NOW_UTC
+
+    class _FakeAllocator:
+        def allocate(
+            self, lease_id: LeaseId, line_id: LineId, session_id: SessionId | None = None
+        ) -> MediaCredentials:
+            return MediaCredentials(
+                agent_media_endpoint="unix:///run/m.sock",
+                provider_media_endpoint="wss://media.internal/provider",
+                agent_media_token=MediaToken(RedactedString("a")),
+                provider_media_token=MediaToken(RedactedString("p")),
+            )
+
+        def revoke(self, lease_id: LeaseId) -> None:
+            return None
+
+    assert isinstance(_FakeClock(), contract.Clock)
+    assert isinstance(_FakeAllocator(), contract.MediaAllocator)
+    assert not isinstance(object(), contract.Clock)
+    assert not isinstance(object(), contract.MediaAllocator)
+
+
+def test_phonebridge_error_deepcopy_and_pickle() -> None:
+    """Round 25 (review-15 item 42): ``args`` carries ``(code, data)``
+    so deepcopy/pickle reconstruct through ``__init__`` instead of
+    crashing on the stale ``code.value`` arg."""
+    err = PhonebridgeError(
+        ErrorCode.INVALID_ARGUMENT,
+        ErrorData(reason=ErrorReason.INVALID_DTMF, detail="bad digits"),
+    )
+    clone = copy.deepcopy(err)
+    assert clone.code is ErrorCode.INVALID_ARGUMENT
+    assert clone.data == err.data
+    assert clone.args == err.args == (ErrorCode.INVALID_ARGUMENT, err.data)
+    assert str(clone) == str(err)
+    restored = pickle.loads(pickle.dumps(err))
+    assert restored.code is ErrorCode.INVALID_ARGUMENT
+    assert restored.data == err.data
+    assert str(restored) == str(err)
+    # The no-data path round-trips too.
+    bare = pickle.loads(pickle.dumps(PhonebridgeError(ErrorCode.STALE_TOKEN)))
+    assert bare.data == ErrorData()
+
+
+def test_apply_patch_detail_names_fields() -> None:
+    """Round 25 (review-15 item 42): ``apply_patch`` failures carry
+    the pydantic ``loc`` field path in ``"field: msg"`` form - a
+    bare msg does not name the broken knob. The model-level ladder
+    error keeps the bare-msg form (no loc)."""
+    # model_copy bypasses validation -> a corrupt effective value the
+    # merge must re-reject with its field name in detail.
+    corrupt = LineTimeouts().model_copy(update={"grant_ttl_sec": -1.0})
+    with pytest.raises(PhonebridgeError) as excinfo:
+        corrupt.apply_patch(TimeoutConfig())
+    assert excinfo.value.code is ErrorCode.INVALID_ARGUMENT
+    detail = excinfo.value.data.detail
+    assert detail is not None and "grant_ttl_sec:" in detail
+    # Model-level (loc-less) failures keep the message-only form.
+    with pytest.raises(PhonebridgeError) as excinfo2:
+        LineTimeouts().apply_patch(TimeoutConfig(heartbeat_degraded_after=4))
+    assert "heartbeat_down_after must exceed" in (excinfo2.value.data.detail or "")
+
+
+def test_ring_drain_and_max_call_duration_timeouts() -> None:
+    """Round 25 (review-15 items 16/24): ``ring_drain_ttl_sec``
+    (~60 s default) bounds the post-decision ring-drain wait while
+    the physical call still rings on the modem (design §5.2 step
+    6); ``max_call_duration_sec`` is the OPTIONAL wall-clock cap
+    whose effective ``None`` means "no cap" - disabled at the wire
+    via the ``clear_max_call_duration`` flag, never via a zero
+    patch."""
+    # Defaults hydrate on the effective model.
+    eff = LineTimeouts()
+    assert eff.ring_drain_ttl_sec == 60.0
+    assert eff.max_call_duration_sec is None
+    # Patch-merge semantics: non-None patch fields replace the
+    # stored value, an all-None patch is a no-op.
+    patch = TimeoutConfig(ring_drain_ttl_sec=45.0, max_call_duration_sec=3600.0)
+    merged = eff.apply_patch(patch)
+    assert merged.ring_drain_ttl_sec == 45.0
+    assert merged.max_call_duration_sec == 3600.0
+    assert eff.ring_drain_ttl_sec == 60.0  # base untouched (atomic)
+    # The explicit off switch resets a previously set cap to the
+    # legitimate effective None - the flag itself never lands on
+    # the merged model.
+    cleared = merged.apply_patch(TimeoutConfig(clear_max_call_duration=True))
+    assert cleared.max_call_duration_sec is None
+    assert cleared.ring_drain_ttl_sec == 45.0
+    # Clearing an already-unset cap is a harmless no-op.
+    still_unset = LineTimeouts().apply_patch(TimeoutConfig(clear_max_call_duration=True))
+    assert still_unset.max_call_duration_sec is None
+    # clear=False behaves like an absent flag.
+    uncleared = merged.apply_patch(TimeoutConfig(clear_max_call_duration=False))
+    assert uncleared.max_call_duration_sec == 3600.0
+    # Set-XOR-clear: value + True together is contradictory.
+    with pytest.raises(ValidationError):
+        TimeoutConfig(max_call_duration_sec=10.0, clear_max_call_duration=True)
+    # Bound violations on BOTH models: 0, negative, >86400,
+    # inf/nan (gt=0/le=86400.0 + allow_inf_nan=False).
+    for bad in (0.0, -1.0, 86400.01, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            LineTimeouts(ring_drain_ttl_sec=bad)
+        with pytest.raises(ValidationError):
+            TimeoutConfig(ring_drain_ttl_sec=bad)
+        with pytest.raises(ValidationError):
+            LineTimeouts(max_call_duration_sec=bad)
+        with pytest.raises(ValidationError):
+            TimeoutConfig(max_call_duration_sec=bad)

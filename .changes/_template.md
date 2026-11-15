@@ -24,9 +24,10 @@ refs: issue #N
 # adds/modifies anchors must exist in docs/specs after the change and
 # removes anchors must be gone. Use a bare "-" when the change touches
 # no documented behavior. Anchors follow GitHub's heading rule for
-# "### Requirement: <name>" (lowercase, punctuation dropped, spaces
-# -> hyphens); tools/check_spec_anchors.sh validates them (the CI
-# lint job runs it).
+# "### Requirement: <name>" applied to the whole heading text, so
+# they carry the "requirement-" prefix (lowercase, punctuation
+# dropped, spaces -> hyphens); tools/check_spec_anchors.sh validates
+# them (the CI lint job runs it).
 - adds: docs/specs/<domain>.md#<requirement-anchor>
 - modifies: docs/specs/<domain>.md#<requirement-anchor>
 - removes: docs/specs/<domain>.md#<requirement-anchor>

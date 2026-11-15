@@ -15,13 +15,15 @@ Each requirement is a third-level heading of the form:
 
 The fragment then references it as
 `docs/specs/<domain>.md#<requirement-anchor>`, where the anchor is
-produced by GitHub's heading rule applied to `<descriptive-name>`:
-lowercase, all punctuation dropped (only letters, digits, spaces,
-hyphens and underscores survive), spaces replaced by hyphens,
-duplicate headings suffixed `-1`, `-2`, ...
+produced by GitHub's heading rule applied to the WHOLE heading text
+— the `Requirement:` prefix is part of it, so every requirement
+anchor starts with `requirement-`: lowercase, all punctuation
+dropped (only letters, digits, spaces, hyphens and underscores
+survive), spaces replaced by hyphens, duplicate headings suffixed
+`-1`, `-2`, ...
 
 Example: `### Requirement: Outbox soft-cap pre-flight` yields the
-anchor `docs/specs/<domain>.md#outbox-soft-cap-pre-flight`.
+anchor `docs/specs/<domain>.md#requirement-outbox-soft-cap-pre-flight`.
 
 ## Spec impact ops
 

@@ -11,16 +11,20 @@ Bluetooth subsystem; every adapter it sees is a kernel `vhci` device
 fed by an agent.** Location is invisible to the telephony stack.
 
 ```
-dongle host (any machine)                 container (isolated netns)
-┌───────────────────────────┐             ┌────────────────────────────┐
-│ USB BT dongle             │             │ vhci-feeder → /dev/vhci    │
-│  └ hci-agent              │  tunnel     │        └─ hciN             │
-│     owns USB (libusb,     │─control-TCP─►            │              │
-│     btusb detached)       │─media-UDP──►│   bluetoothd → PipeWire    │
-│     relays HCI frames     │             │   → per-line worker        │
-└───────────────────────────┘             └────────────────────────────┘
+dongle host (any machine)            container (--network=host, /dev/vhci)
+┌───────────────────────────┐          ┌────────────────────────────┐
+│ USB BT dongle             │          │ vhci-feeder → /dev/vhci    │
+│  └ hci-agent              │  tunnel  │        └─ hciN             │
+│     owns USB (libusb,     │─ctrl-TCP─►            │              │
+│     btusb detached)       │─mediaUDP─►│   bluetoothd → PipeWire    │
+│     relays HCI frames     │          │   → per-line worker        │
+└───────────────────────────┘          └────────────────────────────┘
      paired phone nearby
 ```
+
+(The container shares the host's `init_net` — `AF_BLUETOOTH` does not
+exist inside an isolated network namespace; see
+`docs/phone-bridge-service-design.md` §2.1.)
 
 ## §1. Responsibilities
 
@@ -69,7 +73,7 @@ monotonic counter assigned by each sender independently
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
 | `0x14` STATUS | agent→ | `{state: UP|DEGRADED|DONGLE_DEAD|TUNNEL_FLAP, detail}` |
 | `0x15` SHUTDOWN | both | graceful close |
-| `0x16` SCO_STATE | container→ | `{open: bool, handle?, air_mode?, rx_pkt_len?, tx_pkt_len?}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-21, see below); on `open: true` `handle` carries the 12-bit synchronous connection handle (`uint16`, meaningful bits `0x0FFF`) that the feeder parsed from `Synchronous Connection Complete 0x2c`/`0x03` — REQUIRED on `open: true` (round 24) so the agent can form HCI SCO headers and underrun silence packets before the first UDP datagram ever arrives; `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"` — mirrors the HCI `air_mode` field of the sync connection) and `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the trailing fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
+| `0x16` SCO_STATE | container→ | `{open: bool, handle?, air_mode?, rx_pkt_len?, tx_pkt_len?}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-21, see below); on `open: true` `handle` carries the 12-bit synchronous connection handle (`uint16`, meaningful bits `0x0FFF`) that the feeder parsed from `Synchronous Connection Complete 0x2c`/`0x03` — REQUIRED on `open: true` (round 24) so the agent can form HCI SCO headers and underrun silence packets before the first UDP datagram ever arrives; `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"`) DERIVED from the NUMERIC HCI `air_mode` field in the `0x2c` event — `0x02` = CVSD → `"cvsd"`, `0x03` = transparent (the encoding mSBC rides on eSCO/WBS) → `"msbc"`; the feeder MUST map the numeric code, never expect a string on the air interface (round 25); `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the trailing fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
 
 **USB SCO altsetting control (rounds 19-21).** The Bluetooth USB
 Transport spec keeps Interface 1 (SCO audio) at `altsetting 0` —
@@ -90,10 +94,16 @@ agent `0x16 SCO_STATE`:
   `wMaxPacketSize` values: alt 0 = `0` (idle), alt 1 = `9`,
   alt 2 = `17` (standard for 16-bit CVSD), alt 3 = `25`,
   alt 4 = `33`, alt 5 = `49`, alt 6 = `63` (standard for
-  WBS/mSBC). The mapping: `air_mode == "msbc"` → `altsetting 6`
-  (`wMaxPacketSize = 63`), falling back to `altsetting 1` (`9`)
-  when the dongle's descriptor lacks alt 6; `air_mode == "cvsd"`
-  (16-bit) → `altsetting 2` (`17`). `rx_pkt_len`/`tx_pkt_len`
+  WBS/mSBC). The mapping (round 25 fix — the earlier "fallback to
+  altsetting 1" was wrong: `9` B/ms cannot carry a 60 B mSBC
+  payload): `air_mode == "msbc"` → `altsetting 6`
+  (`wMaxPacketSize = 63`), falling back to `altsetting 3` (`25`)
+  when the descriptor lacks alt 6 — the 60 B packet then rides
+  ~3 consecutive isoc microframes — and to `SCO_ALT_UNSUPPORTED`
+  (call rejected, telemetry event) when neither exists; never
+  altsetting 1 for mSBC. `air_mode == "cvsd"` (16-bit) →
+  `altsetting 2` (`17`), `altsetting 1` (`9`) only for 8-bit CVSD
+  links. `rx_pkt_len`/`tx_pkt_len`
   carry the ON-AIR eSCO packet length (e.g. `60` B for 2-EV3
   mSBC, `30` B for HV3) — the round-20 `48/64/128`-byte CVSD sizes
   were the HCI buffer MTU, not altsetting packet sizes. The agent
@@ -107,7 +117,9 @@ explicit command from the feeder that already knows the ground
 truth.
 
 Control traffic is small and latency-critical: it never shares a queue
-with media. Missed N heartbeats → line `DEGRADED` → `DOWN`.
+with media. Missed N heartbeats → line health `degraded` → `down` on
+the liveness axis (`event.line_health_changed`; occupancy `LineState`
+is orthogonal — round 25).
 
 **The control channel is strictly lossless.** HCI assumes event and
 ACL delivery with zero loss; a single dropped event (e.g.
@@ -219,9 +231,24 @@ endpoint:
   near real time; holding stale audio only compounds the delay);
 - the buffer depth and under/overflow counts feed the agent's
   `STATUS`/telemetry — a persistently underrunning buffer indicates
-  tunnel quality problems, not an agent bug.
+  tunnel quality problems, not an agent bug;
+- each speech burst starts with a ~2-packet prefill (round 25):
+  USB/dongle and tunnel clocks drift ±20..100 ppm, which the 30–45 ms
+  buffer absorbs and re-syncs between bursts; no adaptive DSP
+  resampling is implemented or planned for V1.
 
-### vhci feeder — SCO handle gate
+### vhci feeder — SCO handle gate and MTU alignment (round 25)
+
+**MTU alignment.** `hci_vhci` carries no `btusb` USB quirks: the
+kernel default SCO buffer geometry of a virtual adapter is NOT the
+60 B profile of a real USB dongle. At adapter bring-up the feeder
+MUST program the vhci adapter's synchronous data geometry via the
+HCI `Write_Synchronous_Flow_Control_Enable` / SCO data-packet-length
+setup so `sco_data_packet_len == 60` — matching the mSBC
+1-frame-per-packet invariant the agent's H2 counter rewrite assumes —
+before any sync connection is accepted. A mismatched length would
+let the kernel slice SCO at a different boundary, so the agent's
+byte-2 sequence rewrite would corrupt mid-frame audio.
 
 The split transport means SCO data can outrun the setup event that
 created the synchronous connection. The container-side feeder

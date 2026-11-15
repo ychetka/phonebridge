@@ -33,11 +33,11 @@ refs: issue #55
 ---
 
 ## Spec impact
-- adds: docs/specs/line-manager.md#provider-hangup-targets-exactly-one-identifier
-- adds: docs/specs/line-manager.md#forward-via-line-carries-the-complete-dial-target
-- adds: docs/specs/line-manager.md#outbox-soft-cap-pre-flight-and-drain-discipline
-- adds: docs/specs/line-manager.md#saga-compensation-on-linedial-and-lineanswer
-- adds: docs/specs/line-manager.md#idle-escalation-is-alert-only
-- adds: docs/specs/line-manager.md#accept-window-always-elapses-before-fallback
-- adds: docs/specs/line-manager.md#mediaallocator-lifecycle
-- adds: docs/specs/line-manager.md#log-projection-is-json-safe
+- adds: docs/specs/line-manager.md#requirement-provider-hangup-targets-exactly-one-identifier
+- adds: docs/specs/line-manager.md#requirement-forward-via-line-carries-the-complete-dial-target
+- adds: docs/specs/line-manager.md#requirement-outbox-soft-cap-pre-flight-and-drain-discipline
+- adds: docs/specs/line-manager.md#requirement-saga-compensation-on-linedial-and-lineanswer
+- adds: docs/specs/line-manager.md#requirement-idle-escalation-is-alert-only
+- adds: docs/specs/line-manager.md#requirement-accept-window-always-elapses-before-fallback
+- adds: docs/specs/line-manager.md#requirement-mediaallocator-lifecycle
+- adds: docs/specs/line-manager.md#requirement-log-projection-is-json-safe

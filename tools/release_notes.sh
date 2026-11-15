@@ -60,14 +60,58 @@ def parse(path):
     if end is None:
         raise SystemExit(f"{name}: unterminated --- frontmatter")
     fm, last = {}, None
-    for line in lines[1:end]:
+    fm_lines = lines[1:end]
+    i = 0
+    while i < len(fm_lines):
+        line = fm_lines[i]
+        i += 1
         s = line.strip()
         if s.startswith("#") or not s:
             continue
         km = re.match(r"^([A-Za-z_][\w]*)\s*:(.*)$", line)
         if km and not line[0].isspace():
             last = km.group(1)
-            fm[last] = km.group(2).strip().strip('"').strip("'")
+            rest = km.group(2).strip()
+            if rest in (">", ">-", ">+", "|", "|-", "|+"):
+                # YAML block scalar: consume the indented continuation
+                # lines (plus blank lines between them); a margin-level
+                # comment line is skipped without ending the block.
+                folded = rest.startswith(">")
+                block = []
+                while i < len(fm_lines):
+                    cont = fm_lines[i]
+                    cs = cont.strip()
+                    if not cs:
+                        block.append("")
+                        i += 1
+                    elif not cont[0].isspace():
+                        if cs.startswith("#"):
+                            i += 1
+                            continue
+                        break
+                    else:
+                        block.append(cs)
+                        i += 1
+                while block and not block[-1]:
+                    block.pop()
+                if folded:
+                    # '>' folds lines of a paragraph into spaces;
+                    # blank lines separate paragraphs with a newline.
+                    paras, cur = [], []
+                    for b in block:
+                        if b:
+                            cur.append(b)
+                        elif cur:
+                            paras.append(" ".join(cur))
+                            cur = []
+                    if cur:
+                        paras.append(" ".join(cur))
+                    fm[last] = "\n".join(paras)
+                else:
+                    # '|' keeps one line of content per source line.
+                    fm[last] = "\n".join(block)
+            else:
+                fm[last] = rest.strip('"').strip("'")
         elif last:
             fm[last] = (fm[last] + " " + s).strip()
     missing = [f for f in FIELDS if f not in fm]

@@ -64,7 +64,7 @@
 <h2>Unified model: three kinds of registration</h2>
 <table>
 <tr><th>Who</th><th>What is registered</th><th>Lives while</th></tr>
-<tr><td class="key">Line provider</td><td><code>provider.register{line_id, caps, token}</code> — a "communication channel"</td><td>transport session + ping; lost → DEGRADED→DOWN</td></tr>
+<tr><td class="key">Line provider</td><td><code>provider.register{line_id, caps, token}</code> — a "communication channel"</td><td>transport session + ping; lost → degraded→down on the liveness axis (<code>event.line_health_changed</code>, round 25)</td></tr>
 <tr><td class="key">Agent</td><td><code>agent.register_intent{dial_out|receive_inbound}</code> — an "intention" (exclusive ownership goes through <code>call.claim_exclusive</code>, not an intent — round 21)</td><td>declarative; LineManager resolves intents → LineAssignment</td></tr>
 <tr><td class="key">Line ownership</td><td>LineAssignment (durable, survives sleep) — derived from claim OR admin_pin</td><td>until release / revoke / idle alert</td></tr>
 </table>

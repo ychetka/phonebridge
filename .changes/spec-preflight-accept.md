@@ -18,4 +18,4 @@ refs: issue #57
 ---
 
 ## Spec impact
-- modifies: docs/specs/line-manager.md#outbox-soft-cap-pre-flight-and-drain-discipline
+- modifies: docs/specs/line-manager.md#requirement-outbox-soft-cap-pre-flight-and-drain-discipline
