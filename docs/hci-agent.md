@@ -240,15 +240,18 @@ endpoint:
 ### vhci feeder — SCO handle gate and MTU alignment (round 25)
 
 **MTU alignment.** `hci_vhci` carries no `btusb` USB quirks: the
-kernel default SCO buffer geometry of a virtual adapter is NOT the
-60 B profile of a real USB dongle. At adapter bring-up the feeder
-MUST program the vhci adapter's synchronous data geometry via the
-HCI `Write_Synchronous_Flow_Control_Enable` / SCO data-packet-length
-setup so `sco_data_packet_len == 60` — matching the mSBC
-1-frame-per-packet invariant the agent's H2 counter rewrite assumes —
-before any sync connection is accepted. A mismatched length would
-let the kernel slice SCO at a different boundary, so the agent's
-byte-2 sequence rewrite would corrupt mid-frame audio.
+SCO buffer geometry a real dongle negotiates over USB descriptors
+does not exist on a virtual adapter — behind `/dev/vhci` the feeder
+IS the controller, so it declares the synchronous geometry itself:
+it answers `HCI_Read_Buffer_Size` (and the synchronous-flow-control
+queries) with `sco_data_packet_len = 60` — the mSBC profile — and
+emits SCO packets of exactly that negotiated length
+(1 mSBC frame per HCI packet), before any sync connection is
+accepted. If the kernel side ever reports a different length (e.g.
+a host bluetoothd SCO-buffer readback mismatch), the feeder refuses
+sync setup and raises `SCO_ALT_UNSUPPORTED` — a mismatched length
+would let the kernel slice SCO at a different boundary, so the
+agent's byte-2 H2 sequence rewrite would corrupt mid-frame audio.
 
 The split transport means SCO data can outrun the setup event that
 created the synchronous connection. The container-side feeder

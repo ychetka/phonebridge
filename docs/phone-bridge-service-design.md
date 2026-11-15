@@ -330,8 +330,10 @@ type LineSummary = { line_id: string, caps: Intent[], state: LineState,
 ```
 
 Error codes (contract-level; each maps to a numeric JSON-RPC
-`error.code` and travels typed inside `error.data.error_code` —
-round 25): `UNAUTHORIZED`, `FORBIDDEN`, `SESSION_NOT_FOUND`,
+`error.code` via `ERROR_CODE_WIRE`, the string travels as
+`error.message`, and typed detail rides `error.data`
+`{reason?, detail?, free_lines?}` — round 25): `UNAUTHORIZED`,
+`FORBIDDEN`, `SESSION_NOT_FOUND`,
 `OWNER_MISMATCH`, `LINE_EXCLUSIVE_NOT_OWNER`, `LINE_BUSY_INCOMING`,
 `LINE_NOT_FOUND`, `INVALID_INTENT`, `STALE_TOKEN`,
 `PROVIDER_UNREACHABLE`, `DIAL_REJECTED` (typed `data.reason` - see
@@ -866,10 +868,11 @@ preserved there as the per-line tunnel port pair.)
   counter (`0x08 -> 0x38 -> 0xC8 -> 0xF8`) rewritten on every
   outbound USB mSBC packet, including generated silence on
   underrun (round 24, review-13 H1). The SCO packet SIZE the feeder
-  emits MUST match the virtual adapter's negotiated
-  `sco_data_packet_len` (set via `HCI_Write_Synchronous_Flow_
-  Control`/`SCO flow control enable` on the vhci adapter, default
-  mSBC profile 60 B — `docs/hci-agent.md` §3): `hci_vhci` has no
+  emits MUST match the virtual adapter's declared synchronous
+  geometry — behind `/dev/vhci` the feeder IS the controller and
+  answers `HCI_Read_Buffer_Size`/synchronous-flow-control queries
+  itself with `sco_data_packet_len = 60` (mSBC profile,
+  `docs/hci-agent.md` §2): `hci_vhci` has no
   `btusb` quirks, so a length negotiated for a real USB controller
   would misalign the 1-frame-per-packet invariant the H2 counter
   rewrite assumes. The agent's numeric `air_mode` code (`0x03` =
@@ -1196,10 +1199,12 @@ status (mirrors the busctl commands used in Phase-0).
   over WebSocket on BOTH legs — `ws://` on the UDS control socket
   and `wss://` on the loopback/wg0 listener — so message boundaries
   are protocol-owned and equal on every transport; per-message cap
-  64 KiB. Error envelopes follow JSON-RPC 2.0: `error.code` is the
-  numeric spec code plus a typed `error_code` string inside
-  `error.data` (`UNAUTHORIZED`/`FORBIDDEN`/`SESSION_NOT_FOUND`
-  included since round 25) — see `docs/api-contract.md` error map.
+  64 KiB. Error envelopes follow JSON-RPC 2.0 (round 25):
+  `error.code` is the integer from `ERROR_CODE_WIRE` (application
+  band `-32099..-32000`), `error.message` carries the `ErrorCode`
+  string (`UNAUTHORIZED`/`FORBIDDEN`/`SESSION_NOT_FOUND` included),
+  `error.data` is the `ErrorData` JSON `{reason?, detail?,
+  free_lines?}` — see `docs/api-contract.md` error map.
 - Secrets/PII (tokens, caller numbers) must never reach logs:
   `CallToken`/`MediaToken` travel inside `RedactedString`-style
   containers that refuse `str()`/`json.dumps` without an explicit

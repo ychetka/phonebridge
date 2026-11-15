@@ -553,16 +553,22 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     assert isinstance(rec, RecordAndTelegramFallback)
     assert rec.channel == "@ops"
     announce = adapter.validate_python(
-        {"policy": "answer_and_announce", "announcement_ref": "wav:busy-msg"}
+        {"policy": "answer_and_announce", "announcement_ref": "busy-msg-wav"}
     )
     assert isinstance(announce, AnswerAndAnnounceFallback)
-    assert announce.announcement_ref == "wav:busy-msg"
+    assert announce.announcement_ref == "busy-msg-wav"
     # Round 22 (review-10 MEDIUM-2): the policy carries the
-    # announcement selector - it cannot be empty or absent.
+    # announcement selector - it cannot be empty or absent. The ref
+    # is a checked identifier: a ":" would corrupt the adapter's
+    # "answer_and_announce:<ref>" split (round 25, review-15 item 37).
     with pytest.raises(ValidationError):
         adapter.validate_python({"policy": "answer_and_announce"})
     with pytest.raises(ValidationError):
         adapter.validate_python({"policy": "answer_and_announce", "announcement_ref": ""})
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {"policy": "answer_and_announce", "announcement_ref": "wav:busy-msg"}
+        )
     with pytest.raises(ValidationError):
         adapter.validate_python({"policy": "spill_to_pool"})  # never existed
 
@@ -2343,8 +2349,10 @@ def test_system_agent_identity_and_id_hygiene() -> None:
     assert not is_system_agent_id("agent-1")
     # The reserved identity stays legal on agent-scoped fields.
     assert AgentAudience(agent_id=SYSTEM_FALLBACK_WORKER).agent_id == SYSTEM_FALLBACK_WORKER
-    # External ids: empty, colon-bearing and overlong are rejected.
-    for bad in ("", "a" * 129, "agent:x"):
+    assert AgentAudience(agent_id="system:fallback_worker").agent_id == "system:fallback_worker"
+    # External ids: empty, colon-bearing and overlong are rejected;
+    # a bare "system:" prefix with an empty suffix names nothing.
+    for bad in ("", "a" * 129, "agent:x", SYSTEM_AGENT_PREFIX):
         with pytest.raises(ValidationError):
             AgentAudience(agent_id=bad)
     # "default" is an API-boundary alias, never a domain line_id.
@@ -2891,10 +2899,15 @@ def test_cross_field_validators_batch3() -> None:
     ok_lease = CallLease(**lease_base, intent=Intent.RECEIVE_INBOUND, answered_at=NOW_UTC)
     assert ok_lease.answered_at == NOW_UTC
 
-    # LineSummary mirrors the binding's telecom-only caps.
-    for bad_caps in ([], [Intent.EXCLUSIVE_LINE], [Intent.DIAL_OUT, Intent.EXCLUSIVE_LINE]):
+    # LineSummary mirrors the binding's telecom-only caps while a
+    # provider is attached; an unbound/pool line has no binding and
+    # legitimately reports an empty tuple (its claimability is a
+    # LineAssignment fact, not a cap) - EXCLUSIVE_LINE stays banned.
+    for bad_caps in ([Intent.EXCLUSIVE_LINE], [Intent.DIAL_OUT, Intent.EXCLUSIVE_LINE]):
         with pytest.raises(ValidationError):
             LineSummary(line_id=LineId("line-main"), caps=bad_caps, state=LineState.FREE)
+    unbound = LineSummary(line_id=LineId("line-pool"), caps=(), state=LineState.FREE)
+    assert unbound.caps == ()
     summary = LineSummary(
         line_id=LineId("line-main"),
         caps=[Intent.DIAL_OUT, Intent.RECEIVE_INBOUND],

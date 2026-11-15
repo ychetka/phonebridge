@@ -438,8 +438,14 @@ def _check_agent_id(value: str) -> str:
     reserved ``system:*`` namespace stays legal on domain records -
     :data:`SYSTEM_FALLBACK_WORKER` is a kernel-internal agent that
     legitimately appears on ``AgentAudience.agent_id`` /
-    ``owner_agent_id`` (item 21)."""
+    ``owner_agent_id`` (item 21). A bare ``system:`` with an empty
+    suffix is NOT a legal member of that namespace - the prefix
+    alone names nothing."""
     if is_system_agent_id(value):
+        if len(value) <= len(SYSTEM_AGENT_PREFIX):
+            raise ValueError(
+                f"system agent id must carry a non-empty suffix after {SYSTEM_AGENT_PREFIX!r}"
+            )
         if len(value) > _ID_MAX_LEN:
             raise ValueError(f"identifier exceeds {_ID_MAX_LEN} chars")
         return value
@@ -678,10 +684,9 @@ class QueueCancelReason(str, Enum):
 
 
 class ErrorCode(str, Enum):
-    """Wire error codes - VERBATIM from docs/api-contract.md, plus the
-    round-25 (review-15 item 4) transport/auth trio
-    ``UNAUTHORIZED``/``FORBIDDEN``/``SESSION_NOT_FOUND`` whose doc row
-    lands with the separate api-contract.md amendment.
+    """Wire error codes - VERBATIM from docs/api-contract.md,
+    including the round-25 (review-15 item 4) transport/auth trio
+    ``UNAUTHORIZED``/``FORBIDDEN``/``SESSION_NOT_FOUND``.
 
     The wire JSON-RPC error object carries TWO layers (round 25):
     ``error.code`` is the INTEGER from :data:`ERROR_CODE_WIRE`
@@ -692,8 +697,8 @@ class ErrorCode(str, Enum):
     No additional codes may be introduced in the domain: new error
     semantics travel as typed reason sub-codes in ErrorData.reason
     until the wire document itself is amended. (tests/test_domain_
-    contract.py parses the doc table and asserts this enum matches
-    modulo the pending round-25 trio.)
+    contract.py parses the doc error-code table and asserts this enum
+    matches it exactly.)
     """
 
     OWNER_MISMATCH = "OWNER_MISMATCH"
@@ -1294,10 +1299,12 @@ class AnswerAndAnnounceFallback(ContractModel):
     FallbackWorker connects via the standard agent API only (ADR-01),
     so the policy model itself MUST carry the announcement selector:
     the worker has no admin scope to query line config. Wire config
-    spelling: ``answer_and_announce:<announcement_ref>``."""
+    spelling: ``answer_and_announce:<announcement_ref>`` - the ref is
+    a checked identifier (``_CheckedId``) because a ``":"`` inside it
+    would corrupt the adapter's ``<policy>:<param>`` split."""
 
     policy: Literal["answer_and_announce"] = "answer_and_announce"
-    announcement_ref: str = Field(min_length=1)
+    announcement_ref: _CheckedId
 
 
 FallbackPolicy = Annotated[
@@ -1506,11 +1513,13 @@ class LineSummary(ContractModel):
 
     line_id: _CheckedLineId
     caps: tuple[Intent, ...]
-    """The line's TELECOM capability set as the agent sees it - the
-    mirror of ``ProviderBinding.caps`` (round 25, review-15 item 41):
-    the same non-empty, telecom-only invariant applies, so
-    ``Intent.EXCLUSIVE_LINE`` can never ride the listing (exclusivity
-    AVAILABILITY is a ``claimable``/``mode`` fact the
+    """The line's TELECOM capability set as the agent sees it - while
+    a provider is attached it mirrors the live ``ProviderBinding.caps``
+    (round 25, review-15 item 41); an unbound/pool line has NO binding
+    and legitimately reports an empty tuple - its claimability is a
+    ``LineAssignment.claimable``/``mode`` fact, not a cap.
+    ``Intent.EXCLUSIVE_LINE`` can never ride the listing either way
+    (exclusivity AVAILABILITY is what the
     ``get_lines(intent=EXCLUSIVE_LINE)`` filter answers separately)."""
     state: LineState
     liveness: LivenessState = LivenessState.REACHABLE
@@ -1519,10 +1528,17 @@ class LineSummary(ContractModel):
     @field_validator("caps")
     @classmethod
     def _caps_are_telecom_only(cls, caps: tuple[Intent, ...]) -> tuple[Intent, ...]:
-        """Same ``_provider_caps_check`` the binding enforces (round
-        25, review-15 item 41): the agent-facing caps mirror the
-        binding's, so a non-empty telecom-only set is mandatory."""
-        return _provider_caps_check(caps)
+        """The EXCLUSIVE_LINE ban of ``_provider_caps_check`` WITHOUT
+        its non-empty rule (round 25, review-15 item 41): the caps
+        mirror the live ``ProviderBinding`` while attached, and an
+        unbound/pool line has no binding - it reports ``()``, because
+        claimability is a ``LineAssignment`` fact, not a capability."""
+        if Intent.EXCLUSIVE_LINE in caps:
+            raise ValueError(
+                "exclusive_line is not a provider capability - "
+                "exclusivity lives on LineAssignment.claimable/mode"
+            )
+        return caps
 
 
 class LineAssignment(ContractModel):
