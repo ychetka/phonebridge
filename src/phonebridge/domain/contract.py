@@ -314,17 +314,26 @@ class ProviderDisconnectReason(str, Enum):
 
 
 class CallEndReason(str, Enum):
-    """Call/teardown reason vocabulary for ``event.call_state_changed``
-    and lease-teardown paths (round 21, MEDIUM-9).
+    """CLOSED reason vocabulary for the ``reason`` fields of
+    ``event.call_state_changed``, ``event.missed_call`` and
+    ``event.line_state_changed`` plus lease-teardown paths
+    (round 21, MEDIUM-9; wired into the event payloads in the
+    round-21 review fix).
 
     Superset of :class:`ProviderDisconnectReason` plus the reasons
     only the gateway can mint: agent-initiated hangup, inbound
     preemption of an undialed grant, grant/accept window expiry,
-    dead-man teardowns and admin revokes. Wire spellings are
+    dead-man teardowns, admin revokes and the ``external_call`` line
+    fact (a human-initiated call on the physical phone surfaces as
+    ``event.line_state_changed{new_state:"BUSY", reason:"external_call"}``,
+    design §9 - no lease is ever minted for it). Wire spellings are
     lowercase snake_case - the uppercase ErrorReason members that
     mirror some of the same facts serve the error-channel sub-code
     convention, a different field, and the two vocabularies are
-    intentionally not merged."""
+    intentionally not merged. ``ProviderCallStateUpdate.reason``
+    deliberately stays on the narrower provider-reported
+    :class:`ProviderDisconnectReason` - gateway-minted members of
+    this enum can never arrive on that ingress."""
 
     NORMAL = "normal"
     BUSY = "busy"
@@ -340,6 +349,7 @@ class CallEndReason(str, Enum):
     AGENT_DISCONNECTED = "agent_disconnected"
     PROVIDER_LOST = "provider_lost"
     ADMIN_REVOKED = "admin_revoked"
+    EXTERNAL_CALL = "external_call"
 
 
 class ErrorCode(str, Enum):
@@ -617,7 +627,11 @@ class ContractModel(BaseModel):
       LineManager, EventBus and the adapters share one process, so a
       stray mutation in one subscriber would corrupt kernel state or
       a sibling's view; collection fields are ``tuple``/``frozenset``
-      (JSON serialization to arrays is unchanged).
+      (JSON serialization to arrays is unchanged). NOTE: ``frozen``
+      covers FIELD REASSIGNMENT only - a ``dict`` field kept for wire
+      compat (``ProviderRegistration.meta``) remains mutable through
+      its contents; treat such fields as immutable by convention
+      (round-21 review).
     - ``safe_dump()``/``to_log_dict()`` are the ONLY allowed log dumps:
       raw ``model_dump()``/``model_dump_json()`` emit full PII wire
       values and are PROHIBITED for logging.
@@ -1075,6 +1089,9 @@ class ProviderRevokeCommand(ContractModel):
     line_id: LineId
     assignment_id: AssignmentId
     reason: str | None = None
+    """Free-form admin note relayed to ``line.revoke{reason?}`` (round-21
+    review audit: the wire table documents no closed vocabulary for
+    this param, so it does NOT ride CallEndReason)."""
 
 
 ProviderCommand = Annotated[
@@ -1147,12 +1164,13 @@ class BroadcastAudience(ContractModel):
 
 
 class AgentAudience(ContractModel):
-    """Exactly one ``agent_id`` sees the event: the exclusive line
-    owner (``incoming_call``/``missed_call``/``assignment_revoked`` on
-    owned lines) or the system worker ``system:fallback_worker``
-    (``fallback_triggered``). Required whenever the payload carries
-    PII or a one-shot ``call_token`` - a broadcast would leak the
-    number and the intercept token to every connected agent
+    """The event is scoped to a single ``agent_id``: the exclusive
+    line owner (``incoming_call``/``missed_call``/``assignment_revoked``
+    on owned lines) or the system worker ``system:fallback_worker``
+    (``fallback_triggered``). PII or a one-shot ``call_token`` does
+    NOT by itself force this scope - on a shared-pool line
+    ``incoming_call``/``missed_call`` legitimately broadcast because
+    every connected agent is an eligible acceptor
     (round 21, HIGH-4)."""
 
     scope: Literal["agent"] = "agent"
@@ -1210,12 +1228,17 @@ class CallStateChangedEvent(ContractModel):
     """call_state_changed payload. ``phase`` is the domain CallPhase;
     the wire spelling "disconnected" maps to ENDED at the adapter
     boundary. ``answer_confidence`` mirrors CallLease's hedge: how
-    sure the bridge is that ACTIVE means a human answered (§5.5)."""
+    sure the bridge is that ACTIVE means a human answered (§5.5).
+    ``reason`` rides the CLOSED :class:`CallEndReason` vocabulary
+    (round-21 review): it carries BOTH provider-reported teardowns
+    (relayed from ``provider.call_state.reason``) and gateway-minted
+    ones (``provider_lost``, ``grant_ttl_expired``,
+    ``preempted_by_incoming``, ...)."""
 
     lease_id: LeaseId
     line_id: LineId
     phase: CallPhase
-    reason: str | None = None
+    reason: CallEndReason | None = None
     answer_confidence: AnswerConfidence | None = None
 
 
@@ -1249,7 +1272,9 @@ class AssignmentRevokedEvent(ContractModel):
     """assignment_revoked payload: durable binding ended (release,
     admin line.revoke, or idle escalation). ``owner_agent_id`` is
     None when the revoked binding was a pool/provider attachment
-    (round 19)."""
+    (round 19). ``reason`` stays free-form ``str``: the wire table
+    documents no closed vocabulary for it - an admin-supplied revoke
+    note is legal payload (round-21 review audit)."""
 
     assignment_id: AssignmentId
     line_id: LineId
@@ -1280,21 +1305,28 @@ class FallbackTriggeredEvent(ContractModel):
 
 
 class LineStateChangedEvent(ContractModel):
-    """line_state_changed payload: LineState transition fact."""
+    """line_state_changed payload: LineState transition fact.
+    ``reason`` rides the CLOSED :class:`CallEndReason` vocabulary
+    (round-21 review) - this is the channel that surfaces
+    ``external_call`` when a human-initiated call takes the line
+    BUSY (design §9)."""
 
     line_id: LineId
     old_state: LineState
     new_state: LineState
-    reason: str | None = None
+    reason: CallEndReason | None = None
 
 
 class MissedCallEvent(ContractModel):
     """missed_call payload: an inbound ring ended unanswered
-    (accept-window expiry, caller hangup, or reject-policy outcome)."""
+    (accept-window expiry, caller hangup, or reject-policy outcome).
+    ``reason`` is REQUIRED on the wire (api-contract.md event table)
+    and rides the CLOSED :class:`CallEndReason` vocabulary
+    (round-21 review)."""
 
     line_id: LineId
     caller: RedactedString | None = None
-    reason: str
+    reason: CallEndReason
     voicemail_ref: str | None = None
 
 
@@ -1328,6 +1360,12 @@ class ProviderRegistration(ContractModel):
     caps: tuple[Intent, ...]
     profile: str | None = None
     meta: dict[str, str] = Field(default_factory=dict)
+    """Opaque provider metadata (wire: ``provider.register{meta?}``
+    object). Kept as ``dict`` for wire compat: ``frozen=True`` covers
+    field reassignment only, so the mapping itself stays mutable -
+    treat contents as immutable by convention (round-21 review; a
+    MappingProxyType wrapper would add a custom validator+serializer
+    for no wire-shape gain)."""
     state_snapshot: tuple[ProviderActiveCall, ...] | None = None
     """The provider's view of live calls at registration time
     (round 21, CRITICAL-3): carried on ``provider.reregister``
@@ -1337,15 +1375,24 @@ class ProviderRegistration(ContractModel):
 
 
 class ProviderLiveness(ContractModel):
-    """Provider liveness fact: reachable/unreachable + timestamp.
+    """Provider liveness fact: reachable / ws_disconnected /
+    unreachable + timestamp.
 
-    Derived from heartbeat health (missed pings -> DEGRADED -> DOWN);
+    Distilled from the ``provider.ping`` heartbeat path (missed pings
+    -> DEGRADED -> DOWN, WS drop -> ws_disconnected/orphan-grace);
     the ping transport itself stays in the adapter."""
 
     line_id: LineId
     assignment_id: AssignmentId | None = None
     state: LivenessState
     checked_at: AwareDatetime
+    state_snapshot: tuple[ProviderActiveCall, ...] | None = None
+    """Optional ``provider.ping{state_snapshot?}`` carrier (round-21
+    review): same element shape as
+    :attr:`ProviderRegistration.state_snapshot` - the calls the
+    provider still sees on the D-Bus - so a ping can feed ongoing
+    reconciliation the way reregister does inside the orphan-grace
+    window. ``None`` when the ping carries no snapshot."""
 
 
 class ProviderCallStateUpdate(ContractModel):
@@ -1401,6 +1448,9 @@ class FallbackDecision(ContractModel):
     call_token: CallToken
     policy: FallbackPolicy
     reason: str | None = None
+    """Free-form decision context for logs/telemetry (round-21 review
+    audit: no closed vocabulary is documented for this internal field,
+    so it does NOT ride CallEndReason)."""
     fallback_call_token: CallToken | None = None
     """Re-issued ring token for WORKER policies (round 14): bound to
     ``system:fallback_worker``, single-use, TTL-bound, bypasses the

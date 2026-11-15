@@ -33,6 +33,7 @@ from phonebridge.domain.contract import (
     AssignmentRevokedEvent,
     AudioReadyEvent,
     BroadcastAudience,
+    CallEndReason,
     CallLease,
     CallPhase,
     CallStateChangedEvent,
@@ -567,7 +568,7 @@ def test_event_envelope_and_payloads() -> None:
         lease_id=LeaseId("l-1"),
         line_id=LineId("line-main"),
         phase=CallPhase.ACTIVE,
-        reason="provider active",
+        reason=CallEndReason.NORMAL,
         answer_confidence="provisional",
     )
     qr = QueueReadyEvent(
@@ -600,9 +601,67 @@ def test_event_envelope_and_payloads() -> None:
         old_state=LineState.FREE,
         new_state=LineState.BUSY,
     )
-    mc = MissedCallEvent(line_id=LineId("line-main"), reason="accept_window_expired")
+    mc = MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.ACCEPT_WINDOW_EXPIRED)
     for ev in (csc, qr, qu, ar, are, ft, lsc, mc):
         assert ev.model_dump_json()
+
+
+def test_call_end_reason_wired_into_events() -> None:
+    """Round-21 review (WARNING-1): the ``reason`` fields of
+    call_state_changed / missed_call / line_state_changed ride the
+    CLOSED CallEndReason vocabulary - including ``external_call``,
+    the documented wire value for human-initiated calls (design §9).
+    The provider-side ProviderCallStateUpdate.reason deliberately
+    stays on the narrower ProviderDisconnectReason."""
+    # EXTERNAL_CALL exists and ProviderDisconnectReason is a strict
+    # subset (every provider-reported reason is a legal event reason).
+    assert CallEndReason.EXTERNAL_CALL.value == "external_call"
+    provider_values = {r.value for r in ProviderDisconnectReason}
+    event_values = {r.value for r in CallEndReason}
+    assert provider_values < event_values
+
+    # Valid enum members and their raw wire spellings both validate.
+    lsc = LineStateChangedEvent(
+        line_id=LineId("line-main"),
+        old_state=LineState.FREE,
+        new_state=LineState.BUSY,
+        reason=CallEndReason.EXTERNAL_CALL,
+    )
+    assert lsc.reason is CallEndReason.EXTERNAL_CALL
+    csc = CallStateChangedEvent.model_validate(
+        {
+            "lease_id": "l-1",
+            "line_id": "line-main",
+            "phase": "ended",
+            "reason": "provider_lost",
+        }
+    )
+    assert csc.reason is CallEndReason.PROVIDER_LOST
+
+    # A reason outside the closed vocabulary is rejected on all three
+    # event payloads.
+    with pytest.raises(ValidationError):
+        CallStateChangedEvent(
+            lease_id=LeaseId("l-1"),
+            line_id=LineId("line-main"),
+            phase=CallPhase.ENDED,
+            reason="made_up_reason",
+        )
+    with pytest.raises(ValidationError):
+        LineStateChangedEvent(
+            line_id=LineId("line-main"),
+            old_state=LineState.FREE,
+            new_state=LineState.DOWN,
+            reason="made_up_reason",
+        )
+    with pytest.raises(ValidationError):
+        MissedCallEvent(
+            line_id=LineId("line-main"),
+            reason="made_up_reason",
+        )
+    # reason is REQUIRED on missed_call (wire table marks it non-?).
+    with pytest.raises(ValidationError):
+        MissedCallEvent(line_id=LineId("line-main"))  # type: ignore[call-arg]
 
 
 def test_ingress_payloads_validate() -> None:
@@ -658,6 +717,21 @@ def test_ingress_payloads_validate() -> None:
         state=LivenessState.WS_DISCONNECTED,
         checked_at=NOW_UTC,
     )
+    # Round-21 review (WARNING-2): a ping may carry the same
+    # state_snapshot shape as reregister - ProviderLiveness is its
+    # domain carrier.
+    ping = ProviderLiveness(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("asg-1"),
+        state=LivenessState.REACHABLE,
+        checked_at=NOW_UTC,
+        state_snapshot=[
+            ProviderActiveCall(lease_id=LeaseId("l-1"), state=ProviderCallState.ACTIVE),
+            ProviderActiveCall(state=ProviderCallState.DIALING),  # external call
+        ],
+    )
+    assert ping.state_snapshot is not None
+    assert ping.state_snapshot[1].lease_id is None
     # Round 21 (CRITICAL-3): reregister carries a state_snapshot of
     # the provider's live calls for orphan-grace reconciliation.
     reg = ProviderRegistration(
@@ -818,7 +892,7 @@ class _FakeLineManager(LineManager):
                 name=EventName.MISSED_CALL,
                 audience=BroadcastAudience(),
                 emitted_at=NOW_UTC,
-                payload=MissedCallEvent(line_id=LineId("line-main"), reason="test"),
+                payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NORMAL),
             )
         ]
 
@@ -1139,16 +1213,21 @@ async def test_line_admin_kernel_all_methods() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _doc_line_command_table() -> dict[str, set[str]]:
+def _doc_line_command_table() -> dict[str, dict[str, bool]]:
     """Parse the "## Manager → Line — `line.*`" table in
-    docs/api-contract.md: wire method name -> declared param set
-    (optional `?` markers stripped)."""
+    docs/api-contract.md: wire method name -> {param: is_optional}.
+    The trailing ``?`` marker is KEPT (round-21 review): optionality
+    must be compared against the model fields, not stripped away."""
     text = API_CONTRACT_MD.read_text(encoding="utf-8")
     section = text.split("## Manager → Line", 1)[1]
     section = section.split("\n## ", 1)[0]
-    table: dict[str, set[str]] = {}
+    table: dict[str, dict[str, bool]] = {}
     for m in re.finditer(r"^\|\s*`(line\.[a-z_]+)`\s*\|\s*`\{([^}]*)\}`", section, flags=re.M):
-        params = {p.strip().rstrip("?") for p in m.group(2).split(",") if p.strip()}
+        params: dict[str, bool] = {}
+        for p in m.group(2).split(","):
+            p = p.strip()
+            if p:
+                params[p.rstrip("?")] = p.endswith("?")
         table[m.group(1)] = params
     return table
 
@@ -1157,7 +1236,10 @@ def test_provider_command_wire_parity() -> None:
     """Round 21 (CRITICAL-1) drift test: every ProviderCommand
     discriminator resolves to a documented ``line.*`` method via
     PROVIDER_COMMAND_WIRE_NAMES, and each command model's fields match
-    the params declared in the api-contract table.
+    the params declared in the api-contract table - by name AND by
+    required-vs-optional (the doc's ``?`` suffix vs the model field
+    carrying a default; round-21 review: stripping ``?`` let
+    optionality drift pass silently).
 
     ``command`` (the discriminator) and ``line_id`` are excluded from
     the comparison: commands ride the provider's own inbound
@@ -1178,10 +1260,19 @@ def test_provider_command_wire_parity() -> None:
     for model in command_models:
         discriminator = model.__pydantic_fields__["command"].default
         wire_name = PROVIDER_COMMAND_WIRE_NAMES[discriminator]
-        fields = set(model.__pydantic_fields__) - {"command", "line_id"}
-        assert fields == table[wire_name], (
+        model_fields = model.__pydantic_fields__
+        fields = set(model_fields) - {"command", "line_id"}
+        doc_params = table[wire_name]
+        assert fields == set(doc_params), (
             f"{model.__name__} drift vs {wire_name}: "
-            f"missing={table[wire_name] - fields}, extra={fields - table[wire_name]}"
+            f"missing={set(doc_params) - fields}, extra={fields - set(doc_params)}"
+        )
+        model_optional = {f for f in fields if not model_fields[f].is_required()}
+        doc_optional = {p for p, optional in doc_params.items() if optional}
+        assert model_optional == doc_optional, (
+            f"{model.__name__} optionality drift vs {wire_name}: "
+            f"doc-optional-only={doc_optional - model_optional}, "
+            f"model-optional-only={model_optional - doc_optional}"
         )
 
 
@@ -1223,5 +1314,5 @@ def test_event_audience_union_and_envelope() -> None:
         EventEnvelope[MissedCallEvent](
             name=EventName.MISSED_CALL,  # type: ignore[call-arg]
             emitted_at=NOW_UTC,
-            payload=MissedCallEvent(line_id=LineId("line-main"), reason="x"),
+            payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NORMAL),
         )
