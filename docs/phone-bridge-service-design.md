@@ -62,6 +62,7 @@ referenced sections.
 | round 22 (architect review 10 — `SA_carbon_review_10_gemini`, 2026-11-15) | `LineManager.update_provider_capabilities` + `ProviderCapabilityUpdate` (capability_update ingress, no token); `CallLease.session_id` ((session_id, lease_id) ownership, SessionAudience routing, sibling-session safety); `provider.call_state` gains `caller_id?` + `{ok, call_token}` on `ringing` (gateway-minted token echoed for early caller hangups; `IncomingRingIngress` no longer takes call_token as input); event schema/wire alignment (`caller`→`caller_id`, `expires_in_ms`→`expires_at` RFC 3339, `CallStateChangedEvent.state: WireCallState`, `ticket_id` on `event.line_acquired`, `AssignmentRevokedEvent.owner_agent_id` required — ProviderBinding revoke = `line.revoke` + `line_state_changed{DOWN, admin_revoked}`); ephemeral CallLease auto-release (hangup/disconnected end the lease; `call.release{lease_id}` mid-call = hangup-intent; `call.release{assignment_id}` = durable owner release); `receive_inbound`-scoped inbound events + accept gate (shared pool fans out per-session); `admin.assign_line` + `configure_line{idle_revoke_after, timeouts}` (`TimeoutConfig`); LineProvider owns in-band DTMF synthesis + uplink mute + `0x02` flush emission (MediaRouter drains its uplink buffer on receipt); `AnswerAndAnnounceFallback.announcement_ref`, `fallback_worker` acquire bypass, `event.fallback_triggered` as THE delivery; bounded `PendingClaim` (8/agent, 256 total, socket-bound) + bounded `ProviderRegistration.meta` | contract.py, docs/api-contract.md, §3.2-§3.6, §4.1, §4.2, §5.1-§5.4, §6.4, §10 |
 | round 23 (architect review 12 — `SA_carbon_review_12`, Phase-0 contract freeze) | `line.hangup` XOR target `{lease_id? \| call_token?}` (reject-fallback executability); `ForwardViaLineFallback` gains `target_number`/`target_country` + config-time self-loop ban; `MediaAllocator` lifecycle fixed (allocate at dial/accept + idempotent `revoke(lease_id)` on lease ENDED); `_mask_for_log` serializes datetime/timedelta/Enum (json.dumps-safe logs); two-level outbox overflow model (SOFT_CAP pre-flight on acquire/dial/accept/claim, teardown never raises, drain after every call); Saga compensation on `line.dial`/`line.answer` (`{accepted}` ~2 s deadline → `disconnected`/`network_error`); `FallbackTriggeredEvent.expires_at` + `TimeoutConfig.fallback_accept_ttl_sec`; `event.idle_alert`/`IdleAlertEvent` + `AdminAudience` (idle escalation is alert-only, never a revoke); `reissued_ticket_id` on `call_state_changed`; bounded `idempotency_key` (1-128); deterministic `phone_mac → agN` chain + Call Waiting auto-reject; hci-agent token = long-lived per-line pre-shared secret + uplink playout jitter buffer; MediaRouter 20 ms uplink pacing + asymmetric rings (ADR-A); M1↔M2 storage split (SQLite durable config vs in-memory lease/queue state, admin write-through under `asyncio.Lock`); capability matrix (`CAP_NET_ADMIN`/`CAP_NET_RAW` only bluetoothd + wg-supervisor, vhci-feeder zero-caps on wg0 IP); pinned PipeWire node format 16 kHz/S16LE/mono; exec-hooks execve-only + webhook retry deadline `expires_at - 1s`; `profile` informational only (eligibility via `RECEIVE_INBOUND` in caps); `py.typed` + `docs/specs/` skeleton + doc drift fixes | contract.py, docs/api-contract.md, docs/hci-agent.md, §1, §3.5-§3.6, §4.2-§4.5, §5.2-§5.3, §6.3-§6.4, §7, §9-§10 |
 | round 24 (architect review 13 — `SA_carbon_review_13`, final Phase-0 contract freeze v0.0.19, issue #59) | MediaRouter pacing direction CORRECTED (ADR-24.1): the agent-socket reader drains continuously at socket speed (`0x01` → 1500-frame ring, `0x02` → immediate ring drain), pacing applies on EGRESS — one 640 B frame per monotonic 20 ms tick toward the LineProvider; `LineTimeouts` effective-value model (ADR-24.2) split from the `TimeoutConfig` patch — `LineAssignment.timeouts` for SQLite write-through + `ProviderBinding.heartbeat_interval_ms` stamps the negotiated per-session cadence; `heartbeat_down_after > heartbeat_degraded_after` validated on both models; `validate_e164_country` + `ForwardViaLineFallback` model validator + `LineAssignment` self-loop ban move dial-target validation from `configure_line` into the constructors; provider `caps` are non-empty telecom-only (`dial_out`/`receive_inbound` — `exclusive_line` is a `LineAssignment.claimable`/`mode` property, never a cap); docstrings freeze the `ingest_ring` glare matrix (BUSY/DOWN → `INVALID_STATE`, provider Hangup), `tick(now)` as the sole timer driver (`decide_fallback` before `expires_at` → `INVALID_STATE`; `fallback_accept_ttl_sec` expiry → `RINGING_LOCKED -> FREE` + `MissedCallEvent{ACCEPT_WINDOW_EXPIRED}`), error mapping (`CLAIM_NOT_FOUND` under `INVALID_STATE`, unknown `assignment_id` → `STALE_TOKEN`, `call.release` XOR breach → `INVALID_ARGUMENT`) and `AssignmentId` rotation on owner/mode change with bounded `_closed_assignments`; hci-agent `0x16 SCO_STATE` gains `handle?: uint16` (required on open, ADR-24.3) + continuous 2-bit H2 counter rewritten on ALL outbound mSBC packets including silence | contract.py, docs/api-contract.md, docs/hci-agent.md, §3.3, §3.6, §6.3, §6.6, §9 |
+| round 25 (`SA_carbon_review_15` — pre-M1 contract consolidation) | Deployment: `--network=host` + `/dev/vhci` on a dedicated host ratified as THE production profile (`AF_BLUETOOTH` is `init_net`-only; isolated netns impossible), micro-VM documented as optional hardened profile; `phonebridge doctor` pre-flight; UDS `0660`/`0700` state dirs. Contract: `LineState`/`LivenessState` split (`event.line_health_changed`, RESERVED/DEGRADED/DOWN removed from occupancy); `event.claim_resolved`/`event.assignment_granted`/`event.queue_cancelled` added (`assignment_id` finally reaches the owner); agent/provider media endpoint split (`MediaCredentials`); `line.reattach_media`/`call.reattach_media` token reissue; ring correlates by line not token (fallback token + snapshot reconcile + 1:1 ambiguity rule + provider `/run` state file); queue `seq` minted at acquire ingress; provider `call_state` gains `observed_at`/`call_token`/`caller_id`/`reason` echo + provider disconnect-reason closed vocab; `call.release` XOR `{lease_id\|assignment_id}` + `STALE_TOKEN`; `system:*` identities rejected on external sockets; `clear_idle_revoke_after`; forwarding cycle bound 8 hops; `max_call_duration_sec`/`ring_drain_ttl_sec` timeouts; media pair TTL 30 s + `network_error` teardown on timeout; DTMF `0x02` timestamped watermark flush + ALERTING early-media gate; `call.get_lines` privacy filter + redacted broadcast `line_state_changed` reasons for exclusive lines; JSON-RPC numeric error codes + `error_code`/`ErrorData` + `UNAUTHORIZED`/`FORBIDDEN`/`SESSION_NOT_FOUND`; WS-over-UDS framing 64 KiB | contract.py, docs/api-contract.md, docs/hci-agent.md, §2.1, §4.5, §5.2-§5.4, §6.3-§6.4, §7, §9-§10, §13 |
 
 ## §1. Service boundary
 
@@ -105,8 +106,11 @@ referenced sections.
   `bluez_input.*`/`bluez_output.*`, mSBC assumption-checked at call
   setup (warn if CVSD negotiated).
 - Line liveness: per-line transport session + ping; missed pings ->
-  `DEGRADED` -> `DOWN`, surfaced as `line_state_changed` events
-  (clients must see "degraded" vs "down" distinctly).
+  degraded -> down on the LIVENESS axis (reachable /
+  ws_disconnected / unreachable), surfaced as
+  `event.line_health_changed` (round 25 — call occupancy
+  `LineState` and provider health were split into orthogonal axes;
+  a missed ping can never overwrite a `BUSY` call fact).
 - Line ownership: intent-resolver + LineAssignment (durable) +
   CallLease (ephemeral, dead-man switch) - §4.
 - Universal event fan-out: EventBus in-daemon (§7).
@@ -130,7 +134,7 @@ not D-Bus.
 
 ## §2. Architecture
 
-### §2.1 Deployment artifact: ONE container (prod)
+### §2.1 Deployment artifact: ONE container image, host networking (prod, round 25)
 
 Production deployment is a **single Docker container**
 (`phonebridge-gateway`) that contains the full telephony stack:
@@ -146,18 +150,48 @@ Production deployment is a **single Docker container**
 - **no USB dongles passed through** (round 12, replaces the earlier
   `--device` model): every adapter inside the container is a kernel
   `vhci` device fed by an `hci-agent` on the dongle's machine — see
-  §2.2 and `docs/hci-agent.md`. The container runs in an isolated
-  network namespace; its declared external exposure is exactly the
-  listeners it serves: the agent-facing API surface (UDS/WSS + media,
-  §2.3) and one control-TCP + media-UDP tunnel endpoint per remote
-  line (the hci-agent dials in - §2.2, `docs/hci-agent.md`).
+  §2.2 and `docs/hci-agent.md`.
 
-Motive is host isolation: the host system can be wiped and
-reinstalled and the telephony stack survives entirely inside the
-container — including its Bluetooth subsystem, because no adapter in
-the container is real hardware. A host-side dongle is served by an
-hci-agent running *on that host* exactly like a remote Pi's agent;
-the host's own `bluetoothd` is left free for host devices.
+**Kernel constraint (round 25, verified live — replaces the earlier
+"isolated network namespace" wording, which is physically impossible):**
+the Linux Bluetooth subsystem rejects `AF_BLUETOOTH` sockets
+(`BTPROTO_HCI`/`BTPROTO_SCO`/`BTPROTO_RFCOMM`) outside the root
+network namespace `init_net` (`bt_sock_create` → `EAFNOSUPPORT`), and
+`/dev/vhci` registers `hciN` adapters globally in `init_net`. The
+container therefore runs with **`--network=host`** and an explicit
+`/dev/vhci` device pass-through — the image is packaging for the
+fragile `BlueZ`/`oFono`/`PipeWire` ABI, not a network boundary.
+
+Canonical deployment profile — **dedicated telephony host/VPS**
+(recommended, ratified round 25):
+
+- the host runs NO other Bluetooth stack: host `bluetoothd` is
+  disabled (`systemctl mask bluetooth.service`) — two `bluetoothd`
+  instances in one `init_net` race for `HCI_CHANNEL_CONTROL`;
+- physical dongles plugged into that same host are served by a
+  host-side `hci-agent` per dongle over libusb with `btusb`
+  detached, exactly like a remote Pi's agent;
+- network perimeter is enforced outside the container: listeners
+  bind to `127.0.0.1` (local control/media UDS) and/or the `wg0`
+  interface IP (remote peers), plus host firewall rules — the
+  container shares the host loopback, so local access control lives
+  on the filesystem: the agent socket directory is bind-mounted
+  `0660` under a dedicated `phonebridge` group;
+- state directories (`/var/lib/bluetooth`, `/var/lib/phonebridge`)
+  are `0700`;
+- a `phonebridge doctor` pre-flight check (entrypoint) verifies
+  `/dev/vhci` presence, `hci_vhci` module state, and the ABSENCE of
+  a live host `bluetoothd`, and fails fast with remediation text —
+  never a cryptic `EAFNOSUPPORT` mid-startup.
+
+Optional hardened profile — **shared workstation / multi-tenant**
+(round 25, deferred past MVP): the same OCI image inside a
+lightweight guest micro-VM (Kata/QEMU/cloud-hypervisor) whose guest
+kernel owns its own `init_net` and `/dev/vhci`, leaving the host's
+native Bluetooth untouched. Requires `/dev/kvm` and a guest kernel
+with `CONFIG_BT`+`CONFIG_BT_VHCI` — gated on an audio-jitter spike
+(real-time `PipeWire` timing inside a micro-VM is unproven) and on
+actual demand; NOT an MVP deliverable.
 
 Persistence requirement (ADR-03, round 11): "wipe-safe" is only true
 with two MANDATORY persistent volumes:
@@ -214,9 +248,9 @@ interface LineProviderConfig {
   orphaned agent leases get a **10 s grace** window to re-bind
   through the re-registered provider; (b) provider-reported tunnel/
   USB death (`provider.call_state{state:"disconnected",
-  reason:"dongle_lost"}`) or unreachable provider after
-  DEGRADED->DOWN -> in-flight calls are treated as hangup
-  immediately, no grace.
+  reason:"dongle_lost"}`) or a provider that stays unreachable past
+  the heartbeat `down_after` threshold on the liveness axis ->
+  in-flight calls are treated as hangup immediately, no grace.
 
 RemoteLine example - Raspberry Pi site (round 12): the Pi no longer
 runs the provider. It runs the **hci-agent** — a dumb USB↔HCI relay
@@ -287,17 +321,27 @@ section records the architectural semantics.
 
 ```ts
 type Intent   = "dial_out" | "receive_inbound" | "exclusive_line";
-type LineState = "FREE"|"BUSY"|"RESERVED"|"RINGING_LOCKED"|"DEGRADED"|"DOWN";
-type LineSummary = { line_id: string, caps: Intent[], state: LineState, profile?: string };
+// Occupancy axis ONLY (round 25 — RESERVED had no transitions;
+// DEGRADED/DOWN moved to the liveness axis):
+type LineState     = "FREE"|"BUSY"|"RINGING_LOCKED";
+type LivenessState = "reachable"|"ws_disconnected"|"unreachable";
+type LineSummary = { line_id: string, caps: Intent[], state: LineState,
+                     liveness: LivenessState, profile?: string };
 ```
 
-Error codes (contract-level): `OWNER_MISMATCH`,
-`LINE_EXCLUSIVE_NOT_OWNER`, `LINE_BUSY_INCOMING`, `LINE_NOT_FOUND`,
-`INVALID_INTENT`, `STALE_TOKEN`, `PROVIDER_UNREACHABLE`,
-`DIAL_REJECTED` (typed `data.reason` - see Dial validation in
-`docs/api-contract.md`), `INVALID_STATE`, `INVALID_ARGUMENT`,
-`RESOURCE_EXHAUSTED` (round 20 codes - the last three were omitted
-here until the round-22 doc sync).
+Error codes (contract-level; each maps to a numeric JSON-RPC
+`error.code` via `ERROR_CODE_WIRE`, the string travels as
+`error.message`, and typed detail rides `error.data`
+`{reason?, detail?, free_lines?}` — round 25): `UNAUTHORIZED`,
+`FORBIDDEN`, `SESSION_NOT_FOUND`,
+`OWNER_MISMATCH`, `LINE_EXCLUSIVE_NOT_OWNER`, `LINE_BUSY_INCOMING`,
+`LINE_NOT_FOUND`, `INVALID_INTENT`, `STALE_TOKEN`,
+`PROVIDER_UNREACHABLE`, `DIAL_REJECTED` (typed `data.reason` - see
+Dial validation in `docs/api-contract.md`), `INVALID_STATE`,
+`INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`. Sub-code strings such as
+`INVALID_DTMF` or `SESSION_LIMIT_EXCEEDED` are `ErrorReason`
+values inside `error.data.reason` of their parent code — never
+top-level `error.code`/`error.message` members.
 
 `NO_FREE_LINE` was REMOVED as an error (round 9): a busy pool is a
 normal result, not an exception.
@@ -522,26 +566,39 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   `accept_window_sec`, `fallback_policy_json`,
   `allowed_number_types_json`, `timeouts_json`),
   `line_assignments` (`assignment_id`, `line_id`,
-  `owner_agent_id`, `mode`, `idle_revoke_after_sec`), and
-  `escalation_hooks`.
+  `owner_agent_id`, `mode`, `idle_revoke_after_sec`,
+  `last_seen_at` — required since round 25: without it the
+  alert-only idle clock restarts from zero on every daemon restart),
+  and `escalation_hooks`.
 - **Memory-only (never persisted):** `ProviderBinding`,
   `CallLease`, `QueueTicket`, `PendingClaim`, and the
   `_closed_leases` tombstone ring. Active calls are NOT restored
   from the DB on restart - they are rebuilt through the
   `GetCalls()`/`state_snapshot` reconciliation protocol (§9), so
   the store can never disagree with the real modem state.
-- **Sync pattern (no I/O in the kernel):** at startup the gateway
-  reads `lines` + `line_assignments` and passes them as
-  `initial_lines` to the `InMemoryLineManager` constructor. On
-  admin mutations (`assign_line`, `approve_claim`,
-  `revoke_assignment`, `configure_line`) the admin adapter
-  serializes these rare writes under an `asyncio.Lock`: first it
-  calls the kernel, takes the returned immutable
-  `LineAssignment` snapshot, then commits it to SQLite
-  (`upsert` by `line_id`). The kernel stays I/O-free; crash-between
-  the two writes is bounded because the kernel state is the
-  authority on next boot only through the same `initial_lines`
-  path.
+- **Sync pattern (no I/O in the kernel; widened round 25):** at
+  startup the gateway reads `lines` + `line_assignments` and passes
+  them as `initial_lines` to the `InMemoryLineManager` constructor.
+  EVERY `LineAssignment` mutation — not only admin calls: the
+  agent-side `call.release{assignment_id}` path included —
+  serializes these rare writes under an `asyncio.Lock` through the
+  SAME write-through path: first the kernel call, then the returned
+  immutable `LineAssignment` snapshot is committed to SQLite
+  (`upsert` by `line_id`). `revoke_assignment` returns the new
+  post-revert snapshot (rotated `assignment_id`, `None` for a
+  provider-binding id). The kernel stays I/O-free; a crash between
+  the two writes leaves SQLite one mutation behind — bounded and
+  surfaced: the store rows are rehydrated as `initial_lines` on next
+  boot, and a failed write-through marks the line `config_stale`
+  in observability until a succeeding write resyncs it.
+- **Drain discipline (round 25, clarification):** whichever adapter
+  called the kernel, the drained outbox items feed the SHARED
+  EventBus and provider-command executor — never the draining
+  adapter's own connection. An admin-adapter drain after
+  `approve_claim` therefore still delivers `event.claim_resolved`
+  to the agent's session through the same bus; this is why
+  `LineAdminKernel` exposes `drain_events()`/
+  `drain_provider_commands()` too.
 
 ## §5. Call lifecycle
 
@@ -584,7 +641,13 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
 3. `event.incoming_call{line_id, call_token, caller_id?,
    expires_at}` is emitted (RFC 3339 absolute deadline since
    round 22 - a relative `expires_in_ms` would skew by outbox
-   queue delay).
+   queue delay). **Ring re-delivery (round 25):** a hook wakes the
+   owner but the EVENT itself fires once — so when the exclusive
+   owner (re)opens a session while its line still holds a live,
+   unconsumed ring, the kernel re-emits `event.incoming_call` to
+   the new session with the SAME `call_token` and original
+   `expires_at`; an agent that missed the emission by milliseconds
+   is never locked out of its own ring.
 4. First `call.accept(call_token)` = atomic lease + answer + media
    attach. Owner-scoped lines reject non-owner accepts with
    `OWNER_MISMATCH`; a second accept gets `STALE_TOKEN` (round 21 -
@@ -592,8 +655,18 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
    ring, it does not contend with one).
 5. **Accept window: default 30 s; ALL timeouts and windows are
    admin-configurable** (round 10a).
-6. Timeout -> the line's `fallback_policy` (§5.3) -> release back to
-   `FREE`.
+6. Timeout -> the line's `fallback_policy` (§5.3). **Ring-drain rule
+   (round 25):** deciding `no_pickup` — or a `fallback_accept_ttl_sec`
+   lapse — emits `event.missed_call` immediately, but the line does
+   NOT return to `FREE` while the physical call is still ringing on
+   the modem: the line stays `RINGING_LOCKED` until the provider
+   reports the ring's `disconnected` (caller hangup / carrier
+   voicemail timeout) or a bounded `ring_drain_ttl_sec` (~60 s)
+   elapses, whichever first — plus a best-effort `line.hangup` may
+   be issued to shorten the drain. Without this the FIFO queue could
+   hand a still-ringing line to the next `call.dial`, and a
+   `state_snapshot` would re-register the same physical ring as a
+   NEW `incoming_call`.
 
 ### §5.3 Per-line inbound fallback policy (round 10b, split round 11)
 
@@ -627,9 +700,12 @@ HTTP, WAV files, or call bridging:
   `configure_line`. The `system:fallback_worker` session
   BYPASSES `LINE_EXCLUSIVE_NOT_OWNER` when acquiring the target
   line (round 22) - the admin who configured the policy accepted
-  that override; the worker gets no other privileges,
+  that override; the worker gets no other privileges. Transitive
+  forward cycles (`A → B → … → A`) are rejected at `configure_line`
+  by walking the stored policy chain (bounded at 8 hops, round 25),
 - `record_and_telegram:<channel>` - answer, record the call/
-  voicemail ourselves, post to a Telegram channel,
+  voicemail ourselves, post to a Telegram channel (recording length
+  is bounded by `max_call_duration_sec`, round 25),
 - `answer_and_announce:<announcement_ref>` - answer and play an
   announcement (only if the line has an agent registered for
   inbound). `announcement_ref` is the admin-provisioned WAV/text
@@ -675,7 +751,23 @@ removed.
   (`GetCalls()`) re-binds the lease seamlessly and clears the
   deadline; expiry in `tick(now)` — or a snapshot already missing
   the call — ends the lease as
-  `call_state_changed{reason:"provider_lost"}`.
+  `call_state_changed{reason:"provider_lost"}`. Every preserved
+  lease then gets FRESH provider media credentials via
+  `line.reattach_media` — media tokens are one-shot and did not
+  survive the dropped socket (round 25).
+- **Provider-process restart mid-call (round 25):** a `LineProvider`
+  restarted by its supervisor inside the grace window returns from
+  `GetCalls()` with EMPTY memory — it cannot echo `lease_id`. To
+  prevent the call degrading to an unkillable `external_call` while
+  the agent's lease still waits, TWO rules apply: (a) the provider
+  MUST keep a small durable state file (`/run/phonebridge/<line_id>
+  .json`, atomic write on every call mint/transition) mapping
+  `lease_id` → D-Bus object path, so a restart re-binds ids exactly;
+  (b) when the file is absent/cold, the kernel applies the 1:1
+  ambiguity rule — a snapshot call with `lease_id:null` on a line
+  holding EXACTLY ONE orphaned lease binds to that lease (at most
+  one call exists per line); an ambiguous or zero-match snapshot
+  falls back to the `external_call` fact.
 - Provider-side teardown commands are idempotent: a Hangup racing a
   remote teardown may surface as "method doesn't exist" — that is
   treated as already-gone success, verified via GetCalls/HangupAll.
@@ -777,7 +869,23 @@ preserved there as the per-line tunnel port pair.)
   `docs/hci-agent.md`), plus the continuous 2-bit H2 sync
   counter (`0x08 -> 0x38 -> 0xC8 -> 0xF8`) rewritten on every
   outbound USB mSBC packet, including generated silence on
-  underrun (round 24, review-13 H1).
+  underrun (round 24, review-13 H1). The SCO packet SIZE the feeder
+  emits MUST match the virtual adapter's declared synchronous
+  geometry — behind `/dev/vhci` the feeder IS the controller and
+  answers `HCI_Read_Buffer_Size`/synchronous-flow-control queries
+  itself with `sco_data_packet_len = 60` (mSBC profile,
+  `docs/hci-agent.md` §2): `hci_vhci` has no
+  `btusb` quirks, so a length negotiated for a real USB controller
+  would misalign the 1-frame-per-packet invariant the H2 counter
+  rewrite assumes. The agent's numeric `air_mode` code (`0x03` =
+  transparent/mSBC on BT Core Vol 4 Part B §2.1) is taken from the
+  `0x2c` SCO-connection event, never from a string field.
+- **Playout start prefill (round 25, replaces any DSP-resampling
+  idea):** the uplink jitter buffer starts each burst with a
+  2-packet (~2 ms) prefill; oscillator drift between the two
+  endpoints (±20..100 ppm) is absorbed by the 30-45 ms buffer and
+  re-synced naturally between speech bursts — a continuous
+  adaptation/resampler is out of scope for v1.
 - Latency budget: bridge must add < 100 ms node<->socket; verified
   by a loopback test in CI.
 
@@ -798,9 +906,15 @@ Design consequences:
   and links them explicitly for the duration of a lease:
   `bluez_input → downlink node → media pipeline → uplink node →
   bluez_output`. Agent-facing audio (the media socket) attaches to
-  these endpoints, never directly to transient bluez nodes. The
-  virtual nodes pin their format explicitly (round 23, review-12
-  M4): `audio.rate=16000, audio.channels=1, audio.format=S16LE` —
+  these endpoints, never directly to transient bluez nodes. Node
+  naming (round 25): PipeWire/WirePlumber node.name uses
+  underscores and no `<`/`>` — the canonical names are
+  `phonebridge_uplink_<line_id>` and `phonebridge_downlink_<line_id>`
+  (dots appear only in the bluez-native `bluez_input.<mac>`/
+  `bluez_output.<mac>` node names which PipeWire generates, not in
+  ours). The virtual nodes pin their format explicitly (round 23,
+  review-12 M4): `audio.rate=16000, audio.channels=1,
+  audio.format=S16LE` —
   if the air link degrades from mSBC (16 kHz) to narrowband CVSD
   (8 kHz), PipeWire resamples instead of switching the node format,
   so the wire contract `640 B = 20 ms @ 16 kHz S16_LE` frame can
@@ -827,8 +941,12 @@ Design consequences:
   still-queued older uplink frame for the lease on receipt. That
   split keeps the coordination explicit: muting at the provider
   without the router-side drain would replay 2-3 s of queued agent
-  speech delayed after the tones (or swallow it during the mute) —
-  a flush after a DTMF segment never replays buffered stale audio.
+  speech delayed after the tones (or swallow it during the mute).
+  **Watermark semantics (round 25):** the post-DTMF `0x02` frame is
+  timestamped — the MediaRouter discards only queued uplink frames
+  whose enqueue timestamp ≤ the flush timestamp, so TTS chunks the
+  agent submitted AFTER `call.send_dtmf` returned survive the flush;
+  a timestamp-less drain would silently eat fresh speech.
 
 ### §6.5 Remote-line audio transport (round 12)
 
@@ -885,16 +1003,28 @@ Three primitives only - no broker in v1:
    the event's own deadline (round 23, review-12 M7): for
    `incoming_call`-class events retries MUST stop at
    `expires_at - 1 s` — a wake-up POST landing after the accept
-   window closed only generates noise.
+   window closed only generates noise. Webhook egress is hardened
+   (round 25): every POST carries an explicit connect/total timeout
+   (default 2 s/5 s), HTTPS only for remote hosts, and an SSRF
+   egress guard — configured URLs resolving to loopback/link-local/
+   RFC-1918 are rejected at admin-config time unless the admin set
+   `allow_private_webhooks:true` on the hook (the gateway itself
+   binds only loopback/wg0; a webhook is the one daemon-originated
+   egress an operator can point anywhere).
 3. **Exec / file-drop** - thin hook: run a command or drop a file
    per event type (wake mechanisms for sleeping agents). Exec
-   hooks are hardened (round 23, review-12 M7): the configured
-   argv is execve'd DIRECTLY — never through a shell (`sh -c` is
-   forbidden, so hook config cannot smuggle command injection);
-   the event JSON is delivered on the child's stdin, never in
-   argv/environment (keeps caller PII out of `/proc/*/cmdline`
-   and the process table); every hook run carries a hard process
-   timeout.
+   hooks are hardened (round 23, review-12 M7; limits round 25):
+   the configured argv is execve'd DIRECTLY — never through a
+   shell (`sh -c` is forbidden, so hook config cannot smuggle
+   command injection); the event JSON is delivered on the child's
+   stdin, never in argv/environment (keeps caller PII out of
+   `/proc/*/cmdline` and the process table); every hook run carries
+   a hard process timeout (default 10 s, admin-cap 60 s), a
+   per-hook concurrency cap of 1 queued run (later triggers
+   coalesce), and cgroup-less memory discipline via a bounded
+   stdin payload (≤64 KiB). File-drop hooks write `0600` files into
+   a `0700` spool dir owned by the `phonebridge` group, with a
+   TTL sweep (default 5 min) so stale wake files never pile up.
 
 Audience routing (round 23): `event.idle_alert` is `admin`-audience
 only — socket fan-out delivers it to sessions holding the `admin`
@@ -929,7 +1059,8 @@ gateway, or a SIP SMS aggregator.
 
 | Deployment | Shape |
 |---|---|
-| **Prod** | ONE container (isolated netns): gateway daemon + per-line worker bundles + BlueZ/PipeWire/dbus inside; every adapter is kernel `vhci` fed by an hci-agent — host-local agents feed dongles on the same machine too; agents via bind-mounted socket dir (UDS) or WSS/MCP |
+| **Prod** | ONE OCI container, **`--network=host`** + `/dev/vhci` pass-through on a dedicated host/VPS (round 25 — `AF_BLUETOOTH` lives only in `init_net`, isolated netns is impossible): gateway daemon + per-line worker bundles + BlueZ/PipeWire/dbus inside; every adapter is kernel `vhci` fed by an hci-agent — host-local agents feed dongles on the same machine too; agents via bind-mounted socket dir (UDS 0660, `phonebridge` group) or WSS/MCP bound to `127.0.0.1`/`wg0`; host `bluetoothd` masked, host firewall owns the perimeter |
+| **Prod (hardened, optional)** | the same OCI image inside a guest micro-VM (Kata/QEMU) for shared workstations where the host's own Bluetooth must stay alive — deferred past MVP, §2.1 |
 | **Prototype** | Host-native systemd user service - capability validation ONLY, never prod (`org.pipewire.Telephony` lives on the USER session bus - a system-level unit cannot reach it and fails silently with `ServiceUnknown`) |
 | **Remote site** | Raspberry Pi etc. runs ONLY the hci-agent (USB↔HCI relay, no bluetoothd); control-TCP + media-UDP over a `transport_profile` tunnel (wireguard default; direct_mtls; sstp/openconnect/vless_xray reserved profiles); heartbeat + remote USB reset; in-flight call on tunnel drop = hangup |
 | **Agent host (any)** | One hci-agent instance per dongle; owns USB via libusb with `btusb` detached; host `bluetoothd` unaffected |
@@ -1014,15 +1145,27 @@ status (mirrors the busctl commands used in Phase-0).
     one adapter (by `adapter_mac`) and auto-confirms SSP within the
     window — no `docker exec bluetoothctl` per line.
 - **ALL timeouts and windows are admin-configurable** (round 10a):
-  accept window (default 30 s), queue grant TTL, ping/DEGRADED/DOWN
-  thresholds, orphan grace, `idle_revoke_after` — the kernel
-  surface for all of them is `admin.configure_line{...,
-  idle_revoke_after?, timeouts?}` where `timeouts` carries
+  accept window (default 30 s), queue grant TTL, ping/degraded/down
+  liveness thresholds, orphan grace, `idle_revoke_after` —
+  `idle_revoke_after:null` in the PATCH disables the idle clock
+  entirely (round 25; an absent key keeps the current value —
+  PATCH-without-tombstone ambiguity closed via the explicit
+  `clear_idle_revoke_after:true` flag, both keys together →
+  `INVALID_ARGUMENT`). The kernel surface for all of them is
+  `admin.configure_line{..., idle_revoke_after?,
+  clear_idle_revoke_after?, timeouts?}` where `timeouts` carries
   `{grant_ttl_sec?, orphan_grace_sec?, heartbeat_interval_sec?,
   heartbeat_degraded_after?, heartbeat_down_after?,
-  fallback_accept_ttl_sec?}` (round 22; `fallback_accept_ttl_sec`
+  fallback_accept_ttl_sec?, ring_drain_ttl_sec?,
+  max_call_duration_sec?}` (round 22; `fallback_accept_ttl_sec`
   added round 23, ~10 s default, bounds the FallbackWorker accept
-  deadline). `heartbeat_interval_sec` is floored at 0.001 s
+  deadline; `ring_drain_ttl_sec` ~60 s default bounds the
+  ring-drain wait of §5.2 step 6; `max_call_duration_sec` — round
+  25 — caps any single call's wall-clock length, default off, ≤
+  86400 s when set, and bounds `record_and_telegram` recording
+  length). All timeout values are finite numbers (`NaN`/`Infinity`
+  rejected at the boundary) with sane upper bounds per field (round
+  25). `heartbeat_interval_sec` is floored at 0.001 s
   (millisecond granularity — the wire unit is ms) and stamped as
   `heartbeat_interval_ms = round(sec * 1000)`, min 1 (round 24c).
   Changing `heartbeat_interval_sec` NEVER kills a live
@@ -1054,7 +1197,21 @@ status (mirrors the busctl commands used in Phase-0).
   an agent's claim request is never self-granted (round 10d).
 - Webhook events are authenticated via HMAC + `delivery_id`
   idempotency (§7).
-- Secrets/PII (tokens, caller numbers) must never reach logs.
+- **Control-plane wire framing (round 25):** the JSON-RPC API runs
+  over WebSocket on BOTH legs — `ws://` on the UDS control socket
+  and `wss://` on the loopback/wg0 listener — so message boundaries
+  are protocol-owned and equal on every transport; per-message cap
+  64 KiB. Error envelopes follow JSON-RPC 2.0 (round 25):
+  `error.code` is the integer from `ERROR_CODE_WIRE` (application
+  band `-32099..-32000`), `error.message` carries the `ErrorCode`
+  string (`UNAUTHORIZED`/`FORBIDDEN`/`SESSION_NOT_FOUND` included),
+  `error.data` is the `ErrorData` JSON `{reason?, detail?,
+  free_lines?}` — see `docs/api-contract.md` error map.
+- Secrets/PII (tokens, caller numbers) must never reach logs:
+  `CallToken`/`MediaToken` travel inside `RedactedString`-style
+  containers that refuse `str()`/`json.dumps` without an explicit
+  `.expose()`, and `safe_dump()` masks them in every structured
+  log line (round 25 — a `NewType(str)` token was a log leak).
 
 ## §11. Test strategy without a real call
 
@@ -1169,8 +1326,10 @@ Sequenced into narrow, independently testable PRs:
    loopback-testable without a dongle.
 5. **M5 - FallbackWorker + phonebridgectl + MCP admin + Docker**:
    internal system agent for worker fallback policies (ADR-01);
-   admin CLI and private MCP server; single Dockerfile
-   (supervisord: gateway + per-line bundles + shared
-   dbus/bluez/pipewire + `/dev/vhci`; hci-agents run OUTSIDE the
-   container, one per dongle) with mandatory volumes
-   `/var/lib/bluetooth` + `/var/lib/phonebridge`.
+   admin CLI and private MCP server; single OCI image run with
+   `--network=host` + `/dev/vhci` on a dedicated host (round 25 —
+   §2.1; supervisord: gateway + per-line bundles + shared
+   dbus/bluez/pipewire; hci-agents run OUTSIDE the container, one
+   per dongle) with mandatory volumes `/var/lib/bluetooth` +
+   `/var/lib/phonebridge` (both `0700`), plus the `phonebridge
+   doctor` pre-flight check in the entrypoint.

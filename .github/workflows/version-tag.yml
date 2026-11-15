@@ -7,9 +7,13 @@ on:
 permissions:
   contents: read
 
+# Never cancel a queued/running run on main: this job is the
+# version-tag drift guard, so a later push must not silently skip the
+# check for an earlier merge (that is exactly the incident it exists
+# to catch). Runs queue per ref and each one completes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   check:

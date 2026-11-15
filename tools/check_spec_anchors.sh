@@ -16,8 +16,10 @@
 # which already carries the delta).
 #
 # Anchors follow GitHub's markdown rule for "### Requirement: <name>"
-# headings: lowercase, punctuation dropped, spaces -> hyphens,
-# hyphen/underscore runs kept; duplicate headings get -1/-2 suffixes.
+# headings: the WHOLE heading text is slugified (the "Requirement:"
+# prefix included), so the anchor is "#requirement-<name-slug>" -
+# lowercase, punctuation dropped, spaces -> hyphens, hyphen/underscore
+# runs kept; duplicate headings get -1/-2 suffixes.
 #
 # Usage: tools/check_spec_anchors.sh   (exit 0 = clean, 1 = violations)
 set -euo pipefail
@@ -50,9 +52,11 @@ def requirement_anchors(path):
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
-                m = re.match(r"^###\s+Requirement:\s*(.+?)\s*$", line)
+                m = re.match(r"^###\s+(Requirement:\s*.+?)\s*$", line)
                 if not m:
                     continue
+                # GitHub slugs the whole heading text - the
+                # "Requirement:" prefix is part of the anchor.
                 base = slugify(m.group(1))
                 anchor, n = base, 0
                 while anchor in anchors:

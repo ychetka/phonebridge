@@ -56,6 +56,6 @@ refs: issue #59
 ---
 
 ## Spec impact
-- modifies: docs/specs/line-manager.md#accept-window-always-elapses-before-fallback
-- adds: docs/specs/line-manager.md#effective-timeouts-hydrate-the-kernel-dtos
-- adds: docs/specs/line-manager.md#dial-target-and-caps-validation-is-model-level
+- modifies: docs/specs/line-manager.md#requirement-accept-window-always-elapses-before-fallback
+- adds: docs/specs/line-manager.md#requirement-effective-timeouts-hydrate-the-kernel-dtos
+- adds: docs/specs/line-manager.md#requirement-dial-target-and-caps-validation-is-model-level

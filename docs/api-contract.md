@@ -5,6 +5,17 @@ Status: design draft (consolidated with design rounds 1-24,
 Transport: **JSON-RPC 2.0 bidirectional over one connection per peer**.
 - Local peers: Unix-domain socket (bind-mounted out of the container).
 - Remote peers: **WSS** — providers/agents always dial *into* the gateway (NAT-safe).
+- **Control-channel framing (round 25):** the local Unix-domain control
+  socket uses the SAME WebSocket-over-UDS framing as the media path —
+  a bare `SOCK_STREAM` has no message boundaries, so ad-hoc NDJSON or
+  length-prefix framing is forbidden. Every JSON-RPC message is exactly
+  one WS TEXT frame, hard-capped at **64 KiB**; an oversized frame is
+  closed `1009 Message Too Big`, a non-TEXT control frame
+  `1002 Protocol Error`. Server→client `event.*` deliveries are JSON-RPC
+  **Notifications** (no `id`, no response expected); a client MUST NOT
+  send `event.*` methods upstream. No request is ever parked
+  server-side — an unanswered request is retried by the CLIENT within
+  its own deadline.
 - The agent surface is also reachable through an **MCP transport
   adapter** (round 12): the same `agent.*`/`call.*` namespaces and
   the same token scopes, exposed as MCP tools for AI agents that
@@ -46,11 +57,18 @@ an alias for "any suitable pool line" (`call.get_lines` has no
 ```ts
 type Intent   = "dial_out" | "receive_inbound" | "exclusive_line";
                 // earlier drafts named these outbound|inbound|exclusive
-type LineState = "FREE"|"BUSY"|"RESERVED"|"RINGING_LOCKED"|"DEGRADED"|"DOWN";
+type LineState = "FREE"|"BUSY"|"RINGING_LOCKED";
+                // call-occupancy ONLY (round 25): provider/transport
+                // health moved to `liveness` — a flat enum let a
+                // missed ping overwrite BUSY, and RESERVED had no
+                // transitions. DEGRADED/DOWN now surface via
+                // `event.line_health_changed`, never as a LineState.
+type LivenessState = "reachable"|"ws_disconnected"|"unreachable";
 type LineSummary = {
   line_id: string,
   caps: Intent[],
   state: LineState,
+  liveness: LivenessState,   // provider health as last reported
   profile?: string
 };
 
@@ -84,12 +102,22 @@ type RedactedString = string;
 | `LINE_BUSY_INCOMING` | line locked by an inbound ring (RINGING_LOCKED) |
 | `LINE_NOT_FOUND` | unknown line_id |
 | `INVALID_INTENT` | intent not in line's caps |
-| `STALE_TOKEN` | call_token/lease expired or consumed |
-| `PROVIDER_UNREACHABLE` | line DEGRADED/DOWN |
+| `STALE_TOKEN` | `call_token` consumed/expired, unknown durable `assignment_id`, or a dead-lease media reattach — token-class staleness only (grant-TTL expiry is `RESOURCE_EXHAUSTED`/`GRANT_TTL_EXPIRED`, never `STALE_TOKEN`) |
+| `PROVIDER_UNREACHABLE` | line's provider binding degraded/unreachable (was `ws_disconnected` past orphan grace, or heartbeat-down) |
 | `DIAL_REJECTED` | dial string failed pre-line validation — `data.reason` carries a typed sub-code (see Dial validation) |
 | `INVALID_STATE` | operation invalid in the current call/line phase — repeated `dial`, `send_dtmf` outside ACTIVE, approving a closed claim (round 20) |
 | `INVALID_ARGUMENT` | invalid input parameters — DTMF alphabet/length violations (`data.reason: "INVALID_DTMF"`), empty intent sets (round 20) |
 | `RESOURCE_EXHAUSTED` | queue capacity or per-session ticket/lease limits exceeded (`data.reason`: `QUEUE_FULL`, `SESSION_LIMIT_EXCEEDED`, `GRANT_TTL_EXPIRED` — round 20; these were previously folded into `STALE_TOKEN`) |
+| `UNAUTHORIZED` | missing/invalid/revoked API key or token; a reserved `system:*` identity presented on an external socket (round 25) |
+| `FORBIDDEN` | authenticated identity lacks the method's scope (agent token on `provider.*`, provider token on `call.*`/`line.*`, non-admin on `admin.*`) or `agent_id` does not match the key's bound identity (round 25) |
+| `SESSION_NOT_FOUND` | `session_id` unknown to the gateway — never registered or already closed by `drop_session` (round 25) |
+
+The JSON-RPC error object on the wire (round 25): `error.code` is an
+INTEGER in the application range `-32099..-32000` (the
+`ErrorCode`→integer mapping lives in `ERROR_CODE_WIRE`,
+`src/phonebridge/domain/contract.py`); `error.message` carries the
+`ErrorCode` string from the table above; `error.data` carries the
+`ErrorData` JSON `{reason?, detail?, free_lines?}`.
 
 `NO_FREE_LINE` was REMOVED (round 9): a busy pool is a normal
 result, not an exception - see `call.acquire`.
@@ -113,6 +141,15 @@ become `Dial` on the bus:
   country)`. Region check uses `is_valid_number_for_region`, NOT
   `region_code_for_number() == country` — shared calling codes
   (NANP +1, +44 Crown Dependencies, +7) must not false-reject.
+- **Country vocabulary (round 25):** `country` MUST be a known ISO
+  3166-1 alpha-2 region — an alpha-2-shaped but unassigned code
+  (`"ZZ"`, `"AA"`) is `UNKNOWN_COUNTRY_CODE`, not `COUNTRY_MISMATCH`.
+  The special region `"001"` is accepted ONLY for non-geographic
+  numbering plans (`+800`/`+808`/`+870`/`+878`/`+881`/`+882`/`+883`/
+  `+888`/`+979` — phonenumbers reports `region_code_for_number ==
+  "001"`); a geographic number paired with `"001"`, or a
+  non-geographic number paired with a real country code, is
+  `COUNTRY_MISMATCH`.
 - **Per-line number-type allowlist** (admin config):
   default `{FIXED_LINE, MOBILE, FIXED_LINE_OR_MOBILE, VOIP, TOLL_FREE}` —
   `FIXED_LINE_OR_MOBILE` is mandatory because `phonenumbers.number_type()`
@@ -146,20 +183,21 @@ from these input rejections and from ordinary no-answer termination.
 
 | method | params | returns |
 |---|---|---|
-| `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` — `media_endpoint` is the static socket address; the per-lease `media_token` arrives later inside `line.dial`/`line.answer` (round 14). `heartbeat_interval_ms` is stamped from the line's effective `heartbeat_interval_sec` as `round(sec * 1000)` clamped to ≥1 ms — the interval is floored at 0.001 s (millisecond granularity, the wire unit) so a valid config can never yield a zero cadence (round 24c). `meta` is bounded (round 22): ≤16 keys, keys ≤64 chars, values ≤256 chars — `INVALID_ARGUMENT` beyond. `caps` MUST be non-empty and telecom-only (`dial_out`/`receive_inbound`): an empty set or any `exclusive_line` entry → `INVALID_ARGUMENT` (round 24) — durable exclusivity is a `LineAssignment.claimable`/`mode` property granted by the claim flow, never a hardware capability |
-| `provider.reregister` | same as register + `state_snapshot?` | idempotent; preserves lease state during the 10 s orphan-grace window — `state_snapshot` lists the calls the provider still sees on the D-Bus (`{lease_id?, state, caller_id?}[]`, `lease_id` absent for a call the gateway never issued) so the kernel can re-bind surviving leases (round 21, design §5.4); grace covers the WS-drop level only — provider-reported tunnel/USB death or DEGRADED→DOWN unreachable = immediate teardown, no grace (round 20) |
-| `provider.ping` | `{line_id, assignment_id, state_snapshot?}` | `{ok, server_time}` — missed N pings → DEGRADED → DOWN |
+| `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, provider_media_endpoint?, server_time}` — `provider_media_endpoint` is the provider-side static socket address (agent-side endpoints come from `MediaCredentials.agent_media_endpoint` inside each grant — round 25 endpoint split); the per-lease `media_token` arrives later inside `line.dial`/`line.answer` (round 14). `heartbeat_interval_ms` is stamped from the line's effective `heartbeat_interval_sec` as `round(sec * 1000)` clamped to ≥1 ms — the interval is floored at 0.001 s (millisecond granularity, the wire unit) so a valid config can never yield a zero cadence (round 24c). `meta` is bounded (round 22): ≤16 keys, keys ≤64 chars, values ≤256 chars — `INVALID_ARGUMENT` beyond. `caps` MUST be non-empty and telecom-only (`dial_out`/`receive_inbound`): an empty set or any `exclusive_line` entry → `INVALID_ARGUMENT` (round 24) — durable exclusivity is a `LineAssignment.claimable`/`mode` property granted by the claim flow, never a hardware capability |
+| `provider.reregister` | same as register + `state_snapshot?` | idempotent; preserves lease state during the 10 s orphan-grace window — `state_snapshot` lists the calls the provider still sees on the D-Bus (`{lease_id?, call_token?, state, caller_id?}[]`, `lease_id`/`call_token` absent for a call the gateway never issued) so the kernel can re-bind surviving leases (round 21, design §5.4); every preserved lease receives FRESH provider media credentials via `line.reattach_media` — media tokens are one-shot and died with the dropped socket (round 25); grace covers the WS-drop level only — provider-reported tunnel/USB death or heartbeat-down unreachable = immediate teardown, no grace (round 20). A `provider.register` on an already-live binding is `INVALID_STATE` — reconnect inside the grace window uses `provider.reregister` (round 25) |
+| `provider.ping` | `{line_id, assignment_id, state_snapshot?, checked_at?}` | `{ok, server_time}` — missed N pings → degraded → down; `checked_at` is an optional provider-side RFC 3339 UTC stamp of the liveness observation (gateway stamps receipt time when absent; stale-fact dedupe orders on the accepted stamp, round 25) |
 | `provider.capability_update` | `{line_id, assignment_id, caps, profile?}` | `{ok}` — replaces caps/profile on the ACTIVE binding; carries NO `token` (the binding id authenticates the already-registered peer); an identical update is an idempotent no-op (round 22); the same `caps` invariant as `provider.register` applies — non-empty and telecom-only, `exclusive_line` → `INVALID_ARGUMENT` (round 24) |
-| `provider.call_state` | `{line_id, assignment_id, call_token?, lease_id?, caller_id?, state, reason?}` | `{ok, call_token?}` — `state` is the canonical set `ringing` \| `dialing` \| `alerting` \| `active` \| `disconnected`. `caller_id` carries the inbound caller's E.164 on `ringing` (round 22 — previously the wire had no field for WHO rings). **`call_token` minting (round 22):** on `state:"ringing"` the gateway mints the one-shot `call_token` inside `ingest_ring` and returns it in `{ok, call_token}`; the provider MUST echo that `call_token` on every subsequent update for the same ring — including a pre-answer `disconnected` (early caller hangup) — until `line.answer` hands the call a `lease_id`. For rings the gateway discovered via `state_snapshot` (the provider never received a token), a `disconnected` update with NEITHER id on a `RINGING_LOCKED` line resolves to that line's one open ring. On every other state the response is `{ok}`. `lease_id` identifies an established call. Recognized `reason` values on `disconnected` — the provider-reported vocabulary is CLOSED (round 21): `normal`, `busy`, `no_answer`, `rejected`, `network_error`, `dongle_lost` (tunnel/USB death — immediate teardown, no orphan grace), `stack_restart` (vanished call found by `GetCalls()` reconciliation after a bus/name-owner restart). Gateway-minted reasons such as `provider_lost` (orphan-grace expiry or heartbeat timeout) are emitted on the agent event channel as `event.call_state_changed{reason:"provider_lost"}`, never reported here. An update carrying NEITHER `call_token` nor `lease_id` on a line NOT in `RINGING_LOCKED` reports a human-initiated call on the physical phone (round 21): the line goes `BUSY` with reason `external_call`, no lease is minted, and no `line.hangup` is ever sent for it (design §9) |
+| `provider.call_state` | `{line_id, assignment_id, call_token?, lease_id?, caller_id?, state, reason?, observed_at?}` | `{ok, call_token?}` — `state` is the canonical set `ringing` \| `dialing` \| `alerting` \| `active` \| `disconnected`. `caller_id` carries the inbound caller's E.164 on `ringing` (round 22 — previously the wire had no field for WHO rings). **`call_token` minting (round 22):** on `state:"ringing"` the gateway mints the one-shot `call_token` inside `ingest_ring` and returns it in `{ok, call_token}`; the provider MUST echo that `call_token` on every subsequent update for the same ring — including a pre-answer `disconnected` (early caller hangup) — until `line.answer` hands the call a `lease_id`. For rings the gateway discovered via `state_snapshot` (the provider never received a token), a `disconnected` update with NEITHER id on a `RINGING_LOCKED` line resolves to that line's one open ring. On every other state the response is `{ok}`. `lease_id` identifies an established call. Recognized `observed_at` is an optional provider-side RFC 3339 UTC stamp of the transition observation (gateway stamps receipt time when absent; ordering/dedupe is per (line, call) on the accepted stamp — a same-stamp repeat is a duplicate, not a regression, round 25). Recognized `reason` values on `disconnected` — the provider-reported vocabulary is CLOSED (round 21): `normal`, `busy`, `no_answer`, `rejected`, `network_error`, `dongle_lost` (tunnel/USB death — immediate teardown, no orphan grace), `stack_restart` (vanished call found by `GetCalls()` reconciliation after a bus/name-owner restart). Gateway-minted reasons such as `provider_lost` (orphan-grace expiry or heartbeat timeout) are emitted on the agent event channel as `event.call_state_changed{reason:"provider_lost"}`, never reported here. An update carrying NEITHER `call_token` nor `lease_id` on a line NOT in `RINGING_LOCKED` reports a human-initiated call on the physical phone (round 21): the line goes `BUSY` with reason `external_call`, no lease is minted, and no `line.hangup` is ever sent for it (design §9) |
 | `provider.audio_ready` | `{line_id, assignment_id, lease_id}` | `{ok}` — one-shot notification: the provider's local BT SCO path is up (early media flows, uplink accepted). Gateway emits `event.audio_ready` to the agent from this signal |
 
 ## Manager → Line — `line.*` (down-channel commands)
 
 | method | params | returns |
 |---|---|---|
-| `line.dial` | `{assignment_id, lease_id, number, media_endpoint, media_token}` | `{accepted}` — `number` is the already-validated E.164 string, passed through unchanged (see Dial validation); `media_endpoint`/`media_token` authorize the provider's `media.auth` for this `lease_id`. **Saga compensation (round 23):** the gateway answers the agent's `call.dial` without waiting for this reply; the adapter MUST await `{accepted}` with a ~2 s deadline and, on `{accepted:false}`/timeout/transport error, feed `provider.call_state{state:"disconnected", reason:"network_error"}` so the lease never wedges in DIALING |
-| `line.answer` | `{assignment_id, lease_id, call_token, media_endpoint, media_token}` | `{accepted}` — same per-lease media credentials as `line.dial`; same ~2 s `{accepted}` deadline + `disconnected`/`network_error` compensation as `line.dial` (round 23) |
-| `line.hangup` | `{assignment_id, lease_id?, call_token?}` | `{accepted}` — exactly ONE target (round 23): `lease_id` tears down an established call; `call_token` rejects a still-unanswered inbound ring (the `reject` fallback path - no `lease_id` exists before `call.accept`) |
+| `line.dial` | `{assignment_id, lease_id, number, media_endpoint, media_token}` | `{accepted}` — `number` is the already-validated E.164 string, passed through unchanged (see Dial validation); `media_endpoint`/`media_token` authorize the provider's `media.auth` for this `lease_id`. **Saga compensation (round 23; hangup leg added round 25):** the gateway answers the agent's `call.dial` without waiting for this reply; the adapter MUST await `{accepted}` with a ~2 s deadline and, on `{accepted:false}`/timeout/transport error, feed `provider.call_state{state:"disconnected", reason:"network_error"}` so the lease never wedges in DIALING — AND issue a best-effort `line.hangup{lease_id}` afterwards, because a dial that physically reached the phone (WS dropped after delivery, or a slow radio wakeup past the deadline) would otherwise stay ringing uncontrolled while the gateway already freed the line |
+| `line.answer` | `{assignment_id, lease_id, call_token, media_endpoint, media_token}` | `{accepted}` — same per-lease media credentials as `line.dial`; same ~2 s `{accepted}` deadline + `disconnected`/`network_error` + best-effort hangup compensation as `line.dial` (rounds 23/25). **Ring correlation (round 25):** a line has AT MOST one open ring — the provider answers whichever ring is open on its line regardless of which `call_token` value arrives (original ring token or re-issued `fallback_call_token`); the field is informational for the provider's own bookkeeping |
+| `line.hangup` | `{assignment_id, lease_id?, call_token?}` | `{accepted}` — exactly ONE target (round 23): `lease_id` tears down an established call; `call_token` rejects a still-unanswered inbound ring (the `reject` fallback path - no `lease_id` exists before `call.accept`). Same by-line ring correlation as `line.answer` — the provider targets its one open ring (round 25) |
+| `line.reattach_media` | `{assignment_id, lease_id, media_endpoint, media_token}` | `{accepted}` — fresh provider media credentials for a lease PRESERVED across `provider.reregister` (round 25): media tokens are one-shot, so the dropped socket's pair is dead and the kernel reissues the provider role's half; the provider MUST re-run `media.auth` with the new token before its old media deadline, exactly as on `line.dial` |
 | `line.send_dtmf` | `{assignment_id, lease_id, digits}` | `{accepted}` |
 | `line.revoke` | `{assignment_id, reason?}` | `{accepted}` — **admin scope only** |
 
@@ -169,16 +207,17 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 
 | method | params | returns / errors |
 |---|---|---|
-| `agent.register_intent` | `{agent_id, token, intents[], profile?}` | `{session_id}` / `INVALID_ARGUMENT` on an empty `intents` set; `INVALID_INTENT` when `intents` contains `exclusive_line` — durable exclusivity is requested only via `call.claim_exclusive` (round 21) |
-| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?, idempotency_key?}` | `{granted: true, line_id, lease_id, expires_at}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — `intent` must be `dial_out` (round 14; other intents → `INVALID_INTENT`); `expires_at` is the grant TTL deadline (round 20; missing it → `event.call_state_changed{reason: "grant_ttl_expired"}`); retry dedup is scoped to a non-empty `(session_id, idempotency_key)` — calls without a key create independent tickets so multi-call agents are not merged; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) — except a `system:fallback_worker` session, which bypasses this check to execute admin-configured `forward_via_line` policy (round 22); `RESOURCE_EXHAUSTED`/`SESSION_LIMIT_EXCEEDED` on per-session limits |
+| `agent.register_intent` | `{agent_id, token, intents[], profile?}` | `{session_id}` / `INVALID_ARGUMENT` on an empty `intents` set; `INVALID_INTENT` when `intents` contains `exclusive_line` — durable exclusivity is requested only via `call.claim_exclusive` (round 21). `agent_id` MUST match the API key's bound identity (`FORBIDDEN` on mismatch); `system:*` agent ids are RESERVED for kernel-internal service identities provisioned out-of-band and are `UNAUTHORIZED` on external sockets (round 25). At most 32 concurrent sessions per `agent_id` (`RESOURCE_EXHAUSTED`/`SESSION_LIMIT_EXCEEDED`). A reconnecting owner session re-receives any LIVE ring on its lines as a fresh `event.incoming_call` (same `call_token`, original `expires_at`, round 25) |
+| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?, idempotency_key?}` | `{granted: true, line_id, lease_id, expires_at}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — `intent` must be `dial_out` (round 14; other intents → `INVALID_INTENT`); `expires_at` is the grant TTL deadline (round 20; missing it → `event.call_state_changed{reason: "grant_ttl_expired"}`); retry dedup is scoped to a non-empty `(session_id, idempotency_key)` — calls without a key create independent tickets so multi-call agents are not merged; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) — except a `system:fallback_worker` session, which bypasses this check to execute admin-configured `forward_via_line` policy (round 22); `RESOURCE_EXHAUSTED`/`SESSION_LIMIT_EXCEEDED` on per-session limits — at most 16 queued tickets per session and 1024 globally (`QUEUE_FULL`, round 25) |
 | `call.cancel_acquire` | `{session_id, ticket_id}` | `{ok}` — withdraw a queued acquire |
-| `call.release` | `{session_id, lease_id?, assignment_id?}` | `{ok}` / `OWNER_MISMATCH` — exactly ONE target (round 22): `lease_id` ends the EPHEMERAL lease (an undialed grant frees the line; an in-flight call is hung up first — the lease never outlives the call); `assignment_id` is the durable-binding path — the exclusive owner voluntarily releases its `LineAssignment` (line reverts to the claimable pool, `event.assignment_revoked` to the owner); zero or BOTH targets passed → `INVALID_ARGUMENT` (round 24 — the XOR is a hard wire rule, not a preference) |
+| `call.release` | `{session_id, lease_id?, assignment_id?}` | `{ok}` / `OWNER_MISMATCH` / `STALE_TOKEN` (unknown durable `assignment_id`) — exactly ONE target (round 22): `lease_id` ends the EPHEMERAL lease (an undialed grant frees the line; an in-flight call is hung up first — the lease never outlives the call); `assignment_id` is the durable-binding path — the exclusive owner voluntarily releases its `LineAssignment` (line reverts to the claimable pool, `event.assignment_revoked` to the owner; the `assignment_id` itself arrives via `event.assignment_granted`, round 25); zero or BOTH targets passed → `INVALID_ARGUMENT` (round 24 — the XOR is a hard wire rule, not a preference) |
 | `call.dial` | `{session_id, lease_id, number, country}` | `{lease_id, media_endpoint, media_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE`, `DIAL_REJECTED` |
 | `call.accept` | `{session_id, call_token}` | `{lease_id, line_id, media_endpoint, media_token}` / `STALE_TOKEN`, `OWNER_MISMATCH` — atomic: issues the lease, answers the ring, attaches media; the accepting session MUST hold `receive_inbound` intent (`INVALID_INTENT` otherwise, round 22 — `system:fallback_worker` exempt with its minted `fallback_call_token`) |
 | `call.hangup` | `{session_id, lease_id}` | `{ok}` — ends the call AND the ephemeral lease atomically (auto-release, round 22); a trailing `call.release` is an idempotent no-op |
-| `call.send_dtmf` | `{session_id, lease_id, digits}` | `{ok}` — `digits` must match `^[0-9A-D*#,wW]{1,32}$` (`,`/`w`/`W` = ~500 ms pauses) else `INVALID_ARGUMENT`/`INVALID_DTMF`; `INVALID_STATE` without an ACTIVE call; in-band tones are synthesized by the LineProvider (oFono `SendTones` is broken on PipeWire Telephony, design §5.5/§6.4) which mutes agent uplink PCM for their duration and emits a `0x02` flush afterwards (round 22) |
-| `call.claim_exclusive` | `{session_id, line_id}` | `{claim_id, status: "pending_approval"}` — moderator approval required in admin, never self-granted; pending claims are bounded (≤8 per agent, ≤256 total — `RESOURCE_EXHAUSTED` beyond) and socket-bound (`drop_session` cancels them, round 22) |
-| `call.get_lines` | `{session_id, intent?}` | `{lines: LineSummary[]}` — `intent?` filters by the line's declared caps; `intent:"exclusive_line"` has no provider cap to match — it returns the claimable-exclusive view: lines whose `assignment.claimable && assignment.mode == SHARED_POOL` (round 24), i.e. the pool lines an agent may still file `call.claim_exclusive` against |
+| `call.send_dtmf` | `{session_id, lease_id, digits}` | `{ok}` — `digits` must match `^[0-9A-D*#,wW]{1,32}$` (`,`/`w`/`W` = ~500 ms pauses) else `INVALID_ARGUMENT`/`INVALID_DTMF`; `INVALID_STATE` unless the lease is ACTIVE with `audio_ready` received, OR ALERTING (early-media IVR — the `0.3–0.6 s` `State=active`→SCO-up gap otherwise swallows tones, round 25); in-band tones are synthesized by the LineProvider (oFono `SendTones` is broken on PipeWire Telephony, design §5.5/§6.4) which mutes agent uplink PCM for their duration and emits a timestamped `0x02` flush afterwards (round 22; watermark semantics round 25 — see Binary media protocol) |
+| `call.reattach_media` | `{session_id, lease_id}` | `{lease_id, media_endpoint, media_token}` / `STALE_TOKEN`, `OWNER_MISMATCH` — fresh AGENT media credentials for a live lease after the agent's media socket dropped while the control channel lived (round 25); the new pair obeys the same `MEDIA_PAIR_TTL_SEC` handshake deadline |
+| `call.claim_exclusive` | `{session_id, line_id}` | `{claim_id, status: "pending_approval"}` — moderator approval required in admin, never self-granted; pending claims are bounded (≤8 per agent, ≤256 total — `RESOURCE_EXHAUSTED` beyond) and socket-bound (`drop_session` cancels them, round 22). Resolution arrives asynchronously: `event.claim_resolved` to the claiming session and, on approval, `event.assignment_granted` carrying the `assignment_id` the owner needs for `call.release{assignment_id}` (round 25) |
+| `call.get_lines` | `{session_id, intent?}` | `{lines: LineSummary[]}` — `intent?` filters by the line's declared caps; `intent:"exclusive_line"` has no provider cap to match — it returns the claimable-exclusive view: lines whose `assignment.claimable && assignment.mode == SHARED_POOL` (round 24), i.e. the pool lines an agent may still file `call.claim_exclusive` against. Privacy (round 25): a session sees SHARED_POOL lines plus EXCLUSIVE lines it owns — other agents' exclusive lines are omitted entirely |
 
 ## APICallService → Agent — `event.*`
 
@@ -189,10 +228,14 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `event.queue_updated` | `{session_id, ticket_id, position}` |
 | `event.missed_call` | `{line_id, caller_id?, reason, voicemail_ref?}` |
 | `event.fallback_triggered` | `{line_id, call_token, caller_id?, policy, expires_at}` — THE fallback delivery channel (round 22): delivered to the `system:fallback_worker` session only, when `accept_window_sec` expires on a WORKER-policy line; `call_token` is the internal `fallback_call_token` (round 14); `expires_at` is the worker's absolute accept deadline bounded by `fallback_accept_ttl_sec` (~10 s, round 23 — a dead worker can never hold a ring open) |
-| `event.line_state_changed` | `{line_id, old_state, new_state, reason?}` |
+| `event.line_state_changed` | `{line_id, old_state, new_state, reason?}` — broadcast; on an agent-owned EXCLUSIVE line a privacy-sensitive `reason` (e.g. `external_call` — it reveals the owner's private phone use) is emitted as `reason:null` in the broadcast copy and the real reason is delivered in an additional agent-scoped copy to the owner only (round 25) |
+| `event.line_health_changed` | `{line_id, old_state, new_state}` — provider liveness transition on the `LivenessState` vocabulary (`reachable`\|`ws_disconnected`\|`unreachable`); replaces the removed DEGRADED/DOWN `LineState` members (round 25) |
+| `event.claim_resolved` | `{claim_id, line_id, status, assignment_id?, reason?}` — `status`: `"approved"` \| `"rejected"`; delivered to the claiming session; `assignment_id` present iff approved (round 25) |
+| `event.assignment_granted` | `{assignment_id, line_id, mode}` — a durable `LineAssignment` was granted to the agent (approved claim or `admin.assign_line`); carries the `assignment_id` needed for `call.release{assignment_id}` (round 25) |
+| `event.queue_cancelled` | `{session_id, ticket_id, reason}` — a pending ticket was dropped server-side; `reason`: `line_exclusive` \| `provider_lost` \| `capability_removed` \| `claim_resolved` (round 25) |
 | `event.audio_ready` | `{lease_id, line_id}` — BT SCO path is up: early media (ringback) audible, uplink accepted without first-word clipping |
 | `event.call_state_changed` | `{lease_id, line_id, state, reason?, answer_confidence?, reissued_ticket_id?}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected` (the provider's `ringing` maps to `event.incoming_call`, not to a lease event); `answer_confidence`: `"provisional"` \| `"confirmed"` — how sure the bridge is that `active` means a human answered (oFono `State=active` observed firing on remote answer, but the guarantee is provisional — design §5.5); agent may start its greeting only on `state == "active"` AND `audio_ready` received; `reissued_ticket_id` is present only on a `preempted_by_incoming` teardown of an immediate grant taken with `enqueue:true` — it names the NEW head-of-queue ticket that replaced the dead lease (round 23, so an agent with parallel acquires can correlate lease→ticket; the matching `event.queue_updated{position: 1}` names the same id) |
-| `event.assignment_revoked` | `{assignment_id, line_id, owner_agent_id, reason?}` (round 19b; `owner_agent_id` REQUIRED since round 22) — a durable AGENT-owned `LineAssignment` ended: owner `call.release{assignment_id}` or admin `revoke_assignment` — ONLY explicit revoke paths (round 23: `idle_revoke_after` expiry is alert-only and emits `event.idle_alert`, never a revoke). Delivered ONLY to the revoked owner's session(s). Emitted ONLY for agent assignments — revoking a `ProviderBinding` has no agent audience and instead produces `line.revoke` + `event.line_state_changed{new_state:"DOWN", reason:"admin_revoked"}` (round 22). Without this event an exclusive owner would learn about the revoke only as an `OWNER_MISMATCH` on its next `call.dial` |
+| `event.assignment_revoked` | `{assignment_id, line_id, owner_agent_id, reason?}` (round 19b; `owner_agent_id` REQUIRED since round 22) — a durable AGENT-owned `LineAssignment` ended: owner `call.release{assignment_id}` or admin `revoke_assignment` — ONLY explicit revoke paths (round 23: `idle_revoke_after` expiry is alert-only and emits `event.idle_alert`, never a revoke). Delivered ONLY to the revoked owner's session(s). Emitted ONLY for agent assignments — revoking a `ProviderBinding` has no agent audience and instead produces `line.revoke` + `event.line_health_changed{new_state:"unreachable"}` (round 22; DOWN is a liveness fact, not a LineState, since round 25). Without this event an exclusive owner would learn about the revoke only as an `OWNER_MISMATCH` on its next `call.dial` |
 | `event.idle_alert` | `{assignment_id, line_id, owner_agent_id, idle_since}` (round 23) — an EXCLUSIVE line's `idle_revoke_after` elapsed. STRICTLY alert-only: routed to admin-scope subscribers and configured escalation channels, never to ordinary agent sessions and never implying a revoke; emitted at most once per continuous idle period. Delivery in v1 (round 24): the EventBus pushes `admin`-audience events to the configured `escalation_hooks` (Webhook / Telegram / Exec targets from admin config) and the admin MCP stream (`c_admin`); `agent.register_intent` has no admin subscription path — an idle alert never requires an agent socket |
 
 **Event audience routing (round 21; `admin` scope added round 23).**
@@ -213,9 +256,19 @@ PII or a one-shot `call_token` must never reach uninvolved agents:
 - `event.assignment_revoked` — the revoked owner only; a pool/
   provider attachment has no agent audience and emits NO
   `assignment_revoked` at all (it produces `line.revoke` +
-  `event.line_state_changed{new_state:"DOWN",
-  reason:"admin_revoked"}`, round 22).
-- `event.line_state_changed` — broadcast.
+  `event.line_health_changed{new_state:"unreachable"}`, round 22 —
+  DOWN is a liveness fact, not a `LineState`, since round 25).
+- `event.line_state_changed` — broadcast; an EXCLUSIVE-owned line's
+  privacy-sensitive `reason` additionally produces an agent-scoped
+  copy for the owner with the broadcast copy's `reason` nulled
+  (round 25).
+- `event.line_health_changed` — broadcast (no PII); admin subscribers
+  may also receive it (round 25).
+- `event.claim_resolved` — the claiming session only; a claim whose
+  session died resolves as rejected (`event.queue_cancelled`-class
+  drop, `CLAIM_NOT_FOUND` on any later approve).
+- `event.assignment_granted` — the newly owning agent only.
+- `event.queue_cancelled` — the ticket-owning session only.
 - `event.line_acquired`, `event.queue_updated`, `event.audio_ready`,
   `event.call_state_changed` — the owning session only.
 - `event.idle_alert` — `admin` scope (round 23): admin subscribers
@@ -233,11 +286,25 @@ PII or a one-shot `call_token` must never reach uninvolved agents:
 - Position advances via `event.queue_updated`; on grant the agent
   gets `event.line_acquired` and must act within an admin-configured
   grant TTL (~5 s illustrative) or the next ticket is served.
-- **Fairness across scopes (round 19):** one monotonic `seq` counter
-  covers ALL queue scopes. When line `L` frees, the grant goes to the
+- **Fairness across scopes (round 19; seq minting fixed round 25):**
+  one monotonic `seq` counter covers ALL queue scopes AND is minted
+  at `call.acquire` INGRESS for every call — an immediate grant
+  consumes a `seq` too. When line `L` frees, the grant goes to the
   lowest-`seq` eligible ticket — per-line tickets (`line_id == L`)
   and pool tickets (`line_id` unspecified / `None`) compete in one
-  global order; no starvation of either scope.
+  global order; no starvation of either scope. Because a preempted
+  immediate grant re-materializes a ticket reusing its ORIGINAL
+  ingress `seq` (always lower than any later-queued ticket), head
+  insertion never needs a negative or fractional sequence (round 25).
+- **Server-side ticket drops (round 25):** a pending ticket is
+  cancelled — `event.queue_cancelled`, never silently parked — when
+  its target line becomes EXCLUSIVE (`admin.assign_line` / approved
+  claim), when `claimable` flips false, when the binding loses the
+  capability the ticket asked for, or when the provider is revoked.
+  Pending `call.claim_exclusive` entries on a line that became owned
+  or `claimable:false` auto-resolve rejected. Queue shifts emit
+  `O(queue depth)` `event.queue_updated` envelopes — the total is
+  bounded by `MAX_QUEUE_TICKETS_TOTAL`.
 - **Grant vs incoming-ring race (round 19; ticket lifecycle
   clarified round 22):** a physical `ingest_ring` on a line in the
   granted-but-undialed window PREEMPTS the grant (if the line
@@ -351,13 +418,31 @@ identical framing code path (`websockets.unix_serve` —
      **8 B**: header only, NO payload;
    - any other length is a framing violation — the receiving side
      closes the socket with `1002 Protocol Error`.
-   Flush is in-band — `clear_uplink_buffer`/`flush_audio_out` map to flag `0x02`, no control/media race. A `0x02` frame carries NO audio payload; it has PRIORITY over queued audio frames on the same lease — on receipt the bridge discards every still-queued older uplink audio frame for that lease (round 20, §6.4), so a flush never plays back buffered stale audio after e.g. a synthesized-DTMF segment.
+   Flush is in-band — `clear_uplink_buffer`/`flush_audio_out` map to flag `0x02`, no control/media race. A `0x02` frame carries NO audio payload; it has PRIORITY over queued audio frames on the same lease — on receipt the bridge discards every still-queued uplink audio frame for that lease whose `timestamp_ms` is ≤ the flush's `timestamp_ms` (round 25 watermark semantics: agent speech submitted AFTER the DTMF `{accepted}` survives, while audio buffered during tone synthesis — which would otherwise play back stale by up to ~16 s — is dropped; the earlier "drop everything queued" rule could erase brand-new post-`{ok}` TTS).
 
-3. **Resource bounds (round 14, CODING_HAZARDS rule 7):**
-   - **Pair TTL** — a `media_token` expires ~5 s after issue if no peer
-     completes `media.auth`; a half-connected pair (one peer authed,
-     the other never arrives) is torn down on the same timer. No
-     socket may outlive its `lease_id`.
+3. **Resource bounds (round 14, CODING_HAZARDS rule 7; revised round 25):**
+   - **Pair TTL** — a `media_token` expires **30 s**
+     (`MEDIA_PAIR_TTL_SEC`) after issue if no peer completes
+     `media.auth`; a half-connected pair (one peer authed, the other
+     never arrives) is torn down on the same timer. The earlier ~5 s
+     value was incompatible with MCP LLM agents, whose next tool call
+     routinely lands >5 s after `call.dial`/`call.accept` returns
+     (round 25). A pair-timeout teardown is reported to the kernel,
+     which ends the lease with
+     `event.call_state_changed{reason:"network_error"}` — a live call
+     never silently loses its audio channel. No socket may outlive
+     its `lease_id`.
+   - **Auth handshake deadline** — a freshly accepted media socket
+     MUST send its `media.auth` TEXT frame within **5 s**
+     (`MEDIA_AUTH_TIMEOUT_SEC`) or it is closed (round 25). After
+     auth, ANY TEXT frame or any flag/length outside the table above
+     is a protocol violation → `1002 Protocol Error`.
+   - **Socket-loss recovery (round 25):** the agent's media socket
+     dropping while its control channel lives tears down that lease's
+     media pair — the agent recovers via `call.reattach_media`. The
+     PROVIDER's media socket dropping is covered by the
+     `provider.reregister` → `line.reattach_media` reissue inside the
+     orphan-grace window.
    - **Bounded queues + uplink pacing (round 23, ADR-A; direction
      made explicit round 24)** — the two directions are clocked
      DIFFERENTLY (design §6.6). Agent→provider INGRESS is
@@ -403,24 +488,41 @@ to the admin adapter:
   binding (exclusive owner OR provider attachment); an agent-owned
   assignment emits `assignment_revoked` to the owner, a
   `ProviderBinding` emits `line.revoke` +
-  `event.line_state_changed{new_state:"DOWN",
-  reason:"admin_revoked"}` instead (round 22).
+  `event.line_health_changed{new_state:"unreachable"}` instead
+  (round 22; DOWN is a liveness fact, not a `LineState`, since
+  round 25).
 - `admin.configure_line {line_id, fallback_policy?, accept_window_sec?,
-  allowed_number_types?, claimable?, idle_revoke_after?, timeouts?}` →
+  allowed_number_types?, claimable?, idle_revoke_after?,
+  clear_idle_revoke_after?, timeouts?}` →
   runtime patch, no restart; `timeouts` carries the remaining
   admin-configurable knobs `{grant_ttl_sec?, orphan_grace_sec?,
   heartbeat_interval_sec?, heartbeat_degraded_after?,
-  heartbeat_down_after?, fallback_accept_ttl_sec?}` (rounds 22-23,
-  design §10). `heartbeat_interval_sec` is floored at 0.001 s —
-  millisecond granularity, the wire unit (round 24c). A patched
+  heartbeat_down_after?, fallback_accept_ttl_sec?,
+  ring_drain_ttl_sec?, max_call_duration_sec?,
+  clear_max_call_duration?}` (rounds 22-23; ring-drain and
+  max-duration knobs added round 25 — `ring_drain_ttl_sec` bounds
+  the RINGING_LOCKED drain wait of design §5.2 step 6,
+  `max_call_duration_sec` caps a single call's wall-clock length
+  and bounds `record_and_telegram` recording, `None` effective
+  value = no cap, `clear_max_call_duration:true` removes a set cap
+  and passing it together with `max_call_duration_sec` is
+  `INVALID_ARGUMENT`). `heartbeat_interval_sec` is floored at
+  0.001 s — millisecond granularity, the wire unit (round 24c). A
+  patched
   `heartbeat_interval_sec` takes effect on
   the provider's NEXT `provider.reregister` — the live provider
   learns its interval only from the register response, so the new
   cadence is never enforced against the current session (round 23).
+  `idle_revoke_after` patches the alert-only idle deadline;
+  `clear_idle_revoke_after:true` disables it (`idle_revoke_after` +
+  the flag together is `INVALID_ARGUMENT`, round 25).
   `forward_via_line` policies are validated HERE: `target_number`
   (strict E.164) + `target_country` (ISO alpha-2) go through the
-  same dial-time checks, and a self-loop (`forward.line_id ==
-  line_id`) is `INVALID_ARGUMENT` (round 23); the same checks are
+  same dial-time checks, a self-loop (`forward.line_id ==
+  line_id`) is `INVALID_ARGUMENT` (round 23), and a transitively
+  cyclic forward chain (`A → B → … → A`) is detected by walking the
+  stored policies — bounded at 8 hops — and rejected `INVALID_ARGUMENT`
+  (round 25); the same checks are
   ALSO enforced at model construction inside
   `ForwardViaLineFallback`/`LineAssignment`, so a corrupt hydrated
   row can never carry an invalid policy past the model boundary
@@ -440,7 +542,18 @@ state only, not provisioning or bus plumbing):
 - `admin.pair_window {line_id, duration_sec}` → routed by the admin
   adapter to the line-bundle supervisor, which drives the container's
   BlueZ `Agent1` (see hci-agent.md §5); opens the pairing window on
-  that line's adapter only.
+  that line's adapter only. `duration_sec` is clamped to ≤ 300 s
+  (round 25) and during the window SSP confirmation is auto-accepted
+  ONLY for the line's configured `paired_phone_mac` — never for an
+  arbitrary neighboring Bluetooth device.
+- Additional non-kernel admin operations (design §10, round 25):
+  `admin.list_lines`, `admin.list_leases`, `admin.list_tickets`,
+  `admin.remove_line`, and API-key lifecycle
+  (`admin.issue_key`/`admin.revoke_key` — revocation MUST close the
+  revoked key's live sessions). Bind-mounted sockets are created
+  `0660` under a dedicated `phonebridge` group; the internal WSS
+  listener's TLS material lives under the secrets directory (`0700`)
+  and is hot-reloadable without a daemon restart.
 
 ## Decisions (developer, 2026-11-12)
 

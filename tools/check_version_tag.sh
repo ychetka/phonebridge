@@ -11,7 +11,7 @@ set -uo pipefail
 TIMEOUT="${1:-${VERSION_TAG_TIMEOUT:-600}}"
 
 VER=$(awk -F= '
-  /^\[project\]/ {inp=1; next}
+  /^\[project\][[:space:]]*$/ {inp=1; next}
   /^\[/ {inp=0}
   inp && /^[[:space:]]*version[[:space:]]*=/ {
     v=$2; gsub(/["'"'"'[:space:]]/, "", v); print v; exit }' pyproject.toml 2>/dev/null)
@@ -26,7 +26,8 @@ echo "checking for remote tag $TAG (timeout ${TIMEOUT}s)"
 
 elapsed=0
 while [ "$elapsed" -lt "$TIMEOUT" ]; do
-  git fetch --tags --quiet 2>/dev/null || true
+  git fetch --tags --quiet \
+    || echo "WARN: git fetch --tags failed - checking local refs only" >&2
   if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 \
      && git merge-base --is-ancestor "$TAG^{commit}" HEAD 2>/dev/null; then
     echo "PASS: tag $TAG exists on an ancestor of HEAD ($(git rev-parse --short "$TAG^{commit}"))"

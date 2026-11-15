@@ -36,7 +36,7 @@
 <div class="zone">
   <div class="zone-title">API boundary — UDS (local) / WSS (remote): JSON-RPC 2.0 control + separate packetized media channel</div>
   <code>control: agent.* / call.* / event.*</code>
-  <span class="small">commands: agent.register_intent · call.acquire(enqueue) · call.cancel_acquire · call.dial · call.accept · call.hangup · call.send_dtmf · call.claim_exclusive &nbsp;|&nbsp; events (audience-routed, round 21; admin audience added round 23): event.incoming_call · event.queue_updated · event.line_acquired · event.missed_call · event.fallback_triggered · event.line_state_changed · event.audio_ready · event.call_state_changed · event.assignment_revoked · event.idle_alert (admin-only)</span>
+  <span class="small">commands: agent.register_intent · call.acquire(enqueue) · call.cancel_acquire · call.dial · call.accept · call.hangup · call.send_dtmf · call.claim_exclusive &nbsp;|&nbsp; events (audience-routed, round 21; admin audience added round 23): event.incoming_call · event.queue_updated · event.line_acquired · event.missed_call · event.fallback_triggered · event.line_state_changed · event.line_health_changed · event.claim_resolved · event.assignment_granted · event.queue_cancelled · event.audio_ready · event.call_state_changed · event.assignment_revoked · event.idle_alert (admin-only)</span>
 </div>
 
 <div class="zone">
@@ -79,7 +79,7 @@
 <h2>Deployment (target = prod)</h2>
 <table>
 <tr><td>Prototype (now)</td><td>systemd user-service on the host — capability validation ONLY</td></tr>
-<tr><td>Prod</td><td><b>One container</b> (isolated netns): BlueZ + PipeWire + dbus-daemon inside, all adapters are kernel <code>vhci</code> devices fed by hci-agents — no USB passthrough at all. Host bluetoothd stays free for host devices. Agents reach the container's socket (UDS/WSS/MCP); per-line worker bundles live inside it.</td></tr>
+<tr><td>Prod</td><td><b>One OCI container</b>, <code>--network=host</code> + <code>/dev/vhci</code> on a dedicated host (round 25 — AF_BLUETOOTH is init_net-only; isolated netns is impossible; optional micro-VM profile for shared workstations deferred past MVP): BlueZ + PipeWire + dbus-daemon inside, all adapters are kernel <code>vhci</code> devices fed by hci-agents — no USB passthrough at all. Host <code>bluetoothd</code> is masked; listeners bind <code>127.0.0.1</code>/<code>wg0</code> + host firewall. Agents reach the container's socket (UDS 0660 / WSS / MCP); per-line worker bundles live inside it.</td></tr>
 <tr><td>Remote site / any dongle host</td><td>Only the <b>hci-agent</b>: dumb USB↔HCI relay (libusb, btusb detached), control-TCP + media-UDP over a transport_profile tunnel (wireguard default), heartbeat + remote USB reset; in-flight call on tunnel drop = hangup. A dongle on the gateway's own host uses the identical agent.</td></tr>
 </table>
 </body>

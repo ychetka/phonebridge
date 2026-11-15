@@ -42,7 +42,11 @@ The adapter MUST await the provider's `{accepted}` reply to
 `line.dial`/`line.answer` with a ~2 s deadline. `{accepted:false}`,
 timeout or transport error MUST be fed back as
 `ingest_call_state(DISCONNECTED, NETWORK_ERROR)` so the lease never
-wedges in DIALING.
+wedges in DIALING. After either compensation the adapter MUST issue
+a best-effort `line.hangup` against the call (round 25): a
+`dial`/`answer` that timed out on the wire may still have executed
+on the modem, and an uncompensated air-side call would outlive its
+lease as a ghost ring.
 
 ### Requirement: Idle escalation is alert-only
 
@@ -63,11 +67,116 @@ when `now >= ring.expires_at` the kernel runs the fallback decision
 inside `tick(now)`, and a direct `decide_fallback` call before
 `expires_at` MUST raise `PhonebridgeError(INVALID_STATE)`. When the
 second timer (`fallback_accept_ttl_sec`) expires without a worker
-`call.accept`, the kernel MUST burn the fallback token, transition
-`RINGING_LOCKED -> FREE`, and emit
+`call.accept`, the kernel MUST burn the fallback token and emit
 `MissedCallEvent(reason=ACCEPT_WINDOW_EXPIRED)`;
 `event.fallback_triggered` carries `expires_at` bounded by
-`fallback_accept_ttl_sec`.
+`fallback_accept_ttl_sec`. The line then follows the ring-drain
+rule below — it does NOT return to `FREE` while the physical call
+still rings.
+
+### Requirement: Ring drain after a fallback decision (round 25)
+
+After the fallback decision (`no_pickup` chosen or the
+`fallback_accept_ttl_sec` lapsed) the kernel emits
+`event.missed_call` immediately but MUST keep the line
+`RINGING_LOCKED` until the provider reports the ring's
+`disconnected` — or a bounded `ring_drain_ttl_sec` (default ~60 s)
+elapses — whichever comes first; a best-effort `line.hangup` MAY be
+issued to shorten the drain. Rationale: handing a physically still-
+ringing line to the next `call.dial` would collide with the live
+air-side call, and a later `state_snapshot` would re-register the
+same ring as a NEW `incoming_call`.
+
+### Requirement: Occupancy and liveness are orthogonal axes (round 25)
+
+`LineState` is the OCCUPANCY axis only — `FREE`/`BUSY`/
+`RINGING_LOCKED`; `RESERVED` has no transitions and is removed, and
+`DEGRADED`/`DOWN` are removed because a missed heartbeat MUST never
+overwrite a call fact (a `BUSY` line stays `BUSY` while its
+provider degrades). Provider health lives on the separate
+`LivenessState` axis (`reachable`/`ws_disconnected`/
+`unreachable`), surfaced via `event.line_health_changed`; liveness
+transitions drive teardown policy (orphan grace vs immediate
+hangup), never occupancy.
+
+### Requirement: Claim and assignment results reach the agent (round 25)
+
+`call.claim_exclusive` resolves ASYNCHRONOUSLY: the kernel MUST emit
+`event.claim_resolved{claim_id, line_id, status, assignment_id?,
+reason?}` to the claiming session on approval AND rejection, and on
+approval additionally `event.assignment_granted{assignment_id,
+line_id, mode}` to the new owner — this is the ONLY path delivering
+the `assignment_id` an owner needs for
+`call.release{assignment_id}` (an undelivered `assignment_id` makes
+a granted exclusive line un-releasable). `admin.assign_line` grants
+emit `event.assignment_granted` identically.
+
+### Requirement: Media credentials are split per role and reissuable (round 25)
+
+`MediaCredentials` MUST carry SEPARATE `agent_media_endpoint` /
+`provider_media_endpoint` pairs (local UDS vs WAN WSS coexist), and
+the one-shot per-role tokens MUST be reissuable without tearing
+down the call: `line.reattach_media` feeds fresh provider
+credentials to a lease preserved across `provider.reregister`, and
+`call.reattach_media` feeds fresh agent credentials when the
+agent's media socket dropped while control stayed alive. A burned
+one-shot token MUST never be required twice.
+
+### Requirement: Ring correlation is by line, not by token (round 25)
+
+At most ONE open ring exists per line, so ring correlation MUST be
+by `line_id`: a `disconnected` update carrying NEITHER `call_token`
+nor `lease_id` on a `RINGING_LOCKED` line resolves to that line's
+one open ring (covers snapshot-discovered rings and
+`fallback_call_token` re-issue); the provider echoes the
+gateway-minted `call_token` whenever it has one. A
+`state_snapshot` call with `lease_id:null` binds to the line's
+single orphaned lease under the 1:1 ambiguity rule (the provider
+keeps a `/run` state file for exact re-binding after its own
+restart).
+
+### Requirement: Queue sequence is minted at acquire ingress (round 25)
+
+A single global monotonic `seq` is allocated to EVERY `call.acquire`
+at ingress — including immediate grants — so a preempted
+grant-but-undialed lease re-enters the queue head with its ORIGINAL
+sequence and FIFO fairness survives preemption; signed `seq` space
+is not required because every participant already holds a value.
+Server-side ticket removal (exclusivity, provider loss, capability
+removal, claim resolution) MUST emit `event.queue_cancelled` to the
+ticket's session.
+
+### Requirement: Exclusive-line privacy is filtered at the edge (round 25)
+
+`call.get_lines` MUST omit other agents' EXCLUSIVE lines entirely
+(the claimable pool view is unaffected); `event.line_state_changed`
+for an exclusive line MUST broadcast a redacted `reason` to
+non-owners and deliver the real reason ONLY to the owner's
+session(s) — a shared event bus MUST NOT leak whose private line
+did what.
+
+### Requirement: Forwarding policies are loop-safe and bounded (round 25)
+
+`configure_line` MUST reject a `forward_via_line` policy creating a
+self-loop AND detect transitive cycles (`A → B → … → A`) by walking
+the stored policy chain bounded at 8 hops — a forward loop would
+otherwise spin fallback workers forever. `max_call_duration_sec`
+(`None` = uncapped, ≤ 86400 s when set) bounds every call's
+wall-clock length and the `record_and_telegram` recording length;
+`clear_max_call_duration:true` removes a set cap and is
+`INVALID_ARGUMENT` together with a value (same PATCH-tombstone
+pattern as `clear_idle_revoke_after`).
+
+### Requirement: Wire secrets are non-string containers (round 25)
+
+`CallToken`/`MediaToken` MUST be `RedactedString`-class containers
+(non-`str`, masked `repr`/`str`, explicit `.expose()`/`to_wire()`),
+never `NewType(..., str)` — a raw `str` token serializes into
+structured logs unmasked via C-level paths. `EventEnvelope` carries
+a TYPED audience so a PII-bearing payload (`IncomingCallEvent`)
+cannot be wrapped in `BroadcastAudience` by accident; external
+`agent_id` values under the reserved `system:*` prefix MUST be
+rejected with `UNAUTHORIZED` on external sockets.
 
 ### Requirement: MediaAllocator lifecycle
 
