@@ -64,13 +64,13 @@
   <li>Agent calls <code>call.dial("+373…", country:"MD")</code> — strict E.164 + ISO alpha-2 cross-check (DIAL_REJECTED on failure, never reaches the line) → gateway → <code>line.dial</code> to the owning provider → oFono → phone dials (validated E.164 passed through unchanged).</li>
   <li>Call reaches <code>alerting</code> → media attaches; <code class="evt">event.audio_ready</code> = local SCO path up (from <code>provider.audio_ready</code>); remote answer = <code>event.call_state_changed{state:"active"}</code> — greeting starts only on <b>both</b>.</li>
   <li>Duplex: agent sends audio frames (its voice) over the media channel → callee hears; callee's voice arrives as frames → agent listens/transcribes. <code>call.send_dtmf("1")</code> — IVR navigation.</li>
-  <li><code>call.hangup</code> → <code>call.release</code> → queue advances to the next agent.</li>
+  <li><code>call.hangup</code> ends the call AND the lease atomically (auto-release, round 22) → queue advances to the next agent.</li>
 </ol>
 
 <h2>INBOUND CALL — wake-and-grant</h2>
 <ol class="seq">
   <li>Phone rings → provider reports <code>ringing</code> → gateway marks the line <b>RINGING_LOCKED</b> (outbound acquire on it fails <code class="note">LINE_BUSY_INCOMING</code>).</li>
-  <li>Gateway consults LineAssignment: owner exists → wake owner via hooks (webhook/exec/file-drop); no owner → <code class="evt">event.incoming_call{line_id, call_token, caller_id?, expires_in_ms}</code> to live subscribers.</li>
+  <li>Gateway consults LineAssignment: owner exists → wake owner via hooks (webhook/exec/file-drop); no owner → <code class="evt">event.incoming_call{line_id, call_token, caller_id?, expires_at}</code> to live subscribers.</li>
   <li>First <code>call.accept(call_token)</code> is <b>atomic</b>: lease + answer + media attach. Non-owner accept on an owned line → <code class="note">OWNER_MISMATCH</code>; a second accept → <code class="note">STALE_TOKEN</code>.</li>
   <li><code class="evt">event.audio_ready</code> (from <code>provider.audio_ready</code>) + <code>state == "active"</code> → agent says "hello" (waiting for both avoids truncating the first word on Bluetooth lag).</li>
   <li><b>Nobody accepted within the window</b> (default 30 s, all timeouts admin-configurable) → per-line fallback policy: no_pickup (carrier voicemail / keep ringing — the service does NOT drop or hijack the call) · forward_via_line · record_and_telegram · reject · answer_and_announce.</li>
