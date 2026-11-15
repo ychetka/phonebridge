@@ -192,9 +192,10 @@ interface LineProviderConfig {
   telephony path survives -> in-flight calls stay up at the provider,
   orphaned agent leases get a **10 s grace** window to re-bind
   through the re-registered provider; (b) provider-reported tunnel/
-  USB death (`provider.call_state{state:"disconnected"}` /
-  `dongle_lost`) or unreachable provider after DEGRADED->DOWN ->
-  in-flight calls are treated as hangup immediately, no grace.
+  USB death (`provider.call_state{state:"disconnected",
+  reason:"dongle_lost"}`) or unreachable provider after
+  DEGRADED->DOWN -> in-flight calls are treated as hangup
+  immediately, no grace.
 
 RemoteLine example - Raspberry Pi site (round 12): the Pi no longer
 runs the provider. It runs the **hci-agent** — a dumb USB↔HCI relay
@@ -511,7 +512,15 @@ remains single-use and TTL-bound) and delivers `event.incoming_call`
 - Orphan-lease grace on provider reconnect: **10 s** (round 5b) —
   applies ONLY to the WS-drop level above; a provider that reports
   tunnel/USB death, or stays unreachable past DEGRADED->DOWN,
-  tears its calls down immediately (round 20).
+  tears its calls down immediately (round 20). Mechanics (round 20b):
+  on WS drop the binding's `ProviderBinding.orphan_deadline_at` is
+  set to `now + orphan_grace_sec` (admin-configurable, default 10 s);
+  a `provider.reregister` inside the window whose
+  `state_snapshot` confirms the call still lives on the D-Bus
+  (`GetCalls()`) re-binds the lease seamlessly and clears the
+  deadline; expiry in `tick(now)` — or a snapshot already missing
+  the call — ends the lease as
+  `call_state_changed{reason:"provider_lost"}`.
 - Provider-side teardown commands are idempotent: a Hangup racing a
   remote teardown may surface as "method doesn't exist" — that is
   treated as already-gone success, verified via GetCalls/HangupAll.
@@ -699,19 +708,31 @@ LineManager, (b) exactly one gateway instance per deployment
 (socket path / listen port held exclusively, refuse to start if
 held).
 
-D-Bus split and restart reconciliation (round 20): inside the
-container the privilege boundary is explicit — `bluetoothd`/oFono
-ride the SYSTEM bus while PipeWire/WirePlumber ride the USER-session
-bus (`org.pipewire.Telephony`); the gateway and line bundles bridge
-the two through the shared container dbus-daemon. On ANY stack
-restart (bluetoothd, oFono, PipeWire, WirePlumber, or the gateway
-itself) the affected component re-enumerates its objects and the
-kernel runs reconciliation: re-resolve every line's deterministic
-D-Bus chain (`adapter_mac → Adapter1.Address → Device1.Adapter →
-phone_mac → bluez_*` nodes, §1), rebuild PipeWire links for live
-leases, and resync `CallLease`/`LineAssignment` state against
-provider `state_snapshot` reports — a restarted stack never leaves
-phantom lines, links, or leases behind.
+D-Bus split and restart reconciliation (round 20, detailed round
+20b): the container runs TWO buses. `bluetoothd`/oFono ride the
+SYSTEM bus; PipeWire + WirePlumber (`org.pipewire.Telephony`) require
+a SESSION bus with `XDG_RUNTIME_DIR`. The privilege boundary inside
+the container: only the tunnel supervisor and the `vhci-feeder`
+processes hold `/dev/vhci` access and `CAP_NET_ADMIN`; `pipewire`,
+`wireplumber`, the N `LineProvider` workers and the `gateway` all
+run as the unprivileged `phonebridge` user sharing one
+`XDG_RUNTIME_DIR` and one session D-Bus — with an explicit system-bus
+policy granting UID `phonebridge` access to `org.bluez` (and nothing
+else privileged). Restart reconciliation protocol: on ANY bus
+reconnect or name-owner change of `org.pipewire.Telephony` /
+`org.bluez`, every affected `LineProvider` MUST perform a full
+`GetCalls()` reconciliation and report
+`provider.call_state{state:"disconnected", reason:"stack_restart"}`
+for every call that no longer exists on the bus. The reconciliation
+is BIDIRECTIONAL (round 20b): a call found on the bus that the
+kernel does not know is either adopted/re-leased under the line's
+policy or hung up via the provider — never silently left ringing.
+The kernel
+re-resolves each line's deterministic D-Bus chain (`adapter_mac →
+Adapter1.Address → Device1.Adapter → phone_mac → bluez_*` nodes,
+§1), rebuilds PipeWire links for surviving leases, and tears down
+the reported-gone ones — a restarted stack never leaves phantom
+lines, links, or leases behind.
 
 Observability: structured logs, `line_state_changed`/call events on
 the event stream, `phonebridgectl` CLI for manual dial/hangup/

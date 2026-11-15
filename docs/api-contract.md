@@ -143,7 +143,7 @@ from these input rejections and from ordinary no-answer termination.
 | `provider.reregister` | same as register | idempotent; preserves lease state during the 10 s orphan-grace window — grace covers the WS-drop level only; provider-reported tunnel/USB death or DEGRADED→DOWN unreachable = immediate teardown, no grace (round 20, design §5.4) |
 | `provider.ping` | `{line_id, assignment_id, state_snapshot?}` | `{ok, server_time}` — missed N pings → DEGRADED → DOWN |
 | `provider.capability_update` | `{line_id, assignment_id, caps, profile?}` | `{ok}` |
-| `provider.call_state` | `{line_id, assignment_id, call_token?, lease_id?, state, reason?}` | `{ok}` — `state` is the canonical set `ringing` \| `dialing` \| `alerting` \| `active` \| `disconnected`; `call_token` identifies the inbound ring, `lease_id` an established call |
+| `provider.call_state` | `{line_id, assignment_id, call_token?, lease_id?, state, reason?}` | `{ok}` — `state` is the canonical set `ringing` \| `dialing` \| `alerting` \| `active` \| `disconnected`; `call_token` identifies the inbound ring, `lease_id` an established call. Recognized teardown reasons — the vocabulary is CLOSED (round 20b): `dongle_lost` (tunnel/USB death — immediate teardown, no orphan grace), `stack_restart` (vanished call found by `GetCalls()` reconciliation after a bus/name-owner restart), `provider_lost` (orphan-grace expiry or provider unreachable past DEGRADED→DOWN) |
 | `provider.audio_ready` | `{line_id, assignment_id, lease_id}` | `{ok}` — one-shot notification: the provider's local BT SCO path is up (early media flows, uplink accepted). Gateway emits `event.audio_ready` to the agent from this signal |
 
 ## Manager → Line — `line.*` (down-channel commands)
