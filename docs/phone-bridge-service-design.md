@@ -342,9 +342,11 @@ caller_id?, policy}` goes to the `system:fallback_worker` session
 only, when the accept window expires on a WORKER-policy line
 (round 14).
 
-`event.assignment_revoked{assignment_id, line_id, owner_agent_id?,
-reason?}` (round 19b) is delivered to the revoked owner's session
-when an admin `revoke_assignment`/`line.revoke` or idle escalation
+`event.assignment_revoked{assignment_id, line_id, owner_agent_id,
+reason?}` (round 19b; `owner_agent_id` required since round 22 -
+emitted only for agent LineAssignment revocation) is delivered to
+the revoked owner's session when an admin
+`revoke_assignment`/`line.revoke` or idle escalation
 ends the durable binding - without it the owner would learn only via
 `OWNER_MISMATCH` on the next `call.dial`.
 
