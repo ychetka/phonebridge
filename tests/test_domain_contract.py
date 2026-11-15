@@ -2351,8 +2351,19 @@ def test_system_agent_identity_and_id_hygiene() -> None:
     assert AgentAudience(agent_id=SYSTEM_FALLBACK_WORKER).agent_id == SYSTEM_FALLBACK_WORKER
     assert AgentAudience(agent_id="system:fallback_worker").agent_id == "system:fallback_worker"
     # External ids: empty, colon-bearing and overlong are rejected;
-    # a bare "system:" prefix with an empty suffix names nothing.
-    for bad in ("", "a" * 129, "agent:x", SYSTEM_AGENT_PREFIX):
+    # a bare "system:" prefix with an empty suffix names nothing, and
+    # the system: suffix obeys the same hygiene - whitespace-only and
+    # colon-bearing suffixes are rejected too.
+    for bad in (
+        "",
+        "a" * 129,
+        "agent:x",
+        SYSTEM_AGENT_PREFIX,
+        "system:a:b",
+        "system: ",
+        "system:\t",
+        "system:" + "a" * 129,
+    ):
         with pytest.raises(ValidationError):
             AgentAudience(agent_id=bad)
     # "default" is an API-boundary alias, never a domain line_id.

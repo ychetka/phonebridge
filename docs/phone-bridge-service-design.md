@@ -338,8 +338,10 @@ Error codes (contract-level; each maps to a numeric JSON-RPC
 `LINE_NOT_FOUND`, `INVALID_INTENT`, `STALE_TOKEN`,
 `PROVIDER_UNREACHABLE`, `DIAL_REJECTED` (typed `data.reason` - see
 Dial validation in `docs/api-contract.md`), `INVALID_STATE`,
-`INVALID_ARGUMENT`, `INVALID_DTMF`, `SESSION_LIMIT_EXCEEDED`,
-`RESOURCE_EXHAUSTED`.
+`INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`. Sub-code strings such as
+`INVALID_DTMF` or `SESSION_LIMIT_EXCEEDED` are `ErrorReason`
+values inside `error.data.reason` of their parent code — never
+top-level `error.code`/`error.message` members.
 
 `NO_FREE_LINE` was REMOVED as an error (round 9): a busy pool is a
 normal result, not an exception.

@@ -439,15 +439,17 @@ def _check_agent_id(value: str) -> str:
     :data:`SYSTEM_FALLBACK_WORKER` is a kernel-internal agent that
     legitimately appears on ``AgentAudience.agent_id`` /
     ``owner_agent_id`` (item 21). A bare ``system:`` with an empty
-    suffix is NOT a legal member of that namespace - the prefix
-    alone names nothing."""
+    or whitespace-only suffix is NOT a legal member of that
+    namespace - the prefix alone names nothing - and the suffix
+    itself obeys the same hygiene as any external id (at most
+    ``_ID_MAX_LEN`` chars, no ``:``)."""
     if is_system_agent_id(value):
-        if len(value) <= len(SYSTEM_AGENT_PREFIX):
+        suffix = value[len(SYSTEM_AGENT_PREFIX):]
+        if not suffix.strip():
             raise ValueError(
                 f"system agent id must carry a non-empty suffix after {SYSTEM_AGENT_PREFIX!r}"
             )
-        if len(value) > _ID_MAX_LEN:
-            raise ValueError(f"identifier exceeds {_ID_MAX_LEN} chars")
+        _check_id(suffix)
         return value
     return _check_id(value)
 
