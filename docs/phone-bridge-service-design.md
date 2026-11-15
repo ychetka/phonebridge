@@ -514,7 +514,8 @@ remains single-use and TTL-bound) and delivers `event.incoming_call`
   tunnel/USB death, or stays unreachable past DEGRADED->DOWN,
   tears its calls down immediately (round 20). Mechanics (round 20b):
   on WS drop the binding's `ProviderBinding.orphan_deadline_at` is
-  set to `now + 10s`; a `provider.reregister` inside the window whose
+  set to `now + orphan_grace_sec` (admin-configurable, default 10 s);
+  a `provider.reregister` inside the window whose
   `state_snapshot` confirms the call still lives on the D-Bus
   (`GetCalls()`) re-binds the lease seamlessly and clears the
   deadline; expiry in `tick(now)` — or a snapshot already missing
@@ -722,7 +723,11 @@ reconnect or name-owner change of `org.pipewire.Telephony` /
 `org.bluez`, every affected `LineProvider` MUST perform a full
 `GetCalls()` reconciliation and report
 `provider.call_state{state:"disconnected", reason:"stack_restart"}`
-for every lease that no longer exists on the bus; the kernel
+for every call that no longer exists on the bus. The reconciliation
+is BIDIRECTIONAL (round 20b): a call found on the bus that the
+kernel does not know is either adopted/re-leased under the line's
+policy or hung up via the provider — never silently left ringing.
+The kernel
 re-resolves each line's deterministic D-Bus chain (`adapter_mac →
 Adapter1.Address → Device1.Adapter → phone_mac → bluez_*` nodes,
 §1), rebuilds PipeWire links for surviving leases, and tears down
