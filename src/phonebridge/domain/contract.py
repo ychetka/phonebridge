@@ -41,6 +41,7 @@ from enum import Enum
 from typing import (
     Annotated,
     Any,
+    Final,
     Generic,
     Literal,
     NewType,
@@ -71,12 +72,15 @@ __all__ = [
     "E164_PATTERN",
     "ERROR_CODE_WIRE",
     "EVENT_AUDIENCE_SCOPES",
+    "EVENT_PAYLOAD_TYPES",
     "EVENT_WIRE_NAMES",
     "MAX_DTMF_DIGITS",
+    "MAX_FORWARD_HOPS",
     "MAX_IDEMPOTENCY_KEY_LEN",
     "MAX_LEASES_PER_SESSION",
     "MAX_PENDING_CLAIMS_PER_AGENT",
     "MAX_PENDING_CLAIMS_TOTAL",
+    "MAX_PROFILE_LEN",
     "MAX_PROVIDER_META_ENTRIES",
     "MAX_PROVIDER_META_KEY_LEN",
     "MAX_PROVIDER_META_VALUE_LEN",
@@ -590,11 +594,20 @@ class LivenessState(str, Enum):
     it lives on ``ProviderBinding.liveness``/``LineSummary.liveness``
     and its transitions surface as ``event.line_health_changed`` -
     never as ``event.line_state_changed``, whose
-    :class:`LineState` vocabulary is call-occupancy only."""
+    :class:`LineState` vocabulary is call-occupancy only.
+
+    UNBOUND (round 26, review-16 item 13) is the DERIVED listing
+    state for a line with no provider attached - ``LineSummary``
+    reports it because REACHABLE was misleading (nothing exists to
+    be healthy or sick). It is never a REPORTED fact:
+    :class:`ProviderLiveness` always comes from an attached binding
+    and :class:`LineHealthChangedEvent` transitions never produce
+    it (binding revocation surfaces UNREACHABLE)."""
 
     REACHABLE = "reachable"
     WS_DISCONNECTED = "ws_disconnected"
     UNREACHABLE = "unreachable"
+    UNBOUND = "unbound"
 
 
 class ProviderDisconnectReason(str, Enum):
@@ -898,6 +911,16 @@ MAX_PROVIDER_META_KEY_LEN: int = 64
 MAX_PROVIDER_META_VALUE_LEN: int = 256
 """Upper bound on a ``ProviderRegistration.meta`` value length."""
 
+MAX_PROFILE_LEN: Final[int] = 128
+"""Upper bound on a ``profile`` label (round 26, review-16 item 4;
+CODING_HAZARDS rule 7 on an external agent/provider input): when
+present the ``profile`` fields of :class:`ProviderRegistration`,
+:class:`ProviderCapabilityUpdate` and the :class:`LineSummary`
+mirror are a non-empty string of at most 128 chars - an empty or
+overlong label is INVALID_ARGUMENT at the boundary. The
+``LineSummary`` listing mirror shares the same bound so a stored
+value can never become unlistable."""
+
 MAX_SESSIONS_PER_AGENT: int = 32
 """Concurrent open sessions per ``agent_id`` in ``register_intent``
 (round 25, review-15 item 30; CODING_HAZARDS rule 7 on an external
@@ -922,6 +945,17 @@ MAX_LEASES_PER_SESSION: int = 8
 item 30; rule 7): every lease carries a real call plus a media
 credential pair - an unbounded count would park unbounded PipeWire
 bridges and provider commands."""
+
+MAX_FORWARD_HOPS: Final[int] = 8
+"""Bound on the transitive ``forward_via_line`` chain walk (round
+26, review-16 item 2; docs/specs/line-manager.md):
+``configure_line`` MUST reject a policy that would create a
+forwarding CYCLE (``A -> B -> ... -> A``) by walking the stored
+policy chain of the target lines; the walk is bounded at this many
+hops so a pathological config can never park the kernel in an
+unbounded traversal (rule 7). A direct self-loop is already
+model-enforced on :class:`LineAssignment` - this bound covers the
+multi-line case the model cannot see."""
 
 MEDIA_PAIR_TTL_SEC: int = 30
 """Half-connected media-pair teardown window (round 25, review-15
@@ -1046,7 +1080,11 @@ class ErrorData(ContractModel):
 
     reason: ErrorReason | None = None
     detail: str | None = None
-    free_lines: tuple[LineId, ...] = ()
+    free_lines: tuple[_CheckedLineId, ...] = ()
+    """Each entry goes through :func:`_check_line_id` (round 26,
+    review-16 item 5): a colon-bearing/empty/overlong/``"default"``
+    id can never be echoed back to the wire as a suggested FREE
+    alternative."""
 
 
 class PhonebridgeError(Exception):
@@ -1254,6 +1292,13 @@ class ForwardViaLineFallback(ContractModel):
     configured line, so ``LineAssignment`` rejects
     ``fallback_policy.line_id == self.line_id`` (round 24, review-13
     M1) and ``configure_line`` rejects the same pair on the wire.
+    A TRANSITIVE cycle (``A -> B -> ... -> A``) is banned at the
+    ``configure_line`` kernel layer (round 26, review-16 item 2;
+    docs/specs/line-manager.md): the kernel MUST walk the stored
+    policy chain of the target lines, bounded at
+    :data:`MAX_FORWARD_HOPS` hops, and reject a chain that closes
+    back onto the configured line - a model-level check is
+    impossible here because the cycle spans several assignments.
     Wire config spelling:
     ``forward_via_line:<line_id>:<e164_number>:<country>``."""
 
@@ -1510,8 +1555,10 @@ class LineSummary(ContractModel):
     review-15 item 15) is the SEPARATE provider-health axis - the
     line's provider health as last reported via
     ``event.line_health_changed``/``note_provider_liveness``.
-    ``REACHABLE`` is the default for unbound/pool lines (no provider
-    attached means nothing degraded to report)."""
+    ``UNBOUND`` is the default for unbound/pool lines (round 26,
+    review-16 item 13): no provider attached means there is nothing
+    to be healthy or sick - REACHABLE was misleading on a
+    provider-less row."""
 
     line_id: _CheckedLineId
     caps: tuple[Intent, ...]
@@ -1524,8 +1571,12 @@ class LineSummary(ContractModel):
     (exclusivity AVAILABILITY is what the
     ``get_lines(intent=EXCLUSIVE_LINE)`` filter answers separately)."""
     state: LineState
-    liveness: LivenessState = LivenessState.REACHABLE
-    profile: str | None = None
+    liveness: LivenessState = LivenessState.UNBOUND
+    profile: str | None = Field(default=None, min_length=1, max_length=MAX_PROFILE_LEN)
+    """Bounded when present (round 26, review-16 item 4): a non-empty
+    label of at most :data:`MAX_PROFILE_LEN` chars - the listing
+    mirror shares the ingress bound so a stored profile can never
+    become unlistable."""
 
     @field_validator("caps")
     @classmethod
@@ -1541,6 +1592,24 @@ class LineSummary(ContractModel):
                 "exclusivity lives on LineAssignment.claimable/mode"
             )
         return caps
+
+    @model_validator(mode="after")
+    def _caps_iff_bound(self) -> LineSummary:
+        """``caps`` is non-empty IFF ``liveness`` differs from
+        UNBOUND (round 26, review-16 item 13): a bound provider
+        always contributes non-empty caps, and a provider-less line
+        reports neither caps nor health - the two columns can never
+        contradict each other on the listing.
+
+        Same-item follow-up: UNBOUND also forces ``state == FREE`` -
+        with no provider attached no call can exist on the line, so
+        an ``UNBOUND`` + ``BUSY``/``RINGING_LOCKED`` row is
+        unconstructible."""
+        if (self.caps == ()) != (self.liveness is LivenessState.UNBOUND):
+            raise ValueError("caps is non-empty iff liveness is not unbound")
+        if self.liveness is LivenessState.UNBOUND and self.state is not LineState.FREE:
+            raise ValueError("an unbound line can hold no call - state must be FREE")
+        return self
 
 
 class LineAssignment(ContractModel):
@@ -1904,7 +1973,10 @@ class AcquireRefused(ContractModel):
     server-side parked requests, round 8)."""
 
     granted: Literal[False] = False
-    free_lines: tuple[LineId, ...] = ()
+    free_lines: tuple[_CheckedLineId, ...] = ()
+    """Suggested FREE alternatives - each entry goes through
+    :func:`_check_line_id` (round 26, review-16 item 5), same rule
+    as :attr:`ErrorData.free_lines`."""
 
 
 def _acquire_discriminator(value: Any) -> str:
@@ -1983,7 +2055,12 @@ class MediaReattachResult(ContractModel):
     ``lease_id`` so the agent can re-authenticate on
     ``media.auth{role: "agent"}``; the provider-side pair entry is
     untouched (its own detach is signalled provider-side - see
-    :class:`ProviderReattachMediaCommand`)."""
+    :class:`ProviderReattachMediaCommand`). The reissued pair
+    SUPERSEDES the prior agent-side pair (round 26, review-16 item
+    8): the old ``media_token`` becomes invalid at issue time - a
+    lease holds a single active pair per role - bounding the
+    replay window to the reissue instant rather than the full pair
+    TTL."""
 
     lease_id: _CheckedLeaseId
     media_endpoint: str = Field(min_length=1)
@@ -2184,7 +2261,12 @@ class ProviderReattachMediaCommand(ContractModel):
     and hands it here. The provider treats it like the
     ``media_endpoint``/``media_token`` pair of
     :class:`ProviderDialCommand`: reconnect the media socket,
-    re-authenticate, resume the stream."""
+    re-authenticate, resume the stream. The reissued pair
+    SUPERSEDES the prior provider-side pair (round 26, review-16
+    item 8): the old ``media_token`` becomes invalid at issue
+    time - a lease holds a single active pair per role - bounding
+    the replay window to the reissue instant rather than the full
+    pair TTL."""
 
     command: Literal["reattach_media"] = "reattach_media"
     line_id: _CheckedLineId
@@ -2394,7 +2476,11 @@ class EventEnvelope(ContractModel, Generic[PayloadT]):
     ``audience`` (round 21) is the mandatory routing target computed
     at emission time - see :data:`EventAudience` for the per-event
     rules and :data:`EVENT_AUDIENCE_SCOPES` for the enforced
-    ``(name, scope)`` legality table (round 25)."""
+    ``(name, scope)`` legality table (round 25). The second enforced
+    leg is ``(name, payload-type)`` (round 26, review-16 item 1):
+    :data:`EVENT_PAYLOAD_TYPES` pins the payload model each event
+    name may carry, so a mis-typed payload can never ride a
+    broadcast-legal name."""
 
     name: EventName
     audience: EventAudience
@@ -2412,6 +2498,23 @@ class EventEnvelope(ContractModel, Generic[PayloadT]):
         if self.audience.scope not in allowed:
             raise ValueError(
                 f"audience scope {self.audience.scope!r} is not legal for event {self.name.value!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _payload_type_matches_name(self) -> EventEnvelope[PayloadT]:
+        """Round 26 (review-16 item 1): reject a ``(name, payload)``
+        pair where the payload is not an instance of the model
+        :data:`EVENT_PAYLOAD_TYPES` pins for ``name`` - the lookup
+        happens at validation time, so the map's later module
+        position (it is defined after the event classes below) is
+        fine. A broadcast-audience legal name carrying a PII
+        payload, or any other mis-typed pair, is a defect, not a
+        routing choice."""
+        expected = EVENT_PAYLOAD_TYPES.get(self.name)
+        if expected is not None and not isinstance(self.payload, expected):
+            raise ValueError(
+                f"payload {type(self.payload).__name__} does not match event {self.name.value!r}"
             )
         return self
 
@@ -2720,7 +2823,11 @@ class LineHealthChangedEvent(ContractModel):
     call-occupancy channel. Audience is ``broadcast`` + ``admin``:
     a PII-free operational fact pool observers and admin
     subscribers both need. ``old_state != new_state`` is enforced -
-    a no-change event is a defect, not a notification."""
+    a no-change event is a defect, not a notification. UNBOUND is
+    never a legal endpoint (round 26, review-16 item 13): the event
+    reports transitions ON a bound provider, and binding revocation
+    surfaces UNREACHABLE - ``unbound`` is a derived
+    :class:`LineSummary` listing state only."""
 
     line_id: _CheckedLineId
     old_state: LivenessState
@@ -2730,6 +2837,15 @@ class LineHealthChangedEvent(ContractModel):
     def _state_must_change(self) -> LineHealthChangedEvent:
         if self.old_state == self.new_state:
             raise ValueError("old_state and new_state must differ")
+        return self
+
+    @model_validator(mode="after")
+    def _unbound_never_an_endpoint(self) -> LineHealthChangedEvent:
+        """UNBOUND is rejected on both ends (round 26, review-16 item
+        13): transitions on a bound provider never produce it -
+        binding revocation surfaces UNREACHABLE instead."""
+        if LivenessState.UNBOUND in (self.old_state, self.new_state):
+            raise ValueError("unbound is a derived listing state, not a transition endpoint")
         return self
 
 
@@ -2774,6 +2890,33 @@ class IdleAlertEvent(ContractModel):
     line_id: _CheckedLineId
     owner_agent_id: _CheckedAgentId
     idle_since: AwareDatetime
+
+
+EVENT_PAYLOAD_TYPES: dict[EventName, type[ContractModel]] = {
+    EventName.INCOMING_CALL: IncomingCallEvent,
+    EventName.CALL_STATE_CHANGED: CallStateChangedEvent,
+    EventName.QUEUE_READY: QueueReadyEvent,
+    EventName.QUEUE_UPDATED: QueueUpdatedEvent,
+    EventName.ASSIGNMENT_REVOKED: AssignmentRevokedEvent,
+    EventName.AUDIO_READY: AudioReadyEvent,
+    EventName.FALLBACK_TRIGGERED: FallbackTriggeredEvent,
+    EventName.LINE_STATE_CHANGED: LineStateChangedEvent,
+    EventName.LINE_HEALTH_CHANGED: LineHealthChangedEvent,
+    EventName.MISSED_CALL: MissedCallEvent,
+    EventName.IDLE_ALERT: IdleAlertEvent,
+    EventName.CLAIM_RESOLVED: ClaimResolvedEvent,
+    EventName.ASSIGNMENT_GRANTED: AssignmentGrantedEvent,
+    EventName.QUEUE_CANCELLED: QueueCancelledEvent,
+}
+"""Authoritative event -> payload-model map (round 26, review-16
+item 1): the ``(name, payload-type)`` counterpart of
+:data:`EVENT_AUDIENCE_SCOPES`, enforced by
+:class:`EventEnvelope` at construction so a mis-typed payload can
+never ride a mismatched event name (e.g. caller PII under a
+broadcast-legal name). Defined AFTER the event classes because
+every value is a class object; :class:`EventEnvelope` looks names
+up at validation time, so the forward position is safe.
+Completeness is pinned by ``test_event_payload_types_map``."""
 
 
 # ---------------------------------------------------------------------------
@@ -2827,7 +2970,12 @@ class ProviderRegistration(ContractModel):
     line_id: _CheckedLineId
     token: RedactedString
     caps: tuple[Intent, ...]
-    profile: str | None = None
+    profile: str | None = Field(default=None, min_length=1, max_length=MAX_PROFILE_LEN)
+    """Bounded when present (round 26, review-16 item 4; rule 7 on an
+    external ingress field): a non-empty label of at most
+    :data:`MAX_PROFILE_LEN` chars - shared with
+    :class:`ProviderCapabilityUpdate` and the :class:`LineSummary`
+    mirror."""
     meta: dict[str, str] = Field(default_factory=dict)
     """Opaque provider metadata (wire: ``provider.register{meta?}``
     object). Bounded (round 22, review-10 MEDIUM-5; CODING_HAZARDS
@@ -2905,6 +3053,17 @@ class ProviderLiveness(ContractModel):
     reconciliation the way reregister does inside the orphan-grace
     window. ``None`` when the ping carries no snapshot."""
 
+    @field_validator("state")
+    @classmethod
+    def _state_is_a_reported_fact(cls, state: LivenessState) -> LivenessState:
+        """UNBOUND is rejected (round 26, review-16 item 13): a
+        liveness REPORT always comes from an attached binding -
+        ``unbound`` is a derived :class:`LineSummary` listing state,
+        never a reported fact a provider could send."""
+        if state is LivenessState.UNBOUND:
+            raise ValueError("unbound is a derived listing state, not a reported liveness fact")
+        return state
+
 
 class ProviderCallStateUpdate(ContractModel):
     """provider.call_state ingress fact (bounded ProviderCallState).
@@ -2949,7 +3108,12 @@ class ProviderCallStateUpdate(ContractModel):
 
     ``reason`` is the CLOSED provider vocabulary
     (:class:`ProviderDisconnectReason`, round 21); gateway-minted
-    reasons such as ``provider_lost`` never arrive on this ingress."""
+    reasons such as ``provider_lost`` never arrive on this ingress.
+    It is a teardown fact and may ride ONLY
+    ``state == DISCONNECTED`` (round 26, review-16 item 3 - the same
+    rule :class:`CallStateChangedEvent` enforces: a reason on
+    ``ringing``/``dialing``/``alerting``/``active`` would report why
+    a still-live call ended)."""
 
     line_id: _CheckedLineId
     assignment_id: _CheckedAssignmentId
@@ -2971,6 +3135,17 @@ class ProviderCallStateUpdate(ContractModel):
         case above."""
         if self.call_token is not None and self.lease_id is not None:
             raise ValueError("call_token and lease_id are mutually exclusive")
+        return self
+
+    @model_validator(mode="after")
+    def _reason_only_on_disconnected(self) -> ProviderCallStateUpdate:
+        """``reason`` is a teardown fact - it may ride ONLY
+        ``state == DISCONNECTED`` (round 26, review-16 item 3),
+        mirroring the :class:`CallStateChangedEvent` rule: a reason
+        on a live provider state would report why a still-live call
+        ended."""
+        if self.reason is not None and self.state is not ProviderCallState.DISCONNECTED:
+            raise ValueError("reason is allowed only on state 'disconnected'")
         return self
 
 
@@ -3018,7 +3193,9 @@ class ProviderCapabilityUpdate(ContractModel):
     """Replacement capabilities - same non-empty telecom-only
     invariant as ``ProviderRegistration.caps`` (round 24, review-13
     M3)."""
-    profile: str | None = None
+    profile: str | None = Field(default=None, min_length=1, max_length=MAX_PROFILE_LEN)
+    """Bounded when present (round 26, review-16 item 4): same
+    ``1..MAX_PROFILE_LEN`` rule as :attr:`ProviderRegistration.profile`."""
 
     @field_validator("caps")
     @classmethod
@@ -3298,8 +3475,17 @@ class LineManager(ABC):
         taken with ``enqueue=True``, a NEW ticket materializes at
         the head and the session learns its ``ticket_id`` inside the
         ``event.queue_updated`` notification (the caller's enqueue
-        wish is honored). ``enqueue=False`` grants are torn down
-        without reissue.
+        wish is honored). The reissue notification is two-channel
+        (round 26, review-16 item 7): the lease teardown itself
+        carries the new ticket id as
+        ``event.call_state_changed{state: "disconnected",
+        reason: "preempted_by_incoming",
+        reissued_ticket_id: <ticket>}`` - see
+        :attr:`CallStateChangedEvent.reissued_ticket_id` - and the
+        ``event.queue_updated{position: 1}`` names the same id, so
+        an agent holding several parallel acquires can correlate
+        which preempted ``lease_id`` became which ``ticket_id``.
+        ``enqueue=False`` grants are torn down without reissue.
 
         Ingress ``seq`` semantics (round 25, review-15 item 7): the
         global monotonic ``QueueTicket.seq`` counter is minted at
@@ -3454,10 +3640,14 @@ class LineManager(ABC):
         """call.send_dtmf: IVR navigation tones; mandatory from v1.
         ``digits`` MUST match ``DTMF_PATTERN`` (<= MAX_DTMF_DIGITS
         chars) - violation is INVALID_ARGUMENT with reason
-        INVALID_DTMF (round 20). INVALID_STATE when the lease has no
-        ACTIVE call - tones are synthesized in-band by the
-        LineProvider (see :class:`ProviderSendDtmfCommand`), so they
-        only make sense mid-call."""
+        INVALID_DTMF (round 20). INVALID_STATE unless the lease is
+        ACTIVE with ``audio_ready`` received, OR ALERTING
+        (early-media IVR - the ``0.3-0.6 s`` ``State=active`` ->
+        SCO-up gap otherwise swallows tones): tones are synthesized
+        in-band by the LineProvider (see
+        :class:`ProviderSendDtmfCommand`), so they only make sense
+        once media can flow (wire contract: docs/api-contract.md,
+        round 26, review-16 item 6)."""
         ...
 
     @abstractmethod
@@ -3470,7 +3660,12 @@ class LineManager(ABC):
         Media tokens are one-shot: a dropped media socket burns its
         token while the lease and the call stay alive, so the agent
         needs a new ``(media_endpoint, media_token)`` pair to
-        re-authenticate ``media.auth{role: "agent"}``.
+        re-authenticate ``media.auth{role: "agent"}``. The reissued
+        pair SUPERSEDES the prior agent-side pair for the lease
+        (round 26, review-16 item 8): the old ``media_token``
+        becomes invalid at issue time - a lease holds a single
+        active pair per role - bounding the replay window to the
+        reissue instant rather than the full pair TTL.
         ``OWNER_MISMATCH`` on a foreign ``(session_id, lease_id)``
         pair; ``STALE_TOKEN`` on a dead/ended lease - a reattach can
         never resurrect a torn-down media path."""
@@ -3554,7 +3749,20 @@ class LineManager(ABC):
         outbox - media tokens are one-shot and do NOT survive a
         socket drop, so the dead session's burned
         ``provider_media_token`` can never authenticate the new
-        media socket.
+        media socket. The reissued pair SUPERSEDES the prior
+        provider-side pair for the lease (round 26, review-16
+        item 8): the old ``media_token`` becomes invalid at issue
+        time - a lease holds a single active pair per role -
+        bounding the replay window to the reissue instant rather
+        than the full pair TTL.
+
+        Dead-binding outbox rule (round 26, review-16 item 9):
+        commands still queued for the binding the reregister
+        replaced are DROPPED fail-closed at
+        :meth:`drain_provider_commands` time - their
+        ``assignment_id`` no longer names the live binding; see
+        the drain contract for the lease-teardown obligation a
+        dropped in-flight ``line.dial``/``line.answer`` carries.
         """
         ...
 
@@ -3831,7 +4039,20 @@ class LineManager(ABC):
         """Atomically drain pending provider commands in emission
         order. The provider adapter executes them idempotently
         (already-gone teardowns are success, §5.4) and MUST drain
-        after EVERY kernel call (round 23, review-12 H2)."""
+        after EVERY kernel call (round 23, review-12 H2).
+
+        Fail-closed drop rule (round 26, review-16 item 9): a
+        command whose ``assignment_id`` names a binding that has
+        since died or been replaced by a ``provider.reregister``
+        is DROPPED, never sent - a dead binding's outbox must not
+        leak onto the live channel. A dropped in-flight
+        ``line.dial``/``line.answer`` still owes its lease a
+        teardown: the adapter MUST feed :meth:`ingest_call_state`
+        with ``state=DISCONNECTED, reason=NETWORK_ERROR`` so the
+        lease ends and the line frees - it can never wedge in
+        DIALING (the dial/accept saga compensates only on OBSERVED
+        send errors, so the drop path must feed the same
+        teardown)."""
         ...
 
 
@@ -3981,6 +4202,16 @@ class LineAdminKernel(ABC):
         ``owner_agent_id`` set) and mints a FRESH ``assignment_id``
         for the new owner/mode pair (rotation, round 24, review-13
         M2 - see :class:`LineAssignment`).
+
+        ``owner_agent_id`` (round 26, review-16 item 14) MUST
+        satisfy the agent-identifier grammar of
+        :func:`_check_agent_id` AND MUST NOT be a ``system:*``
+        identity (:data:`SYSTEM_AGENT_PREFIX`): ``system:*`` names
+        kernel-internal service roles such as
+        :data:`SYSTEM_FALLBACK_WORKER`, never a durable line
+        owner - a system role holds no agent session, so an
+        assignment granted to one could never be exercised or
+        released. Violations are INVALID_ARGUMENT.
 
         Outbox effects (round 25, review-15 batch 2): the kernel
         emits :class:`AssignmentGrantedEvent` to the new owner's
@@ -4178,7 +4409,16 @@ class LineAdminKernel(ABC):
         outright: ``forward.line_id == line_id`` is
         INVALID_ARGUMENT - the line can never be its own forward
         target (the same invariant is model-enforced inside
-        :class:`LineAssignment`). A patched
+        :class:`LineAssignment`). A TRANSITIVE cycle is likewise
+        rejected (round 26, review-16 item 2;
+        docs/specs/line-manager.md): a ``forward_via_line`` policy
+        that would close a chain ``A -> B -> ... -> A`` is
+        INVALID_ARGUMENT - the kernel MUST walk the stored policy
+        chain of the target lines, bounded at
+        :data:`MAX_FORWARD_HOPS` hops, so a deeper or closed chain
+        can never hang the FallbackWorker in a forwarding loop
+        (the multi-line case the model-level self-loop check
+        cannot see). A patched
         ``heartbeat_interval_sec`` takes effect on the provider's
         next reregister, never mid-session (see
         :class:`TimeoutConfig`).
@@ -4231,5 +4471,12 @@ class LineAdminKernel(ABC):
         connections - so an admin ``revoke_assignment`` whose outbox
         ``ProviderRevokeCommand`` is drained by the admin adapter
         still reaches the provider's own channel exactly once. MUST
-        be called after EVERY kernel call."""
+        be called after EVERY kernel call.
+
+        The same fail-closed drop rule applies here (round 26,
+        review-16 item 9): commands for a binding that died or was
+        replaced by a ``provider.reregister`` are dropped, and a
+        dropped in-flight ``line.dial``/``line.answer`` tears its
+        lease down via ``ingest_call_state(DISCONNECTED,
+        NETWORK_ERROR)`` - see :meth:`LineManager.drain_provider_commands`."""
         ...

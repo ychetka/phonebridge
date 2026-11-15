@@ -24,12 +24,15 @@ from phonebridge.domain.contract import (
     DTMF_PATTERN,
     ERROR_CODE_WIRE,
     EVENT_AUDIENCE_SCOPES,
+    EVENT_PAYLOAD_TYPES,
     EVENT_WIRE_NAMES,
     MAX_DTMF_DIGITS,
+    MAX_FORWARD_HOPS,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_LEASES_PER_SESSION,
     MAX_PENDING_CLAIMS_PER_AGENT,
     MAX_PENDING_CLAIMS_TOTAL,
+    MAX_PROFILE_LEN,
     MAX_PROVIDER_META_ENTRIES,
     MAX_PROVIDER_META_KEY_LEN,
     MAX_PROVIDER_META_VALUE_LEN,
@@ -208,6 +211,10 @@ def test_public_surface_exists(_gwt: object) -> None:
         "reachable",
         "ws_disconnected",
         "unreachable",
+        # Round 26 (review-16 item 13): the derived provider-less
+        # listing state - reported by LineSummary only, never by a
+        # binding/liveness fact.
+        "unbound",
     }
     assert {p.value for p in CallPhase} == {
         "acquired",
@@ -1069,6 +1076,10 @@ class _FakeLineManager(LineManager):
                 line_id=LineId("line-main"),
                 caps=[Intent.DIAL_OUT],
                 state=LineState.FREE,
+                # Round 26 (review-16 item 13): non-empty caps require
+                # a bound liveness - the new UNBOUND default is for
+                # provider-less rows only.
+                liveness=LivenessState.REACHABLE,
             )
         ]
 
@@ -2367,9 +2378,16 @@ def test_system_agent_identity_and_id_hygiene() -> None:
         with pytest.raises(ValidationError):
             AgentAudience(agent_id=bad)
     # "default" is an API-boundary alias, never a domain line_id.
+    # (REACHABLE liveness keeps non-empty caps legal so the ONLY
+    # failure under test is the line_id itself, round 26 item 13.)
     for bad_line in ("default", "", "line:x", "x" * 129):
         with pytest.raises(ValidationError):
-            LineSummary(line_id=LineId(bad_line), caps=[Intent.DIAL_OUT], state=LineState.FREE)
+            LineSummary(
+                line_id=LineId(bad_line),
+                caps=[Intent.DIAL_OUT],
+                state=LineState.FREE,
+                liveness=LivenessState.REACHABLE,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2487,10 +2505,19 @@ def test_line_health_changed_event() -> None:
             old_state=LivenessState.REACHABLE,
             new_state=LivenessState.REACHABLE,
         )
-    # LineSummary carries the separate liveness column with a
-    # REACHABLE default for unbound/pool lines.
-    row = LineSummary(line_id=LineId("line-main"), caps=[Intent.DIAL_OUT], state=LineState.BUSY)
-    assert row.liveness is LivenessState.REACHABLE
+    # LineSummary carries the separate liveness column. Round 26
+    # (review-16 item 13): the default is the derived UNBOUND state
+    # for provider-less rows - which requires caps == () - while a
+    # bound line reports the binding's health and mirrors its caps.
+    row = LineSummary(line_id=LineId("line-pool"), caps=(), state=LineState.FREE)
+    assert row.liveness is LivenessState.UNBOUND
+    bound = LineSummary(
+        line_id=LineId("line-main"),
+        caps=[Intent.DIAL_OUT],
+        state=LineState.BUSY,
+        liveness=LivenessState.REACHABLE,
+    )
+    assert bound.liveness is LivenessState.REACHABLE
 
 
 def test_queue_cancelled_event() -> None:
@@ -2919,10 +2946,14 @@ def test_cross_field_validators_batch3() -> None:
             LineSummary(line_id=LineId("line-main"), caps=bad_caps, state=LineState.FREE)
     unbound = LineSummary(line_id=LineId("line-pool"), caps=(), state=LineState.FREE)
     assert unbound.caps == ()
+    # Round 26 (review-16 item 13): an unbound/pool line reports
+    # neither caps nor health - UNBOUND is the liveness default.
+    assert unbound.liveness is LivenessState.UNBOUND
     summary = LineSummary(
         line_id=LineId("line-main"),
         caps=[Intent.DIAL_OUT, Intent.RECEIVE_INBOUND],
         state=LineState.FREE,
+        liveness=LivenessState.REACHABLE,
     )
     assert summary.liveness is LivenessState.REACHABLE
 
@@ -3041,3 +3072,251 @@ def test_ring_drain_and_max_call_duration_timeouts() -> None:
             LineTimeouts(max_call_duration_sec=bad)
         with pytest.raises(ValidationError):
             TimeoutConfig(max_call_duration_sec=bad)
+
+
+# ---------------------------------------------------------------------------
+# Round 26 (architect review 16 - SA_carbon_review_16), Phase-0 contract
+# hardening - item 1 event payload-type map, item 2 forward-cycle hop
+# bound, item 3 provider reason scoping, item 4 profile bound, item 5
+# checked free_lines, item 13 UNBOUND liveness.
+# ---------------------------------------------------------------------------
+
+
+def test_event_payload_types_map() -> None:
+    """Round 26 (review-16 item 1): EVENT_PAYLOAD_TYPES covers every
+    EventName and agrees with the doc-verified payload table - and
+    EventEnvelope rejects a ``(name, payload)`` mismatch, so a PII
+    payload can never ride a broadcast-legal name."""
+    assert set(EVENT_PAYLOAD_TYPES) == set(EventName)
+    # Same mapping the doc-table parity test verifies (no drift
+    # between the two tables).
+    assert EVENT_PAYLOAD_TYPES == EVENT_PAYLOAD_MODELS
+    for model in EVENT_PAYLOAD_TYPES.values():
+        assert issubclass(model, contract.ContractModel)
+
+    # A mis-typed pair is rejected even when the audience scope
+    # itself is legal for the name: a broadcast-legal name carrying
+    # caller-PII payload.
+    with pytest.raises(ValidationError):
+        EventEnvelope[IncomingCallEvent](
+            name=EventName.LINE_STATE_CHANGED,
+            audience=BroadcastAudience(),
+            emitted_at=NOW_UTC,
+            payload=IncomingCallEvent(
+                line_id=LineId("line-main"),
+                call_token=CallToken(RedactedString("tok-1")),
+                caller_id=RedactedString(_RAW_NUMBER),
+                expires_at=NOW_UTC,
+            ),
+        )
+    # And the converse: a session/agent-legal name carrying a
+    # broadcast-only payload model.
+    with pytest.raises(ValidationError):
+        EventEnvelope[LineStateChangedEvent](
+            name=EventName.INCOMING_CALL,
+            audience=AgentAudience(agent_id="agent-1"),
+            emitted_at=NOW_UTC,
+            payload=LineStateChangedEvent(
+                line_id=LineId("line-main"),
+                old_state=LineState.FREE,
+                new_state=LineState.BUSY,
+            ),
+        )
+    # A matching pair still constructs.
+    EventEnvelope[LineStateChangedEvent](
+        name=EventName.LINE_STATE_CHANGED,
+        audience=BroadcastAudience(),
+        emitted_at=NOW_UTC,
+        payload=LineStateChangedEvent(
+            line_id=LineId("line-main"),
+            old_state=LineState.FREE,
+            new_state=LineState.BUSY,
+        ),
+    )
+
+
+def test_provider_call_state_reason_scoping() -> None:
+    """Round 26 (review-16 item 3): the provider-side ``reason``
+    mirrors the CallStateChangedEvent rule - it may ride only
+    ``state == DISCONNECTED``; a reason on a live state would
+    report why a still-live call ended."""
+    base: dict[str, Any] = {
+        "line_id": LineId("line-main"),
+        "assignment_id": contract.AssignmentId("bind-1"),
+        "lease_id": LeaseId("l-1"),
+        "observed_at": NOW_UTC,
+    }
+    ProviderCallStateUpdate(
+        **base,
+        state=ProviderCallState.DISCONNECTED,
+        reason=ProviderDisconnectReason.NORMAL,
+    )
+    ProviderCallStateUpdate(**base, state=ProviderCallState.DISCONNECTED)  # reason optional
+    for live_state in (
+        ProviderCallState.RINGING,
+        ProviderCallState.DIALING,
+        ProviderCallState.ALERTING,
+        ProviderCallState.ACTIVE,
+    ):
+        with pytest.raises(ValidationError):
+            ProviderCallStateUpdate(
+                **base, state=live_state, reason=ProviderDisconnectReason.NORMAL
+            )
+
+
+def test_profile_bounds() -> None:
+    """Round 26 (review-16 item 4): ``profile`` is bounded to
+    ``1..MAX_PROFILE_LEN`` chars when present - on
+    ProviderRegistration, ProviderCapabilityUpdate AND the
+    LineSummary mirror (the mirror shares the bound)."""
+    assert MAX_PROFILE_LEN == 128
+    overlong = "p" * (MAX_PROFILE_LEN + 1)
+    reg_base: dict[str, Any] = {
+        "line_id": LineId("line-main"),
+        "token": RedactedString("tok"),
+        "caps": [Intent.DIAL_OUT],
+    }
+    cap_base: dict[str, Any] = {
+        "line_id": LineId("line-main"),
+        "assignment_id": contract.AssignmentId("bind-1"),
+        "caps": [Intent.DIAL_OUT],
+    }
+    sum_base: dict[str, Any] = {
+        "line_id": LineId("line-main"),
+        "caps": [Intent.DIAL_OUT],
+        "state": LineState.FREE,
+        "liveness": LivenessState.REACHABLE,
+    }
+    # Overlong AND empty are rejected on all three carriers.
+    for bad in (overlong, ""):
+        with pytest.raises(ValidationError):
+            ProviderRegistration(**reg_base, profile=bad)
+        with pytest.raises(ValidationError):
+            ProviderCapabilityUpdate(**cap_base, profile=bad)
+        with pytest.raises(ValidationError):
+            LineSummary(**sum_base, profile=bad)
+    # Valid labels - including the boundary length - are legal.
+    assert (
+        ProviderRegistration(**reg_base, profile="p" * MAX_PROFILE_LEN).profile
+        == "p" * MAX_PROFILE_LEN
+    )
+    assert ProviderCapabilityUpdate(**cap_base, profile="secretary").profile == "secretary"
+    assert LineSummary(**sum_base, profile="front desk").profile == "front desk"
+    # None stays the "no profile" state on all three.
+    assert ProviderRegistration(**reg_base).profile is None
+    assert ProviderCapabilityUpdate(**cap_base).profile is None
+    assert LineSummary(**sum_base).profile is None
+
+
+def test_free_lines_checked_line_ids() -> None:
+    """Round 26 (review-16 item 5): ``free_lines`` entries go
+    through ``_check_line_id`` on BOTH ErrorData and
+    AcquireRefused - a colon-bearing, empty, overlong or
+    ``"default"`` entry can never be echoed back to the wire."""
+    ok = ErrorData(free_lines=[LineId("line-a"), LineId("line-b")])
+    assert ok.free_lines == (LineId("line-a"), LineId("line-b"))
+    assert AcquireRefused(free_lines=[LineId("line-a")]).free_lines == (LineId("line-a"),)
+    adapter = TypeAdapter(AcquireResult)
+    refused = adapter.validate_python({"granted": False, "free_lines": ["line-a"]})
+    assert isinstance(refused, AcquireRefused)
+    assert refused.free_lines == (LineId("line-a"),)
+    # Colon-bearing (incl. whitespace+colon), empty, overlong and
+    # the API-boundary alias are all rejected.
+    for bad in ("line:x", " :x", "", "x" * 129, "default"):
+        with pytest.raises(ValidationError):
+            ErrorData(free_lines=[LineId(bad)])
+        with pytest.raises(ValidationError):
+            AcquireRefused(free_lines=[LineId(bad)])
+
+
+def test_liveness_unbound_state() -> None:
+    """Round 26 (review-16 item 13): UNBOUND is the derived
+    provider-less listing state - LineSummary defaults to it, caps
+    is non-empty IFF liveness differs from it, and UNBOUND can
+    never appear as a reported fact (ProviderLiveness) or a
+    transition endpoint (LineHealthChangedEvent)."""
+    assert LivenessState.UNBOUND.value == "unbound"
+
+    # The default listing row: a provider-less line reports neither
+    # caps nor health.
+    row = LineSummary(line_id=LineId("line-pool"), caps=(), state=LineState.FREE)
+    assert row.liveness is LivenessState.UNBOUND
+
+    # caps<->liveness IFF: a bound line mirrors non-empty caps.
+    bound = LineSummary(
+        line_id=LineId("line-main"),
+        caps=[Intent.DIAL_OUT],
+        state=LineState.FREE,
+        liveness=LivenessState.REACHABLE,
+    )
+    assert bound.liveness is LivenessState.REACHABLE
+    for health in (
+        LivenessState.REACHABLE,
+        LivenessState.WS_DISCONNECTED,
+        LivenessState.UNREACHABLE,
+    ):
+        LineSummary(
+            line_id=LineId("line-main"),
+            caps=[Intent.DIAL_OUT],
+            state=LineState.FREE,
+            liveness=health,
+        )
+        # Empty caps on a bound line is rejected.
+        with pytest.raises(ValidationError):
+            LineSummary(
+                line_id=LineId("line-main"),
+                caps=(),
+                state=LineState.FREE,
+                liveness=health,
+            )
+    # Non-empty caps on an unbound line is rejected.
+    with pytest.raises(ValidationError):
+        LineSummary(
+            line_id=LineId("line-main"),
+            caps=[Intent.DIAL_OUT],
+            state=LineState.FREE,
+            liveness=LivenessState.UNBOUND,
+        )
+
+    # Same-item follow-up: UNBOUND forces state == FREE - a
+    # provider-less line can hold no call, so BUSY and
+    # RINGING_LOCKED occupancy rows are unconstructible.
+    for occupied in (LineState.BUSY, LineState.RINGING_LOCKED):
+        with pytest.raises(ValidationError):
+            LineSummary(
+                line_id=LineId("line-pool"),
+                caps=(),
+                state=occupied,
+                liveness=LivenessState.UNBOUND,
+            )
+
+    # A liveness REPORT always comes from an attached binding -
+    # UNBOUND is never a reported fact.
+    with pytest.raises(ValidationError):
+        ProviderLiveness(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            state=LivenessState.UNBOUND,
+            checked_at=NOW_UTC,
+        )
+
+    # Transitions on a bound provider never produce UNBOUND -
+    # binding revocation surfaces UNREACHABLE.
+    for old, new in (
+        (LivenessState.REACHABLE, LivenessState.UNBOUND),
+        (LivenessState.UNBOUND, LivenessState.REACHABLE),
+        (LivenessState.UNREACHABLE, LivenessState.UNBOUND),
+    ):
+        with pytest.raises(ValidationError):
+            LineHealthChangedEvent(line_id=LineId("line-main"), old_state=old, new_state=new)
+
+
+def test_max_forward_hops_constant() -> None:
+    """Round 26 (review-16 item 2): the transitive forward-chain
+    walk the kernel MUST perform in ``configure_line`` is bounded -
+    MAX_FORWARD_HOPS pins the hop ceiling (docs/specs/
+    line-manager.md)."""
+    assert MAX_FORWARD_HOPS == 8
+    assert "MAX_FORWARD_HOPS" in contract.__all__
+    assert "MAX_PROFILE_LEN" in contract.__all__
+    assert "EVENT_PAYLOAD_TYPES" in contract.__all__
