@@ -63,7 +63,7 @@ monotonic counter assigned by each sender independently
 | kind | direction | payload |
 |---|---|---|
 | `0x01` HCI_PASSTHRU | both | HCI packet prefixed with its H4 type byte (`0x01` cmd / `0x02` ACL / `0x04` evt); the byte is synthesized from the USB endpoint class |
-| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the single-use enrollment credential from `agent_token_file`, sent inside the authenticated tunnel only |
+| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the **long-lived per-line pre-shared secret** from `agent_token_file` (round 23 fix — earlier drafts wrongly called it a single-use credential; it is re-presented on EVERY control session, sent inside the authenticated tunnel only). The container validates `token` AND the tunnel peer identity together — WireGuard `/32` peer public key or mTLS client cert CN — both MUST map to the same `line_id`; either check failing rejects the session |
 | `0x11` HELLO_ACK | container→ | `{accepted, line_id, heartbeat_interval_ms, server_time, session_nonce}` or reject+close — `session_nonce` is a fresh `uint32` minted per control session (round 20); the agent MUST echo it in every media-UDP datagram of this session |
 | `0x12` HEARTBEAT | agent→ | `{seq, usb_ok, hci_ok}` every `heartbeat_interval_ms` |
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
@@ -186,6 +186,25 @@ endpoint boundary:
 - verify `payload_len` equals the actual payload size; malformed
   frames are counted, not forwarded.
 
+**Uplink playout jitter buffer (round 23, ADR-B).** UDP media and USB
+isochronous transfers run on different clocks: datagrams arrive with
+network jitter, while the dongle drains the isoc endpoint on a fixed
+air schedule — feeding it straight from the socket produces
+underruns (clicks) and bursts. The agent therefore keeps a small
+bounded playout buffer for uplink SCO (agent→phone direction) of
+**30–45 ms, i.e. 3–6 eSCO packets**, in front of the USB isoc OUT
+endpoint:
+
+- on buffer underrun the agent emits a codec-correct silence frame —
+  the mSBC silence frame for `air_mode == "msbc"`, or `0x55`-filled
+  payload for `air_mode == "cvsd"` — so the air link never starves
+  and the far side hears attenuated silence instead of garbage;
+- on overflow the buffer drops the OLDEST packets (playout must stay
+  near real time; holding stale audio only compounds the delay);
+- the buffer depth and under/overflow counts feed the agent's
+  `STATUS`/telemetry — a persistently underrunning buffer indicates
+  tunnel quality problems, not an agent bug.
+
 ### vhci feeder — SCO handle gate
 
 The split transport means SCO data can outrun the setup event that
@@ -260,8 +279,10 @@ N agent instances.
 # phonebridge hci-agent configuration — example
 line_id: "line-kitchen"            # assigned at line onboarding (admin)
 agent_token_file: "/etc/phonebridge-agent/agent.token"
-                                   # per-line bootstrap credential,
-                                   # sent once in HELLO (see §2)
+                                   # long-lived per-line pre-shared
+                                   # secret, sent in EVERY HELLO and
+                                   # validated together with the
+                                   # tunnel peer identity (see §2/§6)
 
 dongle:
   match:
@@ -346,9 +367,23 @@ every failure source, because a virtual adapter never wedges the kernel.
 
 ## §6. Security notes
 
-- Bootstrap tokens are single-use enrollment credentials; after
-  `HELLO_ACK` the tunnel credential (WG peer key or mTLS cert) is the
-  line identity.
+- `agent.token` is a **long-lived per-line pre-shared secret**
+  (round 23 — NOT a single-use enrollment credential as earlier
+  drafts claimed: the agent has no second credential to rotate to,
+  and the token must survive reboots, tunnel flaps and control
+  session resets). It is sent in every `HELLO` inside the
+  authenticated tunnel, and the container validates it TOGETHER
+  with the tunnel peer identity (WireGuard `/32` peer public key,
+  or the mTLS client cert CN for `direct_mtls`) — identity is the
+  conjunction of BOTH factors bound to the same `line_id`, so a
+  leaked token alone cannot feed a line from a foreign tunnel
+  peer. Rotation is an admin operation (`admin` scope) performed
+  through the keys DB, not a protocol feature.
+- Feeder socket binding (round 23, capability matrix): the
+  container-side `vhci-feeder` binds its control-TCP listener and
+  media-UDP socket ONLY to the tunnel interface IP (`wg0` for the
+  `wireguard` profile) — never to `0.0.0.0` — so the line surface
+  is unreachable except through the authenticated tunnel.
 - WireGuard peer isolation (round 18): the container-side server
   config MUST pin each peer to `AllowedIPs = <peer>/32` and MUST NOT
   forward between peers — a compromised agent host must not be able

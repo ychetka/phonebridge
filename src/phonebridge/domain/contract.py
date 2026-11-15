@@ -54,6 +54,7 @@ __all__ = [
     "DTMF_PATTERN",
     "EVENT_WIRE_NAMES",
     "MAX_DTMF_DIGITS",
+    "MAX_IDEMPOTENCY_KEY_LEN",
     "MAX_PENDING_CLAIMS_PER_AGENT",
     "MAX_PENDING_CLAIMS_TOTAL",
     "MAX_PROVIDER_META_ENTRIES",
@@ -65,6 +66,7 @@ __all__ = [
     "AcquireQueued",
     "AcquireRefused",
     "AcquireResult",
+    "AdminAudience",
     "AgentAudience",
     "AnswerAndAnnounceFallback",
     "AnswerConfidence",
@@ -94,6 +96,7 @@ __all__ = [
     "FallbackPolicy",
     "FallbackTriggeredEvent",
     "ForwardViaLineFallback",
+    "IdleAlertEvent",
     "IncomingCallEvent",
     "IncomingRingIngress",
     "Intent",
@@ -432,6 +435,7 @@ class EventName(str, Enum):
     FALLBACK_TRIGGERED = "fallback_triggered"
     LINE_STATE_CHANGED = "line_state_changed"
     MISSED_CALL = "missed_call"
+    IDLE_ALERT = "idle_alert"
 
 
 EVENT_WIRE_NAMES: dict[EventName, str] = {
@@ -444,6 +448,7 @@ EVENT_WIRE_NAMES: dict[EventName, str] = {
     EventName.FALLBACK_TRIGGERED: "event.fallback_triggered",
     EventName.LINE_STATE_CHANGED: "event.line_state_changed",
     EventName.MISSED_CALL: "event.missed_call",
+    EventName.IDLE_ALERT: "event.idle_alert",
 }
 """Authoritative domain→wire event mapping (round 19b).
 
@@ -490,6 +495,12 @@ DTMF_PATTERN: re.Pattern[str] = re.compile(rf"^[0-9A-D*#,wW]{{1,{MAX_DTMF_DIGITS
 `#`, plus pause commands `,`/`w`/`W` (~500 ms pause each); length
 bound derives from MAX_DTMF_DIGITS. Violation -> INVALID_ARGUMENT +
 ErrorReason.INVALID_DTMF."""
+
+MAX_IDEMPOTENCY_KEY_LEN: int = 128
+"""Upper bound on an ``idempotency_key`` (round 23, review-12 M2;
+CODING_HAZARDS rule 7 on an external agent input): when present the
+key is a non-empty string of at most 128 chars - an empty or
+overlong key is INVALID_ARGUMENT at the boundary."""
 
 MAX_PENDING_CLAIMS_PER_AGENT: int = 8
 """Bounded pending ``call.claim_exclusive`` requests per agent
@@ -632,7 +643,26 @@ class RedactedString:
 
 
 def _mask_for_log(value: Any) -> Any:
-    """Recursively replace RedactedString with its masked string form."""
+    """Recursively replace RedactedString with its masked string form
+    and normalize every other value to a JSON-serializable scalar
+    (round 23, review-12 H1).
+
+    ``safe_dump()``/``to_log_dict()`` feed JSON loggers directly:
+    ``json.dumps(model.to_log_dict())`` MUST always succeed. A
+    ``model_dump()`` in ``"python"`` mode leaves ``datetime``,
+    ``timedelta`` and ``Enum`` members as live Python objects that
+    ``json.dumps`` cannot serialize (str-valued enums happen to
+    survive; datetime/timedelta crash it outright) - they are
+    converted here instead of relying on the ``"json"`` mode
+    serializer, which would emit the RAW ``RedactedString`` wire
+    value and leak PII into logs. Conversions:
+
+    - ``datetime`` -> ``.isoformat()`` (already normalized to aware
+      UTC by ``AwareDatetime`` validation);
+    - ``timedelta`` -> ``.total_seconds()``;
+    - ``Enum`` -> ``.value``;
+    - ``set``/``frozenset`` -> deterministically sorted list.
+    """
     if isinstance(value, RedactedString):
         return str(value)
     if isinstance(value, dict):
@@ -641,6 +671,12 @@ def _mask_for_log(value: Any) -> Any:
         return [_mask_for_log(v) for v in value]
     if isinstance(value, (set, frozenset)):
         return [_mask_for_log(v) for v in sorted(value, key=str)]
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return value.total_seconds()
     return value
 
 
@@ -736,10 +772,28 @@ class RejectFallback(ContractModel):
 
 
 class ForwardViaLineFallback(ContractModel):
-    """Worker policy: dial OUT on another line and bridge the call."""
+    """Worker policy: dial OUT on another line and bridge the call.
+
+    ``line_id`` selects the line the FallbackWorker dials THROUGH;
+    ``target_number``/``target_country`` (round 23, review-12 C2)
+    carry WHERE the call is forwarded - the FallbackWorker connects
+    via the standard agent API only (ADR-01) and has no admin scope
+    to query line config, so the policy model itself MUST carry the
+    full dial target (same ``number`` + ``country`` pair semantics
+    as ``call.dial``: ``target_number`` is a strict-E.164
+    RedactedString, ``target_country`` the ISO 3166-1 alpha-2
+    cross-check assertion; both are pre-validated at
+    ``configure_line`` time).
+
+    ``configure_line`` MUST reject a self-loop: ``line_id`` equal to
+    the line being configured would bridge the ring onto itself.
+    Wire config spelling:
+    ``forward_via_line:<line_id>:<e164_number>:<country>``."""
 
     policy: Literal["forward_via_line"] = "forward_via_line"
     line_id: LineId
+    target_number: RedactedString
+    target_country: str
 
 
 class RecordAndTelegramFallback(ContractModel):
@@ -939,7 +993,13 @@ class QueueTicket(ContractModel):
     intent: Intent
     preferred_line_id: LineId | None = None
     enqueued_at: AwareDatetime
-    idempotency_key: str | None = None
+    idempotency_key: str | None = Field(
+        default=None, min_length=1, max_length=MAX_IDEMPOTENCY_KEY_LEN
+    )
+    """Bounded when present (round 23, review-12 M2): a key is either
+    absent (no dedup - every call is independent) or a non-empty
+    string of at most ``MAX_IDEMPOTENCY_KEY_LEN`` chars; an empty or
+    overlong key is rejected as INVALID_ARGUMENT at the boundary."""
 
     def __lt__(self, other: object) -> bool:
         if not isinstance(other, QueueTicket):
@@ -1118,12 +1178,29 @@ class ProviderHangupCommand(ContractModel):
     """Tear down a call on a bound provider (oFono Hangup). Reaching a
     provider that already tore the call down ("method doesn't exist"
     racing remote teardown) MUST be treated as idempotent success,
-    verified via GetCalls/HangupAll (§5.4)."""
+    verified via GetCalls/HangupAll (§5.4).
+
+    Exactly ONE target (round 23, review-12 C1): ``lease_id`` tears
+    down an established lease-bound call; ``call_token`` REJECTS a
+    still-unanswered inbound ring - no ``lease_id`` exists before
+    ``call.accept``/``line.answer``, so a ``RejectFallback`` on
+    accept-window expiry could otherwise never reach the wire.
+    oFono covers both shapes with the same ``VoiceCall.Hangup`` on
+    the ringing/active call object, so one wire method serves both."""
 
     command: Literal["hangup"] = "hangup"
     line_id: LineId
     assignment_id: AssignmentId
-    lease_id: LeaseId
+    lease_id: LeaseId | None = None
+    call_token: CallToken | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_target(self) -> ProviderHangupCommand:
+        """XOR: exactly one of ``lease_id``/``call_token`` - zero
+        leaves the provider nothing to correlate, two is ambiguous."""
+        if (self.lease_id is None) == (self.call_token is None):
+            raise ValueError("exactly one of lease_id / call_token is required")
+        return self
 
 
 class ProviderSendDtmfCommand(ContractModel):
@@ -1268,8 +1345,20 @@ class SessionAudience(ContractModel):
     session_id: SessionId
 
 
+class AdminAudience(ContractModel):
+    """Admin-observable events only (round 23, review-12 H6/M6):
+    ``idle_alert`` escalations are routed to admin-scope subscribers
+    and the configured escalation channels (e.g. Telegram), never to
+    ordinary agent sessions - an idle exclusive line is an
+    operational signal, not an agent fact. Used ONLY for
+    alert-only/administrative events; nothing about a call or a
+    lease routes here."""
+
+    scope: Literal["admin"] = "admin"
+
+
 EventAudience = Annotated[
-    BroadcastAudience | AgentAudience | SessionAudience,
+    BroadcastAudience | AgentAudience | SessionAudience | AdminAudience,
     Field(discriminator="scope"),
 ]
 """Discriminated union of event routing targets (round 21, HIGH-4).
@@ -1324,13 +1413,22 @@ class CallStateChangedEvent(ContractModel):
     (round-21 review): it carries BOTH provider-reported teardowns
     (relayed from ``provider.call_state.reason``) and gateway-minted
     ones (``provider_lost``, ``grant_ttl_expired``,
-    ``preempted_by_incoming``, ...)."""
+    ``preempted_by_incoming``, ...).
+    ``reissued_ticket_id`` (round 23, review-12 M2) is set only on a
+    ``preempted_by_incoming`` teardown of an IMMEDIATE grant that was
+    taken with ``enqueue=True``: the kernel materializes a NEW ticket
+    at the queue head and reports its ``ticket_id`` here, so an agent
+    holding several parallel acquires can correlate which preempted
+    ``lease_id`` became which ticket (the matching
+    ``event.queue_updated{position: 1}`` names the same id). ``None``
+    on every other path."""
 
     lease_id: LeaseId
     line_id: LineId
     state: WireCallState
     reason: CallEndReason | None = None
     answer_confidence: AnswerConfidence | None = None
+    reissued_ticket_id: TicketId | None = None
 
 
 class QueueReadyEvent(ContractModel):
@@ -1367,8 +1465,12 @@ class QueueUpdatedEvent(ContractModel):
 
 class AssignmentRevokedEvent(ContractModel):
     """assignment_revoked payload: a durable AGENT-owned
-    ``LineAssignment`` ended (owner ``call.release{assignment_id}``,
-    admin ``revoke_assignment``, or idle escalation). Round 22
+    ``LineAssignment`` ended (owner ``call.release{assignment_id}``
+    or admin ``revoke_assignment``). Idle ``idle_revoke_after``
+    expiry NEVER emits this event - it is alert-only and surfaces as
+    :class:`IdleAlertEvent` instead (round 23, review-12 H6: the
+    earlier "idle escalation" wording implied an auto-revoke the
+    alert-only rule forbids). Round 22
     (review-10 HIGH-6) makes ``owner_agent_id`` REQUIRED: this event
     is emitted ONLY for an ``EXCLUSIVE`` agent assignment and is
     delivered to that owner's session(s) via ``AgentAudience`` -
@@ -1406,12 +1508,17 @@ class FallbackTriggeredEvent(ContractModel):
     needs the ``policy`` field, which ``incoming_call`` cannot
     carry). ``call_token`` is the internal fallback_call_token
     re-issued after accept-window expiry - single-use, TTL-bound,
-    bypasses the exclusive-owner check."""
+    bypasses the exclusive-owner check. ``expires_at`` (round 23,
+    review-12 M6) is the absolute deadline the worker has to
+    ``call.accept`` the re-issued token - bounded by the line's
+    ``fallback_accept_ttl_sec`` knob (~10 s), so a dead or wedged
+    FallbackWorker can never hold a ring open indefinitely."""
 
     line_id: LineId
     call_token: CallToken
     caller_id: RedactedString | None = None
     policy: FallbackPolicy
+    expires_at: AwareDatetime
 
 
 class LineStateChangedEvent(ContractModel):
@@ -1438,6 +1545,28 @@ class MissedCallEvent(ContractModel):
     caller_id: RedactedString | None = None
     reason: CallEndReason
     voicemail_ref: str | None = None
+
+
+class IdleAlertEvent(ContractModel):
+    """idle_alert payload (round 23, review-12 H6/M6): an EXCLUSIVE
+    ``LineAssignment`` has been idle past ``idle_revoke_after``.
+
+    STRICTLY alert-only: the event is an escalation signal routed to
+    admin-scope subscribers and configured escalation channels via
+    :class:`AdminAudience` - it NEVER implies a revoke (an exclusive
+    line is never silently reassigned by the machine, design §12
+    resolved question). The earlier "idle escalation" wording on
+    ``assignment_revoked`` was removed for the same reason:
+    ``AssignmentRevokedEvent`` fires ONLY on explicit revoke paths
+    (owner release, admin revoke). Emitted at most once per
+    continuous idle period - ``tick(now)`` records the alert so a
+    still-idle line does not re-alert on every tick until activity
+    resets the window."""
+
+    assignment_id: AssignmentId
+    line_id: LineId
+    owner_agent_id: str
+    idle_since: AwareDatetime
 
 
 # ---------------------------------------------------------------------------
@@ -1624,10 +1753,15 @@ class ProviderCapabilityUpdate(ContractModel):
 class FallbackDecision(ContractModel):
     """Result of the fallback policy decision point (§5.3).
 
-    LineManager calls decide_fallback() when the accept window expires
-    (or no subscribed/owner agent exists); the returned policy is then
-    executed - core policies inside LineManager, worker policies by the
-    internal FallbackWorker via the standard agent API (ADR-01)."""
+    LineManager calls decide_fallback() when the accept window
+    expires; the returned policy is then executed - core policies
+    inside LineManager, worker policies by the internal
+    FallbackWorker via the standard agent API (ADR-01). A line with
+    ZERO live subscribed/owner sessions still waits the full
+    ``accept_window_sec`` first (round 23, review-12 H6): wake-and-
+    grant hooks (webhook/exec) exist precisely to wake a sleeping
+    agent inside that window, so "no live session right now" is NOT
+    an immediate-fallback trigger."""
 
     line_id: LineId
     call_token: CallToken
@@ -1669,14 +1803,40 @@ class Clock(Protocol):
 
 
 class MediaAllocator(Protocol):
-    """Issues the per-lease media credential pair (round 21,
-    CRITICAL-2): the endpoint plus the two independent one-time
-    tokens of :class:`MediaCredentials`. The kernel calls
-    ``allocate`` at grant/accept time and splits the pair - agent
-    token into the agent result, provider token into the outbox
-    command."""
+    """Owns the per-lease media port lifecycle (round 21, CRITICAL-2;
+    lifecycle corrected round 23, review-12 C3).
+
+    ``allocate`` issues the endpoint plus the two independent
+    one-time tokens of :class:`MediaCredentials`. The kernel calls
+    ``allocate`` strictly inside ``dial()`` and ``accept()`` - NOT
+    at grant time: the ``media_token`` pair TTL (~5 s) is comparable
+    to ``grant_ttl_sec``, so allocating at ``AcquireGranted`` /
+    ``queue_ready`` would let tokens expire before ``call.dial``
+    fires, and a preempted or TTL-expired grant would strand live
+    tokens in the router. The kernel splits the pair - agent token
+    into the agent result, provider token into the outbox command.
+
+    ``revoke`` closes the port: no socket may outlive its
+    ``lease_id``, so the kernel calls it on EVERY
+    ``CallLease -> ENDED`` transition (hangup, release,
+    ``disconnected``, ``drop_session`` teardown, dongle/provider
+    loss, ``tick()`` expiry, assignment revoke) - the outbox events
+    alone cannot close the MediaRouter's sockets because the router
+    sees no event stream. Idempotent and synchronous: revoking an
+    already-closed or never-allocated ``lease_id`` is a no-op, and
+    the call performs no network await (rule 4).
+
+    (The port-like name ``MediaPort`` was considered in round 23;
+    ``MediaAllocator`` is kept to avoid a public-surface rename -
+    the lifecycle contract above is what M3 implements.)"""
 
     def allocate(self, lease_id: LeaseId, line_id: LineId) -> MediaCredentials: ...
+
+    def revoke(self, lease_id: LeaseId) -> None:
+        """Close every media socket/credential bound to ``lease_id``.
+        Called on every ``CallLease -> ENDED``; idempotent - a
+        second revoke (or a lease that never allocated) is a no-op."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -1846,7 +2006,19 @@ class LineManager(ABC):
         the transport adapter (round 15). OWNER_MISMATCH /
         PROVIDER_UNREACHABLE / DIAL_REJECTED apply; a duplicate dial on
         one lease is rejected with INVALID_STATE (round 20 - the
-        INVALID_CALL_STATE case no longer rides STALE_TOKEN)."""
+        INVALID_CALL_STATE case no longer rides STALE_TOKEN).
+
+        Provider-side compensation (Saga, round 23, review-12 H3):
+        ``dial()`` itself performs no network await - it transitions
+        the lease to DIALING, enqueues ``ProviderDialCommand`` and
+        returns ``DialResult`` immediately (the agent answer does NOT
+        wait for the provider). The adapter then sends ``line.dial``
+        and MUST await the provider's ``{accepted}`` reply with a
+        bounded deadline (~2 s). On ``{accepted: false}``, a timeout,
+        or a transport error the adapter MUST compensate by calling
+        :meth:`ingest_call_state` with ``state=DISCONNECTED,
+        reason=NETWORK_ERROR`` so the lease ends atomically and the
+        line frees - a lease can never wedge in DIALING forever."""
         ...
 
     @abstractmethod
@@ -1863,7 +2035,17 @@ class LineManager(ABC):
         (INVALID_INTENT otherwise). The ``system:fallback_worker``
         session is exempt: it accepts with the single-use
         ``fallback_call_token`` minted for it at accept-window
-        expiry."""
+        expiry (itself bounded by ``fallback_accept_ttl_sec``,
+        round 23).
+
+        Provider-side compensation (Saga, round 23, review-12 H3):
+        same rule as :meth:`dial` - ``accept()`` mints the lease and
+        enqueues ``ProviderAnswerCommand`` without a network await;
+        the adapter awaits the provider's ``{accepted}`` on
+        ``line.answer`` with a ~2 s deadline and on
+        ``{accepted: false}`` / timeout / transport error MUST feed
+        :meth:`ingest_call_state` ``(DISCONNECTED, NETWORK_ERROR)``
+        to close the lease and free the line."""
         ...
 
     @abstractmethod
@@ -2007,10 +2189,14 @@ class LineManager(ABC):
     @abstractmethod
     async def decide_fallback(self, line_id: LineId, call_token: CallToken) -> FallbackDecision:
         """Fallback POLICY DECISION point (§5.3): on accept-window
-        expiry or no subscribed/owner agent, resolve the line's
-        fallback_policy into a concrete decision. Policy selection is
-        domain concern; EXECUTION is internal (core ops inline, worker
-        policies via FallbackWorker over the agent API - ADR-01)."""
+        expiry, resolve the line's fallback_policy into a concrete
+        decision. Policy selection is domain concern; EXECUTION is
+        internal (core ops inline, worker policies via FallbackWorker
+        over the agent API - ADR-01). The window ALWAYS elapses first:
+        even with zero live subscribed/owner sessions the kernel waits
+        the full ``accept_window_sec`` so configured wake-and-grant
+        hooks can wake a sleeping agent (round 23, review-12 H6) -
+        "no live session" is never an immediate-fallback trigger."""
         ...
 
     # --- agent session lifecycle ---
@@ -2070,19 +2256,48 @@ class LineManager(ABC):
     # ProviderCommands to the provider adapter. Ordering is
     # deterministic (mutation order); the bounded capacity turns an
     # overflow into RESOURCE_EXHAUSTED rather than unbounded growth.
+    #
+    # Overflow model (round 23, review-12 H2 / ADR-C): a two-level
+    # limit replaces a single hard cap, because an in-memory kernel
+    # has no automatic rollback - a RESOURCE_EXHAUSTED raised after
+    # state dicts were already mutated would leave half-applied
+    # state, and a teardown event refused at a full outbox would
+    # wedge a line BUSY forever.
+    #
+    # * SOFT_CAP (pre-flight): resource-CREATING operations
+    #   (``acquire``, ``dial``, ``accept``, ``claim_exclusive``)
+    #   check remaining outbox capacity BEFORE any state mutation;
+    #   an outbox at/above the soft cap rejects the call with
+    #   RESOURCE_EXHAUSTED while the kernel state is still untouched.
+    #   The rejected agent simply retries.
+    # * Teardown paths NEVER raise RESOURCE_EXHAUSTED:
+    #   ``hangup``, ``release``, ``drop_session``,
+    #   ``ingest_call_state`` teardowns, provider-loss and ``tick()``
+    #   expiries append their events/commands unconditionally
+    #   (reserve-tail capacity - teardown volume is bounded by the
+    #   number of live leases, which is itself bounded).
+    # * Drain contract: the adapter MUST call ``drain_events()`` and
+    #   ``drain_provider_commands()`` after EVERY kernel call before
+    #   yielding to the event loop, so the outbox can never grow
+    #   across mutations and the soft cap is observed on a nearly
+    #   empty buffer in practice.
 
     @abstractmethod
     def drain_events(self) -> list[EventEnvelope[Any]]:
         """Atomically drain pending domain-event envelopes in emission
         order. The EventBus MUST publish ONLY from this queue - a
-        mutation never emits to subscribers directly."""
+        mutation never emits to subscribers directly. MUST be called
+        by the adapter after EVERY kernel call (round 23, review-12
+        H2): the outbox is not allowed to accumulate across
+        mutations."""
         ...
 
     @abstractmethod
     def drain_provider_commands(self) -> list[ProviderCommand]:
         """Atomically drain pending provider commands in emission
         order. The provider adapter executes them idempotently
-        (already-gone teardowns are success, §5.4)."""
+        (already-gone teardowns are success, §5.4) and MUST drain
+        after EVERY kernel call (round 23, review-12 H2)."""
         ...
 
 
@@ -2106,12 +2321,24 @@ class TimeoutConfig(ContractModel):
     ``ProviderBinding.orphan_deadline_at`` (default 10 s, round
     5b/20)."""
     heartbeat_interval_sec: float | None = Field(default=None, gt=0)
-    """Required ``provider.ping`` cadence for the line's binding."""
+    """Required ``provider.ping`` cadence for the line's binding.
+    A runtime change takes effect on the provider's NEXT
+    ``provider.reregister`` - the live provider learns
+    ``heartbeat_interval_ms`` only from the register response, so
+    a patched interval MUST NOT be enforced against the current
+    session (round 23, review-12 H6: shrinking it mid-session
+    would kill a healthy provider on a false ping timeout)."""
     heartbeat_degraded_after: int | None = Field(default=None, ge=1)
     """Missed pings before the line goes DEGRADED."""
     heartbeat_down_after: int | None = Field(default=None, ge=1)
     """Missed pings before the line goes DOWN (must exceed the
     DEGRADED threshold when both are set)."""
+    fallback_accept_ttl_sec: float | None = Field(default=None, gt=0)
+    """Deadline for the FallbackWorker to ``call.accept`` a re-issued
+    ``fallback_call_token`` (round 23, review-12 M6; ~10 s
+    illustrative default): bounds
+    ``FallbackTriggeredEvent.expires_at``, so a dead worker never
+    leaves a ring pending past its TTL."""
 
 
 class LineAdminKernel(ABC):
@@ -2219,6 +2446,19 @@ class LineAdminKernel(ABC):
         HIGH-5) patches the ALERT-ONLY idle-escalation deadline
         already carried on ``LineAssignment``; ``timeouts`` carries
         the remaining runtime knobs (grant TTL, orphan grace,
-        heartbeat DEGRADED/DOWN thresholds) as a partial
-        :class:`TimeoutConfig` patch."""
+        heartbeat DEGRADED/DOWN thresholds, fallback accept TTL) as
+        a partial :class:`TimeoutConfig` patch.
+
+        Fallback-policy validation (round 23, review-12 C2): a
+        ``forward_via_line`` policy is pre-validated HERE, at config
+        time - ``target_number``/``target_country`` go through the
+        same strict-E.164 + ISO alpha-2 + ``allowed_number_types``
+        checks ``call.dial`` applies (INVALID_ARGUMENT /
+        DIAL_REJECTED-class rejections, not a deferred runtime
+        surprise), and a SELF-LOOP is rejected outright:
+        ``forward.line_id == line_id`` is INVALID_ARGUMENT - the
+        line can never be its own forward target. A patched
+        ``heartbeat_interval_sec`` takes effect on the provider's
+        next reregister, never mid-session (see
+        :class:`TimeoutConfig`)."""
         ...

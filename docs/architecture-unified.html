@@ -65,8 +65,8 @@
 <table>
 <tr><th>Who</th><th>What is registered</th><th>Lives while</th></tr>
 <tr><td class="key">Line provider</td><td><code>provider.register{line_id, caps, token}</code> — a "communication channel"</td><td>transport session + ping; lost → DEGRADED→DOWN</td></tr>
-<tr><td class="key">Agent</td><td><code>agent.register_intent{dial_out|receive_inbound|exclusive_line}</code> — an "intention"</td><td>declarative; LineManager resolves intents → LineAssignment</td></tr>
-<tr><td class="key">Line ownership</td><td>LineAssignment (durable, survives sleep) — derived from intent OR admin_pin</td><td>until release / revoke / idle alert</td></tr>
+<tr><td class="key">Agent</td><td><code>agent.register_intent{dial_out|receive_inbound}</code> — an "intention" (exclusive ownership goes through <code>call.claim_exclusive</code>, not an intent — round 21)</td><td>declarative; LineManager resolves intents → LineAssignment</td></tr>
+<tr><td class="key">Line ownership</td><td>LineAssignment (durable, survives sleep) — derived from claim OR admin_pin</td><td>until release / revoke / idle alert</td></tr>
 </table>
 
 <h2>Inbound call under any topology</h2>

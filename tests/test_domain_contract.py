@@ -21,6 +21,7 @@ from phonebridge.domain.contract import (
     DTMF_PATTERN,
     EVENT_WIRE_NAMES,
     MAX_DTMF_DIGITS,
+    MAX_IDEMPOTENCY_KEY_LEN,
     MAX_PENDING_CLAIMS_PER_AGENT,
     MAX_PENDING_CLAIMS_TOTAL,
     MAX_PROVIDER_META_ENTRIES,
@@ -32,6 +33,7 @@ from phonebridge.domain.contract import (
     AcquireQueued,
     AcquireRefused,
     AcquireResult,
+    AdminAudience,
     AgentAudience,
     AnswerAndAnnounceFallback,
     AssignmentMode,
@@ -55,6 +57,7 @@ from phonebridge.domain.contract import (
     FallbackPolicy,
     FallbackTriggeredEvent,
     ForwardViaLineFallback,
+    IdleAlertEvent,
     IncomingCallEvent,
     IncomingRingIngress,
     Intent,
@@ -495,9 +498,25 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     adapter = TypeAdapter(contract.FallbackPolicy)
     assert isinstance(adapter.validate_python({"policy": "no_pickup"}), NoPickupFallback)
     assert isinstance(adapter.validate_python({"policy": "reject"}), RejectFallback)
-    fwd = adapter.validate_python({"policy": "forward_via_line", "line_id": "line-b"})
+    fwd = adapter.validate_python(
+        {
+            "policy": "forward_via_line",
+            "line_id": "line-b",
+            "target_number": "+37379099999",
+            "target_country": "MD",
+        }
+    )
     assert isinstance(fwd, ForwardViaLineFallback)
     assert fwd.line_id == LineId("line-b")
+    # Round 23 (review-12 C2): the policy must carry the full dial
+    # target - the FallbackWorker has no admin scope to query config.
+    assert fwd.target_number.to_wire() == "+37379099999"
+    assert fwd.target_country == "MD"
+    # ...the target is PII-safe in log dumps (masked, never raw).
+    assert "+37379099999" not in repr(fwd.safe_dump())
+    for missing in ({}, {"target_country": "MD"}, {"target_number": "+37379099999"}):
+        with pytest.raises(ValidationError):
+            adapter.validate_python({"policy": "forward_via_line", "line_id": "line-b", **missing})
     rec = adapter.validate_python({"policy": "record_and_telegram", "channel": "@ops"})
     assert isinstance(rec, RecordAndTelegramFallback)
     assert rec.channel == "@ops"
@@ -581,6 +600,7 @@ EVENT_PAYLOAD_MODELS: dict[EventName, type[contract.ContractModel]] = {
     EventName.FALLBACK_TRIGGERED: FallbackTriggeredEvent,
     EventName.LINE_STATE_CHANGED: LineStateChangedEvent,
     EventName.MISSED_CALL: MissedCallEvent,
+    EventName.IDLE_ALERT: IdleAlertEvent,
 }
 """Domain EventName -> payload model (round 22): the wire-parity
 check below needs one authoritative model per event row."""
@@ -692,6 +712,7 @@ def test_event_envelope_and_payloads() -> None:
         call_token=CallToken("fb-tok"),
         caller_id=RedactedString(_RAW_NUMBER),
         policy=NoPickupFallback(),
+        expires_at=NOW_UTC,
     )
     lsc = LineStateChangedEvent(
         line_id=LineId("line-main"),
@@ -699,7 +720,13 @@ def test_event_envelope_and_payloads() -> None:
         new_state=LineState.BUSY,
     )
     mc = MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.ACCEPT_WINDOW_EXPIRED)
-    for ev in (csc, qr, qu, ar, are, ft, lsc, mc):
+    ia = IdleAlertEvent(
+        assignment_id=contract.AssignmentId("asg-1"),
+        line_id=LineId("line-main"),
+        owner_agent_id="agent-1",
+        idle_since=NOW_UTC,
+    )
+    for ev in (csc, qr, qu, ar, are, ft, lsc, mc, ia):
         assert ev.model_dump_json()
 
 
@@ -1297,6 +1324,28 @@ def test_queue_ticket_idempotency_key() -> None:
         ).idempotency_key
         is None
     )
+    # Round 23 (review-12 M2): a key is either absent or non-empty
+    # and <= MAX_IDEMPOTENCY_KEY_LEN - empty/overlong keys are
+    # INVALID_ARGUMENT-class violations at the model boundary.
+    for bad in ("", "k" * (MAX_IDEMPOTENCY_KEY_LEN + 1)):
+        with pytest.raises(ValidationError):
+            QueueTicket(
+                ticket_id=TicketId("t-3"),
+                seq=3,
+                session_id=SessionId("s-1"),
+                intent=Intent.DIAL_OUT,
+                enqueued_at=NOW_UTC,
+                idempotency_key=bad,
+            )
+    assert MAX_IDEMPOTENCY_KEY_LEN == 128
+    QueueTicket(
+        ticket_id=TicketId("t-4"),
+        seq=4,
+        session_id=SessionId("s-1"),
+        intent=Intent.DIAL_OUT,
+        enqueued_at=NOW_UTC,
+        idempotency_key="k" * MAX_IDEMPOTENCY_KEY_LEN,
+    )
 
 
 class _FakeLineAdminKernel(LineAdminKernel):
@@ -1535,8 +1584,9 @@ def test_media_credentials_distinct_role_tokens() -> None:
 
 def test_event_audience_union_and_envelope() -> None:
     """Round 21 (HIGH-4): EventAudience is a discriminated union
-    (broadcast | agent | session) and a REQUIRED envelope field -
-    every event leaves the kernel with a routing target."""
+    (broadcast | agent | session | admin - round 23) and a REQUIRED
+    envelope field - every event leaves the kernel with a routing
+    target."""
     adapter = TypeAdapter(EventAudience)
     assert isinstance(adapter.validate_python({"scope": "broadcast"}), BroadcastAudience)
     agent = adapter.validate_python({"scope": "agent", "agent_id": "system:fallback_worker"})
@@ -1545,6 +1595,9 @@ def test_event_audience_union_and_envelope() -> None:
     session = adapter.validate_python({"scope": "session", "session_id": "sess-1"})
     assert isinstance(session, SessionAudience)
     assert session.session_id == SessionId("sess-1")
+    # Round 23 (review-12 H6/M6): admin-observable escalation
+    # routing for the alert-only idle_alert event.
+    assert isinstance(adapter.validate_python({"scope": "admin"}), AdminAudience)
     with pytest.raises(ValidationError):
         adapter.validate_python({"scope": "room"})
 
@@ -1555,3 +1608,187 @@ def test_event_audience_union_and_envelope() -> None:
             emitted_at=NOW_UTC,
             payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NORMAL),
         )
+
+
+# ---------------------------------------------------------------------------
+# Round 23 (architect review 12 - SA_carbon_review_12): Phase-0 contract
+# freeze before M1-M5 - C1 hangup XOR, C2 forward target, C3 media port
+# lifecycle, H1 log-dump JSON invariant, H6/M6 idle_alert + fallback TTL,
+# M2 idempotency bounds + preempted-grant correlation.
+# ---------------------------------------------------------------------------
+
+
+def test_hangup_command_xor_target() -> None:
+    """Round 23 (review-12 C1): ProviderHangupCommand carries exactly
+    ONE target - ``lease_id`` for an established call, ``call_token``
+    to reject a still-unanswered ring (no lease exists before accept).
+    Zero and two targets are both rejected."""
+    base = {
+        "line_id": LineId("line-main"),
+        "assignment_id": contract.AssignmentId("bind-1"),
+    }
+    by_lease = ProviderHangupCommand(**base, lease_id=LeaseId("l-1"))
+    assert by_lease.call_token is None
+    by_token = ProviderHangupCommand(**base, call_token=CallToken("tok-1"))
+    assert by_token.lease_id is None
+    with pytest.raises(ValidationError):
+        ProviderHangupCommand(**base)  # neither target
+    with pytest.raises(ValidationError):
+        ProviderHangupCommand(
+            **base, lease_id=LeaseId("l-1"), call_token=CallToken("tok-1")
+        )  # both - ambiguous
+
+
+def test_to_log_dict_is_json_serializable() -> None:
+    """Round 23 (review-12 H1) invariant: ``json.dumps`` on
+    ``to_log_dict()`` MUST always succeed - datetime -> ISO UTC,
+    timedelta -> total_seconds, Enum -> .value - and MUST never
+    contain raw PII (the python-mode dump leaves those types live;
+    only the "json" serializer handles them, and that path would
+    emit raw RedactedString wire values)."""
+    assignment = _assignment(
+        mode=AssignmentMode.EXCLUSIVE,
+        owner_agent_id="agent-1",
+        idle_revoke_after=timedelta(hours=24),
+    )
+    dumped = json.dumps(assignment.to_log_dict())
+    assert isinstance(dumped, str)
+    # datetime serialized to ISO-8601, timedelta to seconds.
+    assert assignment.to_log_dict()["last_seen_at"] == NOW_UTC.isoformat()
+    assert assignment.to_log_dict()["idle_revoke_after"] == 24 * 3600.0
+    assert assignment.to_log_dict()["mode"] == "exclusive"
+
+    class _KitchenSink(contract.ContractModel):
+        when: contract.AwareDatetime
+        delta: timedelta
+        state: LineState
+        reason: CallEndReason
+        secret_value: RedactedString
+        tags: frozenset[str]
+        maybe: str | None = None
+
+    sink = _KitchenSink(
+        when=NOW_UTC,
+        delta=timedelta(milliseconds=1500),
+        state=LineState.BUSY,
+        reason=CallEndReason.PROVIDER_LOST,
+        secret_value=RedactedString(_RAW_NUMBER),
+        tags=frozenset({"a", "b"}),
+    )
+    log_dict = sink.to_log_dict()
+    rendered = json.dumps(log_dict)  # must not raise
+    assert log_dict["when"] == NOW_UTC.isoformat()
+    assert log_dict["delta"] == 1.5
+    assert log_dict["state"] == "BUSY"
+    assert log_dict["reason"] == "provider_lost"
+    assert log_dict["tags"] == ["a", "b"]
+    assert _RAW_NUMBER not in rendered
+    assert "****" in rendered
+
+
+def test_media_allocator_port_lifecycle() -> None:
+    """Round 23 (review-12 C3): the media port contract is allocate
+    strictly at dial/accept + an idempotent synchronous
+    ``revoke(lease_id)`` called on every CallLease -> ENDED. The
+    annotation below makes mypy check the fake against the protocol -
+    a missing ``revoke`` would fail the type gate."""
+    calls: list[str] = []
+
+    class FakeAllocator:
+        def allocate(self, lease_id: LeaseId, line_id: LineId) -> MediaCredentials:
+            calls.append(f"allocate:{lease_id}")
+            return MediaCredentials(
+                media_endpoint="unix:///run/phonebridge/media.sock",
+                agent_media_token=MediaToken("a-tok"),
+                provider_media_token=MediaToken("p-tok"),
+            )
+
+        def revoke(self, lease_id: LeaseId) -> None:
+            calls.append(f"revoke:{lease_id}")
+
+    allocator: contract.MediaAllocator = FakeAllocator()
+    creds = allocator.allocate(LeaseId("l-1"), LineId("line-main"))
+    assert creds.agent_media_token != creds.provider_media_token
+    allocator.revoke(LeaseId("l-1"))
+    allocator.revoke(LeaseId("l-1"))  # idempotent - safe to call twice
+    allocator.revoke(LeaseId("never-allocated"))  # unknown lease: no-op
+    assert calls == [
+        "allocate:l-1",
+        "revoke:l-1",
+        "revoke:l-1",
+        "revoke:never-allocated",
+    ]
+
+
+def test_round23_event_schema_freeze() -> None:
+    """Round 23 (review-12 H6/M2/M6): fallback_triggered carries an
+    absolute expires_at deadline; call_state_changed may carry
+    reissued_ticket_id for a preempted immediate grant; idle_alert is
+    a separate admin-observable event, never a revoke."""
+    # expires_at is REQUIRED on fallback_triggered (fallback_accept_ttl).
+    with pytest.raises(ValidationError):
+        FallbackTriggeredEvent(
+            line_id=LineId("line-main"),  # type: ignore[call-arg]
+            call_token=CallToken("fb-tok"),
+            policy=NoPickupFallback(),
+        )
+    ft = FallbackTriggeredEvent(
+        line_id=LineId("line-main"),
+        call_token=CallToken("fb-tok"),
+        policy=NoPickupFallback(),
+        expires_at=NOW_UTC,
+    )
+    assert ft.expires_at == NOW_UTC
+
+    # reissued_ticket_id: optional correlation of a preempted
+    # enqueue=True immediate grant to its new head-of-queue ticket.
+    csc = CallStateChangedEvent(
+        lease_id=LeaseId("l-1"),
+        line_id=LineId("line-main"),
+        state="disconnected",
+        reason=CallEndReason.PREEMPTED_BY_INCOMING,
+        reissued_ticket_id=TicketId("t-9"),
+    )
+    assert csc.reissued_ticket_id == TicketId("t-9")
+    assert csc.model_dump(mode="json")["reissued_ticket_id"] == "t-9"
+    assert (
+        CallStateChangedEvent(
+            lease_id=LeaseId("l-1"), line_id=LineId("line-main"), state="active"
+        ).reissued_ticket_id
+        is None
+    )
+
+    # idle_alert: alert-only, AdminAudience routing, required fields.
+    envelope = EventEnvelope[IdleAlertEvent](
+        name=EventName.IDLE_ALERT,
+        audience=AdminAudience(),
+        emitted_at=NOW_UTC,
+        payload=IdleAlertEvent(
+            assignment_id=contract.AssignmentId("asg-1"),
+            line_id=LineId("line-main"),
+            owner_agent_id="agent-1",
+            idle_since=NOW_UTC,
+        ),
+    )
+    assert EVENT_WIRE_NAMES[EventName.IDLE_ALERT] == "event.idle_alert"
+    assert isinstance(envelope.audience, AdminAudience)
+    with pytest.raises(ValidationError):
+        IdleAlertEvent(  # type: ignore[call-arg]
+            assignment_id=contract.AssignmentId("asg-1"),
+            line_id=LineId("line-main"),
+            # owner_agent_id + idle_since are required: an admin alert
+            # must name the idle owner and when it went idle.
+        )
+
+
+def test_timeout_config_fallback_accept_ttl() -> None:
+    """Round 23 (review-12 M6): TimeoutConfig gains
+    fallback_accept_ttl_sec - the FallbackWorker's deadline to accept
+    a re-issued ring token (~10 s illustrative default)."""
+    patch = TimeoutConfig(fallback_accept_ttl_sec=10.0)
+    assert patch.fallback_accept_ttl_sec == 10.0
+    assert TimeoutConfig().fallback_accept_ttl_sec is None
+    with pytest.raises(ValidationError):
+        TimeoutConfig(fallback_accept_ttl_sec=0.0)
+    with pytest.raises(ValidationError):
+        TimeoutConfig(fallback_accept_ttl_sec=-1)
