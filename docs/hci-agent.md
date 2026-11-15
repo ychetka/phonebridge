@@ -69,9 +69,9 @@ monotonic counter assigned by each sender independently
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
 | `0x14` STATUS | agent→ | `{state: UP|DEGRADED|DONGLE_DEAD|TUNNEL_FLAP, detail}` |
 | `0x15` SHUTDOWN | both | graceful close |
-| `0x16` SCO_STATE | container→ | `{open: bool, air_mode, rx_pkt_len, tx_pkt_len}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-20, see below); on `open: true` `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"` — mirrors the HCI `air_mode` field of the sync connection) and `rx_pkt_len`/`tx_pkt_len` are the negotiated packet lengths; on `open: false` the three fields are `0`-valued and ignored |
+| `0x16` SCO_STATE | container→ | `{open: bool, air_mode?, rx_pkt_len?, tx_pkt_len?}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-21, see below); on `open: true` `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"` — mirrors the HCI `air_mode` field of the sync connection) and `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the three fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
 
-**USB SCO altsetting control (rounds 19-20).** The Bluetooth USB
+**USB SCO altsetting control (rounds 19-21).** The Bluetooth USB
 Transport spec keeps Interface 1 (SCO audio) at `altsetting 0` —
 zero bandwidth (`wMaxPacketSize = 0`) — while idle; isochronous
 transfers cannot flow until a working altsetting is selected, and a
@@ -83,12 +83,22 @@ and `Disconnect Complete 0x05` for the SCO handle gate — sends the
 agent `0x16 SCO_STATE`:
 
 - `open: true` (after a successful sync connection complete): the
-  agent maps `air_mode` + `rx_pkt_len`/`tx_pkt_len` to the matching
-  Interface 1 `altsetting` (the altsetting IS a packet-size choice:
-  `wMaxPacketSize` differs for CVSD 48/64/128-byte vs transparent
-  mSBC 16-bit frames — a bare `packet_len` was ambiguous, round 20),
-  starts isoc IN+OUT transfers, and chops outgoing HCI SCO packets
-  into `wMaxPacketSize`-sized isoc frames.
+  agent selects the Interface 1 `bAlternateSetting` by `air_mode`
+  per Bluetooth Core Spec Vol 4 Part B §2.1.1 (round 21 fix — the
+  round-20 text wrongly looked up `wMaxPacketSize == rx_pkt_len`,
+  which matches nothing). The altsettings have FIXED
+  `wMaxPacketSize` values: alt 0 = `0` (idle), alt 1 = `9`,
+  alt 2 = `17` (standard for 16-bit CVSD), alt 3 = `25`,
+  alt 4 = `33`, alt 5 = `49`, alt 6 = `63` (standard for
+  WBS/mSBC). The mapping: `air_mode == "msbc"` → `altsetting 6`
+  (`wMaxPacketSize = 63`), falling back to `altsetting 1` (`9`)
+  when the dongle's descriptor lacks alt 6; `air_mode == "cvsd"`
+  (16-bit) → `altsetting 2` (`17`). `rx_pkt_len`/`tx_pkt_len`
+  carry the ON-AIR eSCO packet length (e.g. `60` B for 2-EV3
+  mSBC, `30` B for HV3) — the round-20 `48/64/128`-byte CVSD sizes
+  were the HCI buffer MTU, not altsetting packet sizes. The agent
+  then starts isoc IN+OUT transfers and chops outgoing HCI SCO
+  packets into `wMaxPacketSize`-sized isoc frames.
 - `open: false` (after disconnect): the agent stops isoc transfers
   and returns Interface 1 to `altsetting 0`, releasing the bandwidth.
 
@@ -152,7 +162,9 @@ is up; the feeder binds its uplink destination to the last
 authenticated source address of the session's media port. A
 `MEDIA_PING` from an address that fails the tunnel peer check
 (WireGuard `/32` source or mTLS-bound identity) is ignored and
-counted as `SCO_UNEXPECTED_HANDLE`-class telemetry.
+counted under the dedicated `SCO_PEER_MISMATCH` counter (round 21) —
+peer-identity failures and `session_nonce` failures
+(`SCO_SESSION_MISMATCH`) are tracked separately.
 
 Stale frames MAY be
 dropped; late audio is worse than missing audio (isochronous semantics
@@ -200,6 +212,7 @@ passively from the event stream it forwards:
 | `SCO_UNEXPECTED_HANDLE` | frames for an unknown handle persist > ~250 ms or > 20 frames after connection setup — sync/event desync suspected |
 | `SCO_RX_STARVATION` | gate open but zero valid SCO frames for > ~500 ms during an active call |
 | `SCO_FRAMING_ERROR` | datagram shorter than the HCI SCO header, `payload_len` mismatch, or handle 0 / out of range |
+| `SCO_PEER_MISMATCH` | datagram from a source address failing the tunnel peer check (WireGuard `/32` or mTLS-bound identity) — distinct from `SCO_SESSION_MISMATCH` (round 21) |
 | `SCO_SESSION_MISMATCH` | datagram with a `session_nonce` other than the current HELLO_ACK-issued value — stale pre-reset session traffic (round 20) |
 
 These are loud degradation signals feeding the line state machine —

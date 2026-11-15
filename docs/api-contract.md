@@ -1,7 +1,7 @@
 # phonebridge API contract (v0 draft)
 
-Status: design draft (consolidated with design rounds 1-18,
-2026-11-13; see docs/phone-bridge-service-design.md decision log).
+Status: design draft (consolidated with design rounds 1-21,
+2026-11-15; see docs/phone-bridge-service-design.md decision log).
 Transport: **JSON-RPC 2.0 bidirectional over one connection per peer**.
 - Local peers: Unix-domain socket (bind-mounted out of the container).
 - Remote peers: **WSS** — providers/agents always dial *into* the gateway (NAT-safe).
@@ -57,6 +57,11 @@ type LineSummary = {
 // the wire value is complete, the log/error-dump rendering is
 // masked (e.g. "+373****56").
 type RedactedString = string;
+
+// Wire time convention (round 21): every `*_at` field and
+// `server_time` is an RFC 3339 / ISO-8601 string in UTC
+// ("2026-11-15T12:00:00.000Z"); every `*_ms` field is a
+// non-negative integer count of milliseconds.
 ```
 
 ## Identifier taxonomy (round 11)
@@ -66,7 +71,7 @@ type RedactedString = string;
 | `assignment_id` | LineManager | durable | line<->owner/provider binding; survives reconnects. Two DISTINCT object spaces share this tag (round 20): a `LineAssignment` id identifies agent ownership of a line, a `ProviderBinding` id identifies a registered provider attachment — admin operations disambiguate by which object the id resolves to; `provider.register` returns a ProviderBinding id |
 | `call_token` | LineManager | TTL = `accept_window_sec` (default 30 s) | one-shot token for an inbound ring (`RINGING_LOCKED`); burns on `call.accept` or timeout |
 | `lease_id` | LineManager | ephemeral (one call / one hold) | single id of the active line hold AND the call - replaces any `call_id` everywhere (methods and events) |
-| `media_token` | MediaRouter | ephemeral (bound to `lease_id`) | authorizes the binary media socket handshake |
+| `media_token` | MediaRouter | ephemeral (bound to `lease_id`) | authorizes the binary media socket handshake. TWO independent one-time tokens are issued per `lease_id` (round 21): `agent_media_token` bound to `(lease_id, "agent")` (delivered in `call.dial`/`call.accept` results) and `provider_media_token` bound to `(lease_id, "provider")` (delivered in `line.dial`/`line.answer`). Both travel on the wire as `media_token`; the MediaRouter validates `(token -> lease_id, expected_role)`, so neither side can spoof the other's role in `media.auth` |
 
 ## Error codes
 
@@ -140,10 +145,10 @@ from these input rejections and from ordinary no-answer termination.
 | method | params | returns |
 |---|---|---|
 | `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` — `media_endpoint` is the static socket address; the per-lease `media_token` arrives later inside `line.dial`/`line.answer` (round 14) |
-| `provider.reregister` | same as register | idempotent; preserves lease state during the 10 s orphan-grace window — grace covers the WS-drop level only; provider-reported tunnel/USB death or DEGRADED→DOWN unreachable = immediate teardown, no grace (round 20, design §5.4) |
+| `provider.reregister` | same as register + `state_snapshot?` | idempotent; preserves lease state during the 10 s orphan-grace window — `state_snapshot` lists the calls the provider still sees on the D-Bus (`{lease_id?, state, caller?}[]`, `lease_id` absent for a call the gateway never issued) so the kernel can re-bind surviving leases (round 21, design §5.4); grace covers the WS-drop level only — provider-reported tunnel/USB death or DEGRADED→DOWN unreachable = immediate teardown, no grace (round 20) |
 | `provider.ping` | `{line_id, assignment_id, state_snapshot?}` | `{ok, server_time}` — missed N pings → DEGRADED → DOWN |
 | `provider.capability_update` | `{line_id, assignment_id, caps, profile?}` | `{ok}` |
-| `provider.call_state` | `{line_id, assignment_id, call_token?, lease_id?, state, reason?}` | `{ok}` — `state` is the canonical set `ringing` \| `dialing` \| `alerting` \| `active` \| `disconnected`; `call_token` identifies the inbound ring, `lease_id` an established call. Recognized teardown reasons — the vocabulary is CLOSED (round 20b): `dongle_lost` (tunnel/USB death — immediate teardown, no orphan grace), `stack_restart` (vanished call found by `GetCalls()` reconciliation after a bus/name-owner restart), `provider_lost` (orphan-grace expiry or provider unreachable past DEGRADED→DOWN) |
+| `provider.call_state` | `{line_id, assignment_id, call_token?, lease_id?, state, reason?}` | `{ok}` — `state` is the canonical set `ringing` \| `dialing` \| `alerting` \| `active` \| `disconnected`; `call_token` identifies the inbound ring, `lease_id` an established call. Recognized `reason` values on `disconnected` — the provider-reported vocabulary is CLOSED (round 21): `normal`, `busy`, `no_answer`, `rejected`, `network_error`, `dongle_lost` (tunnel/USB death — immediate teardown, no orphan grace), `stack_restart` (vanished call found by `GetCalls()` reconciliation after a bus/name-owner restart). Gateway-minted reasons such as `provider_lost` (orphan-grace expiry or heartbeat timeout) are emitted on the agent event channel as `event.call_state_changed{reason:"provider_lost"}`, never reported here. An update carrying NEITHER `call_token` nor `lease_id` reports a human-initiated call on the physical phone (round 21): the line goes `BUSY` with reason `external_call`, no lease is minted, and no `line.hangup` is ever sent for it (design §9) |
 | `provider.audio_ready` | `{line_id, assignment_id, lease_id}` | `{ok}` — one-shot notification: the provider's local BT SCO path is up (early media flows, uplink accepted). Gateway emits `event.audio_ready` to the agent from this signal |
 
 ## Manager → Line — `line.*` (down-channel commands)
@@ -154,7 +159,7 @@ from these input rejections and from ordinary no-answer termination.
 | `line.answer` | `{assignment_id, lease_id, call_token, media_endpoint, media_token}` | `{accepted}` — same per-lease media credentials as `line.dial` |
 | `line.hangup` | `{assignment_id, lease_id}` | `{accepted}` |
 | `line.send_dtmf` | `{assignment_id, lease_id, digits}` | `{accepted}` |
-| `line.revoke` | `{assignment_id}` | `{accepted}` — **admin scope only** |
+| `line.revoke` | `{assignment_id, reason?}` | `{accepted}` — **admin scope only** |
 
 Sent as server-initiated JSON-RPC requests over the provider's own inbound connection — no reverse dial needed.
 
@@ -162,12 +167,12 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 
 | method | params | returns / errors |
 |---|---|---|
-| `agent.register_intent` | `{agent_id, token, intents[], profile?}` | `{session_id}` |
+| `agent.register_intent` | `{agent_id, token, intents[], profile?}` | `{session_id}` / `INVALID_ARGUMENT` on an empty `intents` set; `INVALID_INTENT` when `intents` contains `exclusive_line` — durable exclusivity is requested only via `call.claim_exclusive` (round 21) |
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?, idempotency_key?}` | `{granted: true, line_id, lease_id, expires_at}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — `intent` must be `dial_out` (round 14; other intents → `INVALID_INTENT`); `expires_at` is the grant TTL deadline (round 20; missing it → `event.call_state_changed{reason: "grant_ttl_expired"}`); retry dedup is scoped to a non-empty `(session_id, idempotency_key)` — calls without a key create independent tickets so multi-call agents are not merged; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`); `RESOURCE_EXHAUSTED`/`SESSION_LIMIT_EXCEEDED` on per-session limits |
 | `call.cancel_acquire` | `{session_id, ticket_id}` | `{ok}` — withdraw a queued acquire |
 | `call.release` | `{session_id, lease_id}` | `{ok}` / `OWNER_MISMATCH` |
 | `call.dial` | `{session_id, lease_id, number, country}` | `{lease_id, media_endpoint, media_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE`, `DIAL_REJECTED` |
-| `call.accept` | `{session_id, call_token}` | `{lease_id, line_id, media_endpoint, media_token}` / `STALE_TOKEN`, `LINE_BUSY_INCOMING`, `OWNER_MISMATCH` — atomic: issues the lease, answers the ring, attaches media |
+| `call.accept` | `{session_id, call_token}` | `{lease_id, line_id, media_endpoint, media_token}` / `STALE_TOKEN`, `OWNER_MISMATCH` — atomic: issues the lease, answers the ring, attaches media |
 | `call.hangup` | `{session_id, lease_id}` | `{ok}` |
 | `call.send_dtmf` | `{session_id, lease_id, digits}` | `{ok}` — `digits` must match `^[0-9A-D*#,wW]{1,32}$` (`,`/`w`/`W` = ~500 ms pauses) else `INVALID_ARGUMENT`/`INVALID_DTMF`; `INVALID_STATE` without an ACTIVE call; provider-synthesized tones mute agent uplink PCM for their duration (round 20, §6.4) |
 | `call.claim_exclusive` | `{session_id, line_id}` | `{claim_id, status: "pending_approval"}` — moderator approval required in admin, never self-granted |
@@ -186,6 +191,23 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | `event.audio_ready` | `{lease_id, line_id}` — BT SCO path is up: early media (ringback) audible, uplink accepted without first-word clipping |
 | `event.call_state_changed` | `{lease_id, line_id, state, reason?, answer_confidence?}` — `state`: `dialing` \| `alerting` \| `active` \| `disconnected` (the provider's `ringing` maps to `event.incoming_call`, not to a lease event); `answer_confidence`: `"provisional"` \| `"confirmed"` — how sure the bridge is that `active` means a human answered (oFono `State=active` observed firing on remote answer, but the guarantee is provisional — design §5.5); agent may start its greeting only on `state == "active"` AND `audio_ready` received |
 | `event.assignment_revoked` | `{assignment_id, line_id, owner_agent_id?, reason?}` (round 19b) — the durable binding ended: admin `revoke_assignment`/`line.revoke` or idle escalation. Delivered ONLY to the revoked owner's session(s); `owner_agent_id` is absent for a pool/provider attachment (no agent to notify). Without this event an exclusive owner would learn about the revoke only as an `OWNER_MISMATCH` on its next `call.dial` |
+
+**Event audience routing (round 21).** The kernel stamps a routing
+audience on every event at emission time (`broadcast` \| `agent` \|
+`session`); the EventBus is a stateless router over it and never
+re-enters kernel tables after the fact — a torn-down lease or
+session must not strand its queued event, and payloads that carry
+PII or a one-shot `call_token` must never reach uninvolved agents:
+
+- `event.incoming_call` / `event.missed_call` — the line owner's
+  agent on an exclusive line; broadcast on a shared-pool line.
+- `event.fallback_triggered` — the `system:fallback_worker` agent
+  only.
+- `event.assignment_revoked` — the revoked owner only (a pool/
+  provider attachment has no agent audience).
+- `event.line_state_changed` — broadcast.
+- `event.line_acquired`, `event.queue_updated`, `event.audio_ready`,
+  `event.call_state_changed` — the owning session only.
 
 ## Queue semantics (mandatory FIFO)
 
@@ -233,7 +255,7 @@ interface LineProviderConfig {
   profile?: string;
   reconnect: { backoff_ms: [number, number]; jitter_pct: number };
   heartbeat_interval_ms: number;
-  media_transport: "rtp_wss";  // UNIFIED: always packet audio (LocalLine -> 127.0.0.1)
+  media_transport: "ws_pcm";  // UNIFIED: framed PCM over WebSocket (LocalLine -> 127.0.0.1)
 }
 ```
 
@@ -260,6 +282,15 @@ by `call.dial` / `call.accept` (agent) or `line.dial` / `line.answer`
 protocol — `unix://` means a WS handshake over AF_UNIX,
 `wss://` over TCP/TLS; the frames below are identical on either.
 
+Each lease carries **two independent one-time `media_token`s**
+(round 21): the agent's token (issued in `call.dial`/`call.accept`
+results) is bound to `(lease_id, "agent")` and the provider's token
+(issued in `line.dial`/`line.answer`) is bound to
+`(lease_id, "provider")`. `media.auth` succeeds only when the
+presented token matches BOTH the lease and the self-declared `role`
+— a stolen or misused `"agent"` token cannot open a second socket
+as `"provider"` and hijack the phone-side stream.
+
 The local endpoint is **WebSocket over the Unix socket**, not a raw
 `SOCK_STREAM` (round 18): a bare UDS byte stream has no message
 boundaries, so an 8-byte `flush`/`keepalive` frame (`0x02`/`0x03`)
@@ -271,11 +302,17 @@ identical framing code path (`websockets.unix_serve` —
 1. **Auth handshake** — first frame is TEXT JSON:
    - client: `{"type":"media.auth","role":"agent"|"provider","lease_id":"...","media_token":"..."}`
    - server: `{"type":"media.auth_ok"}` or socket close `4001 Unauthorized`.
-2. **Streaming** — all subsequent frames are BINARY, fixed 648 B:
-   - `byte 0` `uint8` flags: `0x01`=audio, `0x02`=flush/clear-uplink-buffer, `0x03`=keepalive;
-   - `bytes 1..3` `uint24` BE `seq` (monotonic, loss detection);
-   - `bytes 4..7` `uint32` BE `timestamp_ms` (stream-relative);
-   - `bytes 8..647` payload: raw PCM 16 kHz S16_LE mono = 640 B = 20 ms. Flags `0x02`/`0x03` may carry 0-byte payload.
+2. **Streaming** — all subsequent frames are BINARY with a fixed
+   layout: `byte 0` `uint8` flags, `bytes 1..3` `uint24` BE `seq`
+   (monotonic, loss detection), `bytes 4..7` `uint32` BE
+   `timestamp_ms` (stream-relative), then the payload. The total
+   frame length depends on the flag (round 21):
+   - `0x01` audio — exactly **648 B**: 8 B header + 640 B payload
+     (raw PCM 16 kHz S16_LE mono = 20 ms);
+   - `0x02` flush/clear-uplink-buffer, `0x03` keepalive — exactly
+     **8 B**: header only, NO payload;
+   - any other length is a framing violation — the receiving side
+     closes the socket with `1002 Protocol Error`.
    Flush is in-band — `clear_uplink_buffer`/`flush_audio_out` map to flag `0x02`, no control/media race. A `0x02` frame carries NO audio payload; it has PRIORITY over queued audio frames on the same lease — on receipt the bridge discards every still-queued older uplink audio frame for that lease (round 20, §6.4), so a flush never plays back buffered stale audio after e.g. a synthesized-DTMF segment.
 
 3. **Resource bounds (round 14, CODING_HAZARDS rule 7):**

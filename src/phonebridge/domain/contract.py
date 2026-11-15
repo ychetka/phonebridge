@@ -34,7 +34,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Annotated, Any, Generic, Literal, NewType, TypeVar, cast
+from typing import Annotated, Any, Generic, Literal, NewType, Protocol, TypeVar, cast
 
 from pydantic import (
     AfterValidator,
@@ -53,11 +53,13 @@ __all__ = [
     "DTMF_PATTERN",
     "EVENT_WIRE_NAMES",
     "MAX_DTMF_DIGITS",
+    "PROVIDER_COMMAND_WIRE_NAMES",
     "AcceptResult",
     "AcquireGranted",
     "AcquireQueued",
     "AcquireRefused",
     "AcquireResult",
+    "AgentAudience",
     "AnswerAndAnnounceFallback",
     "AnswerConfidence",
     "AssignmentId",
@@ -65,16 +67,21 @@ __all__ = [
     "AssignmentRevokedEvent",
     "AudioReadyEvent",
     "AwareDatetime",
+    "BroadcastAudience",
+    "CallEndReason",
     "CallLease",
     "CallPhase",
     "CallStateChangedEvent",
     "CallToken",
+    "ClaimId",
     "ClaimResult",
+    "Clock",
     "ContractModel",
     "DialResult",
     "ErrorCode",
     "ErrorData",
     "ErrorReason",
+    "EventAudience",
     "EventEnvelope",
     "EventName",
     "FallbackDecision",
@@ -93,16 +100,21 @@ __all__ = [
     "LineStateChangedEvent",
     "LineSummary",
     "LivenessState",
+    "MediaAllocator",
+    "MediaCredentials",
     "MediaToken",
     "MissedCallEvent",
     "NoPickupFallback",
+    "PendingClaim",
     "PhonebridgeError",
+    "ProviderActiveCall",
     "ProviderAnswerCommand",
     "ProviderBinding",
     "ProviderCallState",
     "ProviderCallStateUpdate",
     "ProviderCommand",
     "ProviderDialCommand",
+    "ProviderDisconnectReason",
     "ProviderHangupCommand",
     "ProviderLiveness",
     "ProviderRegistration",
@@ -114,6 +126,7 @@ __all__ = [
     "RecordAndTelegramFallback",
     "RedactedString",
     "RejectFallback",
+    "SessionAudience",
     "SessionId",
     "TicketId",
     "WireCallState",
@@ -138,12 +151,19 @@ CallToken = NewType("CallToken", str)
 """One-shot inbound-ring token; TTL = accept_window_sec (default 30 s).
 Burns on call.accept or timeout."""
 
+ClaimId = NewType("ClaimId", str)
+"""Pending exclusive-line claim request id (call.claim_exclusive);
+resolved by the admin approve_claim/reject_claim pair (round 21)."""
+
 LeaseId = NewType("LeaseId", str)
 """Ephemeral single id of the active line hold AND the call.
 Replaces any call_id everywhere - no call_id exists (round 11)."""
 
 MediaToken = NewType("MediaToken", str)
-"""Authorizes the binary media socket handshake; bound to a lease_id."""
+"""Authorizes the binary media socket handshake; bound to a
+(lease_id, role) pair - every lease carries TWO independent one-time
+tokens (agent vs provider) so media.auth role claims are
+cryptographically backed (round 21, CRITICAL-2)."""
 
 LineId = NewType("LineId", str)
 """Canonical line identifier. The agent-side alias "default" is resolved
@@ -258,10 +278,68 @@ class AssignmentMode(str, Enum):
 
 
 class LivenessState(str, Enum):
-    """Provider liveness fact reported via note_provider_liveness."""
+    """Provider liveness fact reported via note_provider_liveness.
+
+    WS_DISCONNECTED (round 21, CRITICAL-3): the provider's WS control
+    channel dropped while the telephony path may still be alive -
+    starts the 10 s orphan-grace window
+    (``ProviderBinding.orphan_deadline_at``), after which a
+    ``provider.reregister`` carrying a ``state_snapshot`` decides
+    re-bind vs teardown. UNREACHABLE instead means heartbeat timeout
+    (DEGRADED -> DOWN) and tears leases down IMMEDIATELY - no grace
+    (design §5.4)."""
 
     REACHABLE = "reachable"
+    WS_DISCONNECTED = "ws_disconnected"
     UNREACHABLE = "unreachable"
+
+
+class ProviderDisconnectReason(str, Enum):
+    """CLOSED provider-reported disconnect-reason vocabulary
+    (wire: ``provider.call_state{state:"disconnected", reason}``,
+    round 21, MEDIUM-9).
+
+    These are facts the provider itself reports. ``provider_lost``
+    is deliberately absent: it is minted by the gateway on
+    orphan-grace expiry or heartbeat timeout, never by a provider -
+    it lives in :class:`CallEndReason` instead."""
+
+    NORMAL = "normal"
+    BUSY = "busy"
+    NO_ANSWER = "no_answer"
+    REJECTED = "rejected"
+    NETWORK_ERROR = "network_error"
+    DONGLE_LOST = "dongle_lost"
+    STACK_RESTART = "stack_restart"
+
+
+class CallEndReason(str, Enum):
+    """Call/teardown reason vocabulary for ``event.call_state_changed``
+    and lease-teardown paths (round 21, MEDIUM-9).
+
+    Superset of :class:`ProviderDisconnectReason` plus the reasons
+    only the gateway can mint: agent-initiated hangup, inbound
+    preemption of an undialed grant, grant/accept window expiry,
+    dead-man teardowns and admin revokes. Wire spellings are
+    lowercase snake_case - the uppercase ErrorReason members that
+    mirror some of the same facts serve the error-channel sub-code
+    convention, a different field, and the two vocabularies are
+    intentionally not merged."""
+
+    NORMAL = "normal"
+    BUSY = "busy"
+    NO_ANSWER = "no_answer"
+    REJECTED = "rejected"
+    NETWORK_ERROR = "network_error"
+    DONGLE_LOST = "dongle_lost"
+    STACK_RESTART = "stack_restart"
+    AGENT_HANGUP = "agent_hangup"
+    PREEMPTED_BY_INCOMING = "preempted_by_incoming"
+    GRANT_TTL_EXPIRED = "grant_ttl_expired"
+    ACCEPT_WINDOW_EXPIRED = "accept_window_expired"
+    AGENT_DISCONNECTED = "agent_disconnected"
+    PROVIDER_LOST = "provider_lost"
+    ADMIN_REVOKED = "admin_revoked"
 
 
 class ErrorCode(str, Enum):
@@ -535,12 +613,17 @@ class ContractModel(BaseModel):
       must not write the number into the error string (rule 10).
     - ``extra="forbid"``: the contract is closed; unknown keys are a
       defect, not silently dropped.
+    - ``frozen=True`` (round 21, MEDIUM-8): every DTO is immutable.
+      LineManager, EventBus and the adapters share one process, so a
+      stray mutation in one subscriber would corrupt kernel state or
+      a sibling's view; collection fields are ``tuple``/``frozenset``
+      (JSON serialization to arrays is unchanged).
     - ``safe_dump()``/``to_log_dict()`` are the ONLY allowed log dumps:
       raw ``model_dump()``/``model_dump_json()`` emit full PII wire
       values and are PROHIBITED for logging.
     """
 
-    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
+    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid", frozen=True)
 
     def safe_dump(self) -> dict[str, Any]:
         """Log-safe dump: RedactedString fields rendered masked."""
@@ -564,7 +647,7 @@ class ErrorData(ContractModel):
 
     reason: ErrorReason | None = None
     detail: str | None = None
-    free_lines: list[LineId] = Field(default_factory=list)
+    free_lines: tuple[LineId, ...] = ()
 
 
 class PhonebridgeError(Exception):
@@ -650,7 +733,7 @@ class LineSummary(ContractModel):
     """Agent-facing line listing row (wire: call.get_lines)."""
 
     line_id: LineId
-    caps: list[Intent]
+    caps: tuple[Intent, ...]
     state: LineState
     profile: str | None = None
 
@@ -724,7 +807,7 @@ class ProviderBinding(ContractModel):
 
     assignment_id: AssignmentId
     line_id: LineId
-    caps: list[Intent]
+    caps: tuple[Intent, ...]
     profile: str | None = None
     liveness: LivenessState = LivenessState.REACHABLE
     connected_at: AwareDatetime
@@ -836,7 +919,7 @@ class AcquireRefused(ContractModel):
     server-side parked requests, round 8)."""
 
     granted: Literal[False] = False
-    free_lines: list[LineId] = Field(default_factory=list)
+    free_lines: tuple[LineId, ...] = ()
 
 
 def _acquire_discriminator(value: Any) -> str:
@@ -886,11 +969,23 @@ class AcceptResult(ContractModel):
     media_token: MediaToken
 
 
+class PendingClaim(ContractModel):
+    """A pending ``call.claim_exclusive`` request awaiting moderator
+    approval (round 21, HIGH-7): the admin surface lists these via
+    ``LineAdminKernel.list_pending_claims``."""
+
+    claim_id: ClaimId
+    line_id: LineId
+    requester_agent_id: str
+    session_id: SessionId
+    created_at: AwareDatetime
+
+
 class ClaimResult(ContractModel):
     """call.claim_exclusive result: claim is a REQUEST - moderator
     approval in the admin surface grants it; never self-granted (§4.2)."""
 
-    claim_id: str
+    claim_id: ClaimId
     status: Literal["pending_approval"] = "pending_approval"
 
 
@@ -908,23 +1003,42 @@ class ClaimResult(ContractModel):
 
 
 class ProviderDialCommand(ContractModel):
-    """Initiate an outbound call on a bound provider (oFono Dial)."""
+    """Initiate an outbound call on a bound provider (wire: line.dial,
+    oFono Dial).
+
+    ``media_endpoint``/``media_token`` (round 21, CRITICAL-1/2) are
+    the provider-role credentials of the lease's token pair - the
+    agent holds a DIFFERENT token for the same lease
+    (:class:`MediaCredentials`), so a stolen agent token can never
+    claim ``role: "provider"`` in ``media.auth``."""
 
     command: Literal["dial"] = "dial"
     line_id: LineId
     assignment_id: AssignmentId
     lease_id: LeaseId
     number: RedactedString
-    mask_clir: bool = False
+    media_endpoint: str
+    media_token: MediaToken
 
 
 class ProviderAnswerCommand(ContractModel):
-    """Answer an inbound ring on a bound provider (oFono Answer)."""
+    """Answer an inbound ring on a bound provider (wire: line.answer,
+    oFono Answer).
+
+    ``lease_id`` (round 21, CRITICAL-1) is minted by the kernel at
+    accept time: without it the provider could not attribute its own
+    ``provider.audio_ready`` / ``provider.call_state{active}``
+    reports nor pass ``media.auth``. ``media_endpoint``/
+    ``media_token`` are the provider-role credentials - same pair
+    semantics as :class:`ProviderDialCommand`."""
 
     command: Literal["answer"] = "answer"
     line_id: LineId
     assignment_id: AssignmentId
     call_token: CallToken
+    lease_id: LeaseId
+    media_endpoint: str
+    media_token: MediaToken
 
 
 class ProviderHangupCommand(ContractModel):
@@ -957,7 +1071,7 @@ class ProviderRevokeCommand(ContractModel):
     After issuing, the line drops to DOWN and all its leases follow
     the teardown path."""
 
-    command: Literal["revoke_assignment"] = "revoke_assignment"
+    command: Literal["revoke"] = "revoke"
     line_id: LineId
     assignment_id: AssignmentId
     reason: str | None = None
@@ -976,6 +1090,48 @@ ProviderCommand = Annotated[
 executes them idempotently in drain order."""
 
 
+PROVIDER_COMMAND_WIRE_NAMES: dict[str, str] = {
+    "dial": "line.dial",
+    "answer": "line.answer",
+    "hangup": "line.hangup",
+    "send_dtmf": "line.send_dtmf",
+    "revoke": "line.revoke",
+}
+"""Authoritative discriminator→wire-name map for ProviderCommand
+(round 21, CRITICAL-1), the command-side counterpart of
+``EVENT_WIRE_NAMES``: every ``command`` literal resolves to the
+``line.*`` method the provider surface receives. ``line_id`` is not
+a wire parameter - the commands ride the provider's own inbound
+connection, which is already bound to exactly one line. Drift
+against the ``line.*`` table in docs/api-contract.md is caught by
+``test_provider_command_wire_parity``."""
+
+
+class MediaCredentials(ContractModel):
+    """The per-lease media credential pair (round 21, CRITICAL-2).
+
+    One ``lease_id`` gets TWO independent one-time tokens: the agent
+    receives ``agent_media_token`` inside DialResult/AcceptResult,
+    the provider receives ``provider_media_token`` inside
+    ProviderDialCommand/ProviderAnswerCommand. On the wire both
+    travel as ``media_token``; the MediaRouter binds each token to
+    ``(lease_id, expected_role)``, so a compromised or misused
+    ``role: "agent"`` token can never open a socket as
+    ``role: "provider"`` and hijack the phone-side stream."""
+
+    media_endpoint: str
+    agent_media_token: MediaToken
+    provider_media_token: MediaToken
+
+    @model_validator(mode="after")
+    def _roles_get_distinct_tokens(self) -> MediaCredentials:
+        """The two roles MUST hold different tokens - equal tokens
+        would recreate the CRITICAL-2 role-spoofing hole."""
+        if self.agent_media_token == self.provider_media_token:
+            raise ValueError("agent_media_token and provider_media_token must differ")
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Domain events + typed envelope
 # ---------------------------------------------------------------------------
@@ -983,14 +1139,58 @@ executes them idempotently in drain order."""
 PayloadT = TypeVar("PayloadT", bound=ContractModel)
 
 
+class BroadcastAudience(ContractModel):
+    """Every live agent session sees the event: ``line_state_changed``,
+    and ``incoming_call``/``missed_call`` on shared-pool lines."""
+
+    scope: Literal["broadcast"] = "broadcast"
+
+
+class AgentAudience(ContractModel):
+    """Exactly one ``agent_id`` sees the event: the exclusive line
+    owner (``incoming_call``/``missed_call``/``assignment_revoked`` on
+    owned lines) or the system worker ``system:fallback_worker``
+    (``fallback_triggered``). Required whenever the payload carries
+    PII or a one-shot ``call_token`` - a broadcast would leak the
+    number and the intercept token to every connected agent
+    (round 21, HIGH-4)."""
+
+    scope: Literal["agent"] = "agent"
+    agent_id: str
+
+
+class SessionAudience(ContractModel):
+    """Exactly one session sees the event: ``queue_ready``,
+    ``queue_updated``, ``audio_ready`` and ``call_state_changed``
+    carry session-scoped lease facts that must not leak to other
+    sessions (round 21, HIGH-4)."""
+
+    scope: Literal["session"] = "session"
+    session_id: SessionId
+
+
+EventAudience = Annotated[
+    BroadcastAudience | AgentAudience | SessionAudience,
+    Field(discriminator="scope"),
+]
+"""Discriminated union of event routing targets (round 21, HIGH-4).
+The audience is stamped by the kernel inside the mutation
+transaction - the EventBus is a stateless router over it and never
+re-enters kernel tables after the fact (a torn-down lease/session
+must not strand its queued event)."""
+
+
 class EventEnvelope(ContractModel, Generic[PayloadT]):
     """Typed envelope carrying a domain event payload to a subscriber.
 
     ``name`` is the domain EventName; the adapter maps to ``event.*``
     wire spellings and subscriber-scoped fields (e.g. session_id).
-    """
+    ``audience`` (round 21) is the mandatory routing target computed
+    at emission time - see :data:`EventAudience` for the per-event
+    rules."""
 
     name: EventName
+    audience: EventAudience
     emitted_at: AwareDatetime
     payload: PayloadT
 
@@ -1104,6 +1304,19 @@ class MissedCallEvent(ContractModel):
 # ---------------------------------------------------------------------------
 
 
+class ProviderActiveCall(ContractModel):
+    """One live call as the provider sees it on the D-Bus (round 21).
+
+    Element of ``ProviderRegistration.state_snapshot`` - the
+    orphan-grace reconciliation input. ``lease_id`` is ``None`` for a
+    call the kernel never issued, e.g. a human-initiated call on the
+    physical phone (design §9 external-call rule)."""
+
+    lease_id: LeaseId | None = None
+    state: ProviderCallState
+    caller: RedactedString | None = None
+
+
 class ProviderRegistration(ContractModel):
     """Distilled registration fact (provider.register at the boundary).
 
@@ -1112,9 +1325,15 @@ class ProviderRegistration(ContractModel):
 
     line_id: LineId
     token: RedactedString
-    caps: list[Intent]
+    caps: tuple[Intent, ...]
     profile: str | None = None
     meta: dict[str, str] = Field(default_factory=dict)
+    state_snapshot: tuple[ProviderActiveCall, ...] | None = None
+    """The provider's view of live calls at registration time
+    (round 21, CRITICAL-3): carried on ``provider.reregister``
+    inside the 10 s orphan-grace window so the kernel can verify a
+    surviving call still exists on the D-Bus before re-binding its
+    lease (design §5.4). ``None`` on a first-time register."""
 
 
 class ProviderLiveness(ContractModel):
@@ -1134,14 +1353,26 @@ class ProviderCallStateUpdate(ContractModel):
 
     ``call_token`` identifies the inbound ring; ``lease_id`` (round 14)
     identifies an established call - without it the gateway cannot
-    attribute an update to a lease."""
+    attribute an update to a lease.
+
+    External calls (round 21, HIGH-6): an update carrying NEITHER
+    ``call_token`` nor ``lease_id`` reports a human-initiated call on
+    the physical phone (dialed or answered on the handset itself).
+    The kernel marks the line BUSY with reason ``"external_call"`` -
+    no agent lease is minted, no PipeWire bridge is attached (audio
+    stays on the phone) and NO Hangup is ever sent; the state clears
+    when the provider reports DISCONNECTED (design §9).
+
+    ``reason`` is the CLOSED provider vocabulary
+    (:class:`ProviderDisconnectReason`, round 21); gateway-minted
+    reasons such as ``provider_lost`` never arrive on this ingress."""
 
     line_id: LineId
     assignment_id: AssignmentId
     call_token: CallToken | None = None
     lease_id: LeaseId | None = None
     state: ProviderCallState
-    reason: str | None = None
+    reason: ProviderDisconnectReason | None = None
     observed_at: AwareDatetime
 
 
@@ -1175,6 +1406,39 @@ class FallbackDecision(ContractModel):
     ``system:fallback_worker``, single-use, TTL-bound, bypasses the
     exclusive-owner check so FallbackWorker can call accept() after
     the original call_token went stale. None for CORE policies."""
+
+
+# ---------------------------------------------------------------------------
+# Injected pure ports (round 21, MEDIUM-9)
+#
+# ``InMemoryLineManager`` (M1) takes these through its constructor so
+# the kernel stays deterministic in tests - a scripted ``Clock``
+# instead of ``datetime.now``/``sleep``, a canned ``MediaAllocator``
+# instead of a socket allocator. The ports are one-way inputs and
+# hold NO kernel reference.
+# ---------------------------------------------------------------------------
+
+
+class Clock(Protocol):
+    """Monotonic aware-UTC time source injected into the kernel.
+
+    The kernel calls it inside mutations; every returned datetime
+    MUST satisfy ``ensure_aware_utc`` and MUST NOT move backwards
+    relative to the previous call - tick-order bookkeeping
+    (orphan deadlines, grant TTLs) depends on monotonicity."""
+
+    def __call__(self) -> datetime: ...
+
+
+class MediaAllocator(Protocol):
+    """Issues the per-lease media credential pair (round 21,
+    CRITICAL-2): the endpoint plus the two independent one-time
+    tokens of :class:`MediaCredentials`. The kernel calls
+    ``allocate`` at grant/accept time and splits the pair - agent
+    token into the agent result, provider token into the outbox
+    command."""
+
+    def allocate(self, lease_id: LeaseId, line_id: LineId) -> MediaCredentials: ...
 
 
 # ---------------------------------------------------------------------------
@@ -1218,7 +1482,11 @@ class LineManager(ABC):
         Resolves declaratively into LineAssignment records via the
         intent-resolver (§4.1). Token authentication happens at the
         transport boundary; the domain sees an already-authenticated
-        agent_id.
+        agent_id. An EMPTY ``intents`` set is rejected with
+        INVALID_ARGUMENT, and ``Intent.EXCLUSIVE_LINE`` is
+        INVALID_INTENT (round 21): durable exclusivity is requested
+        ONLY through ``claim_exclusive`` + moderator approval
+        (round 10d/14) - a self-declared intent can never grant it.
         """
         ...
 
@@ -1476,16 +1744,40 @@ class LineAdminKernel(ABC):
     """
 
     @abstractmethod
-    async def approve_claim(self, claim_id: str) -> LineAssignment:
+    async def approve_claim(self, claim_id: ClaimId) -> LineAssignment:
         """Approve a pending ``call.claim_exclusive`` request: grants
         the durable ``exclusive_line`` assignment (moderator action,
         §4.2). Unknown claim_id -> PhonebridgeError."""
         ...
 
     @abstractmethod
-    async def reject_claim(self, claim_id: str, reason: str | None = None) -> None:
+    async def reject_claim(self, claim_id: ClaimId, reason: str | None = None) -> None:
         """Reject a pending claim request with an optional PII-free
         reason string."""
+        ...
+
+    @abstractmethod
+    async def list_pending_claims(self) -> list[PendingClaim]:
+        """Admin read (round 21, HIGH-7): every pending claim request.
+        The admin surface needs this to show moderators what awaits
+        approval - without it the pending set lives only in private
+        kernel state."""
+        ...
+
+    @abstractmethod
+    async def list_assignments(self) -> list[LineAssignment]:
+        """Admin read (round 21, HIGH-7): every durable
+        ``LineAssignment`` (agent-ownership object space), so the
+        admin surface can resolve valid ``assignment_id`` targets for
+        ``revoke_assignment`` without reaching into kernel internals."""
+        ...
+
+    @abstractmethod
+    async def list_provider_bindings(self) -> list[ProviderBinding]:
+        """Admin read (round 21, HIGH-7): every ``ProviderBinding``
+        (provider-attachment object space) - the second half of the
+        ``assignment_id`` disambiguation documented on
+        ``revoke_assignment``."""
         ...
 
     @abstractmethod

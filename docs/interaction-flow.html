@@ -36,14 +36,14 @@
 <div class="zone">
   <div class="zone-title">API boundary — UDS (local) / WSS (remote): JSON-RPC 2.0 control + separate packetized media channel</div>
   <code>control: agent.* / call.* / event.*</code>
-  <span class="small">commands: agent.register_intent · call.acquire(enqueue) · call.cancel_acquire · call.dial · call.accept · call.hangup · call.send_dtmf · call.claim_exclusive &nbsp;|&nbsp; events: event.incoming_call · event.queue_updated · event.line_acquired · event.missed_call · event.line_state_changed · event.audio_ready · event.call_state_changed</span>
+  <span class="small">commands: agent.register_intent · call.acquire(enqueue) · call.cancel_acquire · call.dial · call.accept · call.hangup · call.send_dtmf · call.claim_exclusive &nbsp;|&nbsp; events (audience-routed, round 21): event.incoming_call · event.queue_updated · event.line_acquired · event.missed_call · event.fallback_triggered · event.line_state_changed · event.audio_ready · event.call_state_changed · event.assignment_revoked</span>
 </div>
 
 <div class="zone">
   <div class="zone-title">phonebridge container (owns telephony exclusively)</div>
   <div class="box core">LineManager (gateway daemon)<span class="small">Line{dongle, phone, oFono modem, caps, profile, state} — N-line architecture, works with one; LineAssignment + CallLease + intent-resolver</span></div>
   <div class="box core">Call queue<span class="small">FIFO, ticket_id, position, grant TTL, socket-bound tickets</span></div>
-  <div class="box core">EventBus<span class="small">socket subscribe · webhook (retry+delivery_id+HMAC) · exec/file-drop</span></div>
+  <div class="box core">EventBus<span class="small">audience-routed fan-out (broadcast | agent | session, round 21): socket subscribe · webhook (retry+delivery_id+HMAC) · exec/file-drop — drains a bounded outbox</span></div>
   <div class="box sys">Line bundle ×N<span class="small">per line in the same container: vhci-feeder + shim/audio-forwarder + LineProvider process; registers at wss://127.0.0.1:7001/provider</span></div>
   <span class="arrow">▼ D-Bus (container-internal)</span>
   <div class="box sys">oFono-shim / BlueZ (shared)<span class="small">VoiceCallManager: Dial/Answer/Hangup — verified live (SMS: OUT OF SCOPE — no MessageManager on bus)</span></div>
