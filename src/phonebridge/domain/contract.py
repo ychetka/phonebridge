@@ -389,10 +389,11 @@ MAX_DTMF_DIGITS: int = 32
 20, rule 7): an unbounded digit string could park synthesized tones
 in the provider queue for minutes."""
 
-DTMF_PATTERN: re.Pattern[str] = re.compile(r"^[0-9A-D*#,wW]{1,32}$")
+DTMF_PATTERN: re.Pattern[str] = re.compile(rf"^[0-9A-D*#,wW]{{1,{MAX_DTMF_DIGITS}}}$")
 """Legal DTMF alphabet (round 20): digits 0-9, letters A-D, `*` and
-`#`, plus pause commands `,`/`w`/`W` (~500 ms pause each). Violation
--> INVALID_ARGUMENT + ErrorReason.INVALID_DTMF."""
+`#`, plus pause commands `,`/`w`/`W` (~500 ms pause each); length
+bound derives from MAX_DTMF_DIGITS. Violation -> INVALID_ARGUMENT +
+ErrorReason.INVALID_DTMF."""
 
 _MASK = "****"
 _MASK_PREFIX_LEN = 4
@@ -714,9 +715,11 @@ class ProviderBinding(ContractModel):
     tag but lives in a separate object space from
     ``LineAssignment.assignment_id`` (api-contract.md Identifier
     taxonomy); admin operations disambiguate by which object the id
-    resolves to. ``orphan_deadline_at`` is set only while a
-    disconnected provider is inside the wire's 10 s orphan-grace
-    window.
+    resolves to - the kernel MUST mint ids unique across BOTH spaces
+    (a collision is a defect: the operation rejects the id as
+    ambiguous rather than guessing). ``orphan_deadline_at`` is set
+    only while a disconnected provider is inside the wire's 10 s
+    orphan-grace window.
     """
 
     assignment_id: AssignmentId
@@ -946,7 +949,7 @@ class ProviderSendDtmfCommand(ContractModel):
     line_id: LineId
     assignment_id: AssignmentId
     lease_id: LeaseId
-    digits: str
+    digits: str = Field(pattern=DTMF_PATTERN.pattern)
 
 
 class ProviderRevokeCommand(ContractModel):
@@ -1282,8 +1285,8 @@ class LineManager(ABC):
         knows which line backs the lease, so this check cannot live in
         the transport adapter (round 15). OWNER_MISMATCH /
         PROVIDER_UNREACHABLE / DIAL_REJECTED apply; a duplicate dial on
-        one lease is rejected (INVALID_CALL_STATE reason under
-        STALE_TOKEN is the convention)."""
+        one lease is rejected with INVALID_STATE (round 20 - the
+        INVALID_CALL_STATE case no longer rides STALE_TOKEN)."""
         ...
 
     @abstractmethod
