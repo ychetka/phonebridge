@@ -63,7 +63,7 @@ type RedactedString = string;
 
 | id | issued by | lifetime | purpose |
 |---|---|---|---|
-| `assignment_id` | LineManager | durable | line<->owner/provider binding; survives reconnects |
+| `assignment_id` | LineManager | durable | line<->owner/provider binding; survives reconnects. Two DISTINCT object spaces share this tag (round 20): a `LineAssignment` id identifies agent ownership of a line, a `ProviderBinding` id identifies a registered provider attachment — admin operations disambiguate by which object the id resolves to; `provider.register` returns a ProviderBinding id |
 | `call_token` | LineManager | TTL = `accept_window_sec` (default 30 s) | one-shot token for an inbound ring (`RINGING_LOCKED`); burns on `call.accept` or timeout |
 | `lease_id` | LineManager | ephemeral (one call / one hold) | single id of the active line hold AND the call - replaces any `call_id` everywhere (methods and events) |
 | `media_token` | MediaRouter | ephemeral (bound to `lease_id`) | authorizes the binary media socket handshake |
@@ -80,6 +80,9 @@ type RedactedString = string;
 | `STALE_TOKEN` | call_token/lease expired or consumed |
 | `PROVIDER_UNREACHABLE` | line DEGRADED/DOWN |
 | `DIAL_REJECTED` | dial string failed pre-line validation — `data.reason` carries a typed sub-code (see Dial validation) |
+| `INVALID_STATE` | operation invalid in the current call/line phase — repeated `dial`, `send_dtmf` outside ACTIVE, approving a closed claim (round 20) |
+| `INVALID_ARGUMENT` | invalid input parameters — DTMF alphabet/length violations (`data.reason: "INVALID_DTMF"`), empty intent sets (round 20) |
+| `RESOURCE_EXHAUSTED` | queue capacity or per-session ticket/lease limits exceeded (`data.reason`: `QUEUE_FULL`, `SESSION_LIMIT_EXCEEDED`, `GRANT_TTL_EXPIRED` — round 20; these were previously folded into `STALE_TOKEN`) |
 
 `NO_FREE_LINE` was REMOVED (round 9): a busy pool is a normal
 result, not an exception - see `call.acquire`.
@@ -137,7 +140,7 @@ from these input rejections and from ordinary no-answer termination.
 | method | params | returns |
 |---|---|---|
 | `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` — `media_endpoint` is the static socket address; the per-lease `media_token` arrives later inside `line.dial`/`line.answer` (round 14) |
-| `provider.reregister` | same as register | idempotent; preserves lease state during grace window |
+| `provider.reregister` | same as register | idempotent; preserves lease state during the 10 s orphan-grace window — grace covers the WS-drop level only; provider-reported tunnel/USB death or DEGRADED→DOWN unreachable = immediate teardown, no grace (round 20, design §5.4) |
 | `provider.ping` | `{line_id, assignment_id, state_snapshot?}` | `{ok, server_time}` — missed N pings → DEGRADED → DOWN |
 | `provider.capability_update` | `{line_id, assignment_id, caps, profile?}` | `{ok}` |
 | `provider.call_state` | `{line_id, assignment_id, call_token?, lease_id?, state, reason?}` | `{ok}` — `state` is the canonical set `ringing` \| `dialing` \| `alerting` \| `active` \| `disconnected`; `call_token` identifies the inbound ring, `lease_id` an established call |
@@ -160,13 +163,13 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | method | params | returns / errors |
 |---|---|---|
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` | `{session_id}` |
-| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` | `{granted: true, line_id, lease_id}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — `intent` must be `dial_out` (round 14; other intents → `INVALID_INTENT`); empty free_lines = nothing available, normal result not an error; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`) |
+| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?, idempotency_key?}` | `{granted: true, line_id, lease_id, expires_at}` or `{granted: false, free_lines[]}` or `{granted: false, queued: true, ticket_id, position}` — `intent` must be `dial_out` (round 14; other intents → `INVALID_INTENT`); `expires_at` is the grant TTL deadline (round 20; missing it → `event.call_state_changed{reason: "grant_ttl_expired"}`); retry dedup is scoped to a non-empty `(session_id, idempotency_key)` — calls without a key create independent tickets so multi-call agents are not merged; `LINE_EXCLUSIVE_NOT_OWNER` (+ `data.free_lines[]`); `RESOURCE_EXHAUSTED`/`SESSION_LIMIT_EXCEEDED` on per-session limits |
 | `call.cancel_acquire` | `{session_id, ticket_id}` | `{ok}` — withdraw a queued acquire |
 | `call.release` | `{session_id, lease_id}` | `{ok}` / `OWNER_MISMATCH` |
 | `call.dial` | `{session_id, lease_id, number, country}` | `{lease_id, media_endpoint, media_token}` / `OWNER_MISMATCH`, `PROVIDER_UNREACHABLE`, `DIAL_REJECTED` |
 | `call.accept` | `{session_id, call_token}` | `{lease_id, line_id, media_endpoint, media_token}` / `STALE_TOKEN`, `LINE_BUSY_INCOMING`, `OWNER_MISMATCH` — atomic: issues the lease, answers the ring, attaches media |
 | `call.hangup` | `{session_id, lease_id}` | `{ok}` |
-| `call.send_dtmf` | `{session_id, lease_id, digits}` | `{ok}` |
+| `call.send_dtmf` | `{session_id, lease_id, digits}` | `{ok}` — `digits` must match `^[0-9A-D*#,wW]{1,32}$` (`,`/`w`/`W` = ~500 ms pauses) else `INVALID_ARGUMENT`/`INVALID_DTMF`; `INVALID_STATE` without an ACTIVE call; provider-synthesized tones mute agent uplink PCM for their duration (round 20, §6.4) |
 | `call.claim_exclusive` | `{session_id, line_id}` | `{claim_id, status: "pending_approval"}` — moderator approval required in admin, never self-granted |
 | `call.get_lines` | `{session_id, intent?}` | `{lines: LineSummary[]}` |
 
@@ -175,7 +178,7 @@ Sent as server-initiated JSON-RPC requests over the provider's own inbound conne
 | event | payload |
 |---|---|
 | `event.incoming_call` | `{line_id, call_token, caller_id?, expires_in_ms}` — first valid `call.accept` wins |
-| `event.line_acquired` | `{session_id, line_id, lease_id, intent}` — also the grant for a queued ticket; agent must act within grant TTL |
+| `event.line_acquired` | `{session_id, line_id, lease_id, intent, expires_at}` — also the grant for a queued ticket; `expires_at` is the grant TTL deadline — missing it ends the lease with `event.call_state_changed{reason: "grant_ttl_expired"}` (round 20) |
 | `event.queue_updated` | `{session_id, ticket_id, position}` |
 | `event.missed_call` | `{line_id, caller_id?, reason, voicemail_ref?}` |
 | `event.fallback_triggered` | `{line_id, call_token, caller_id?, policy}` — delivered to the `system:fallback_worker` session only, when `accept_window_sec` expires on a WORKER-policy line; `call_token` is the internal `fallback_call_token` (round 14) |
@@ -273,7 +276,7 @@ identical framing code path (`websockets.unix_serve` —
    - `bytes 1..3` `uint24` BE `seq` (monotonic, loss detection);
    - `bytes 4..7` `uint32` BE `timestamp_ms` (stream-relative);
    - `bytes 8..647` payload: raw PCM 16 kHz S16_LE mono = 640 B = 20 ms. Flags `0x02`/`0x03` may carry 0-byte payload.
-   Flush is in-band — `clear_uplink_buffer`/`flush_audio_out` map to flag `0x02`, no control/media race.
+   Flush is in-band — `clear_uplink_buffer`/`flush_audio_out` map to flag `0x02`, no control/media race. A `0x02` frame carries NO audio payload; it has PRIORITY over queued audio frames on the same lease — on receipt the bridge discards every still-queued older uplink audio frame for that lease (round 20, §6.4), so a flush never plays back buffered stale audio after e.g. a synthesized-DTMF segment.
 
 3. **Resource bounds (round 14, CODING_HAZARDS rule 7):**
    - **Pair TTL** — a `media_token` expires ~5 s after issue if no peer

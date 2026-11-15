@@ -64,14 +64,14 @@ monotonic counter assigned by each sender independently
 |---|---|---|
 | `0x01` HCI_PASSTHRU | both | HCI packet prefixed with its H4 type byte (`0x01` cmd / `0x02` ACL / `0x04` evt); the byte is synthesized from the USB endpoint class |
 | `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the single-use enrollment credential from `agent_token_file`, sent inside the authenticated tunnel only |
-| `0x11` HELLO_ACK | container→ | `{accepted, line_id, heartbeat_interval_ms, server_time}` or reject+close |
+| `0x11` HELLO_ACK | container→ | `{accepted, line_id, heartbeat_interval_ms, server_time, session_nonce}` or reject+close — `session_nonce` is a fresh `uint32` minted per control session (round 20); the agent MUST echo it in every media-UDP datagram of this session |
 | `0x12` HEARTBEAT | agent→ | `{seq, usb_ok, hci_ok}` every `heartbeat_interval_ms` |
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
 | `0x14` STATUS | agent→ | `{state: UP|DEGRADED|DONGLE_DEAD|TUNNEL_FLAP, detail}` |
 | `0x15` SHUTDOWN | both | graceful close |
-| `0x16` SCO_STATE | container→ | `{open: bool, packet_len}` — instructs the agent to enable/disable the USB isochronous path (round 19, see below); `packet_len` is meaningful only on `open: true` — send `0` on close |
+| `0x16` SCO_STATE | container→ | `{open: bool, air_mode, rx_pkt_len, tx_pkt_len}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-20, see below); on `open: true` `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"` — mirrors the HCI `air_mode` field of the sync connection) and `rx_pkt_len`/`tx_pkt_len` are the negotiated packet lengths; on `open: false` the three fields are `0`-valued and ignored |
 
-**USB SCO altsetting control (round 19).** The Bluetooth USB
+**USB SCO altsetting control (rounds 19-20).** The Bluetooth USB
 Transport spec keeps Interface 1 (SCO audio) at `altsetting 0` —
 zero bandwidth (`wMaxPacketSize = 0`) — while idle; isochronous
 transfers cannot flow until a working altsetting is selected, and a
@@ -83,11 +83,12 @@ and `Disconnect Complete 0x05` for the SCO handle gate — sends the
 agent `0x16 SCO_STATE`:
 
 - `open: true` (after a successful sync connection complete): the
-  agent selects the working `altsetting` for the negotiated codec
-  (mSBC / transparent 16-bit) on USB Interface 1, starts isoc IN+OUT
-  transfers, and chops outgoing HCI SCO packets into
-  `wMaxPacketSize`-sized isoc frames (`packet_len` mirrors the
-  negotiated payload length).
+  agent maps `air_mode` + `rx_pkt_len`/`tx_pkt_len` to the matching
+  Interface 1 `altsetting` (the altsetting IS a packet-size choice:
+  `wMaxPacketSize` differs for CVSD 48/64/128-byte vs transparent
+  mSBC 16-bit frames — a bare `packet_len` was ambiguous, round 20),
+  starts isoc IN+OUT transfers, and chops outgoing HCI SCO packets
+  into `wMaxPacketSize`-sized isoc frames.
 - `open: false` (after disconnect): the agent stops isoc transfers
   and returns Interface 1 to `altsetting 0`, releasing the bandwidth.
 
@@ -123,8 +124,13 @@ live in the vhci experiment. Therefore:
 
 ### Media channel — UDP
 
-`uint8 kind · uint16 BE media_seq · uint32 BE ts_ms · payload` —
-one datagram per media frame. Kinds:
+`uint8 kind · uint32 BE session_nonce · uint16 BE media_seq ·
+uint32 BE ts_ms · payload` — one datagram per media frame (round
+20: `session_nonce` binds every datagram to the current control
+session — a changed NAT port does not prove knowledge of it, so
+stale datagrams from a pre-reset session can't be accepted; the
+feeder ignores and telemetry-counts any datagram whose nonce does
+not equal the nonce it minted in `HELLO_ACK`). Kinds:
 
 - `0x03` SCO — one **complete HCI SCO packet** per datagram
   (`2 B handle/flags · 1 B payload_len · payload`).
@@ -194,6 +200,7 @@ passively from the event stream it forwards:
 | `SCO_UNEXPECTED_HANDLE` | frames for an unknown handle persist > ~250 ms or > 20 frames after connection setup — sync/event desync suspected |
 | `SCO_RX_STARVATION` | gate open but zero valid SCO frames for > ~500 ms during an active call |
 | `SCO_FRAMING_ERROR` | datagram shorter than the HCI SCO header, `payload_len` mismatch, or handle 0 / out of range |
+| `SCO_SESSION_MISMATCH` | datagram with a `session_nonce` other than the current HELLO_ACK-issued value — stale pre-reset session traffic (round 20) |
 
 These are loud degradation signals feeding the line state machine —
 the kernel-side symptom (`hci0: SCO packet for unknown connection
