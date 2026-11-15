@@ -69,6 +69,7 @@ from phonebridge.domain.contract import (
     LineState,
     LineStateChangedEvent,
     LineSummary,
+    LineTimeouts,
     LivenessState,
     MediaCredentials,
     MediaToken,
@@ -101,6 +102,8 @@ from phonebridge.domain.contract import (
     TicketId,
     TimeoutConfig,
     ensure_aware_utc,
+    heartbeat_interval_ms_from_sec,
+    validate_e164_country,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1792,3 +1795,262 @@ def test_timeout_config_fallback_accept_ttl() -> None:
         TimeoutConfig(fallback_accept_ttl_sec=0.0)
     with pytest.raises(ValidationError):
         TimeoutConfig(fallback_accept_ttl_sec=-1)
+
+
+# ---------------------------------------------------------------------------
+# Round 24 (architect review 13 - SA_carbon_review_13), Phase-0 final
+# contract freeze v0.0.19 - C2 effective LineTimeouts + ProviderBinding
+# heartbeat_interval_ms, M1 model-level forward-target validation +
+# self-loop, M3 telecom-only caps.
+# ---------------------------------------------------------------------------
+
+
+def test_line_timeouts_effective_model() -> None:
+    """Round 24 (review-13 C2): LineTimeouts is the CONCRETIZED
+    counterpart of TimeoutConfig - every field carries a resolved
+    default (never None), and heartbeat_down_after must strictly
+    exceed heartbeat_degraded_after."""
+    eff = LineTimeouts()
+    assert eff.grant_ttl_sec == 5.0
+    assert eff.orphan_grace_sec == 10.0
+    assert eff.heartbeat_interval_sec == 5.0
+    assert eff.heartbeat_degraded_after == 2
+    assert eff.heartbeat_down_after == 3
+    assert eff.fallback_accept_ttl_sec == 10.0
+    # Frozen like every ContractModel.
+    with pytest.raises(ValidationError):
+        eff.grant_ttl_sec = 9.0  # type: ignore[misc]
+    # Bounds: same positivity contract as the patch model.
+    with pytest.raises(ValidationError):
+        LineTimeouts(grant_ttl_sec=0.0)
+    with pytest.raises(ValidationError):
+        LineTimeouts(heartbeat_degraded_after=0)
+    # Ordering: DOWN is the terminal escalation of DEGRADED.
+    with pytest.raises(ValidationError):
+        LineTimeouts(heartbeat_degraded_after=3, heartbeat_down_after=3)
+    with pytest.raises(ValidationError):
+        LineTimeouts(heartbeat_degraded_after=5, heartbeat_down_after=3)
+    ok = LineTimeouts(heartbeat_degraded_after=2, heartbeat_down_after=4)
+    assert ok.heartbeat_down_after == 4
+
+
+def test_timeout_config_heartbeat_ordering() -> None:
+    """Round 24 (review-13 C2): the same down > degraded invariant is
+    enforced on the PATCH model when both thresholds are set; a
+    lone threshold stays legal (it merges against the stored
+    effective value at configure_line time)."""
+    TimeoutConfig()  # empty patch remains legal
+    TimeoutConfig(heartbeat_degraded_after=2)
+    TimeoutConfig(heartbeat_down_after=3)
+    TimeoutConfig(heartbeat_degraded_after=2, heartbeat_down_after=4)
+    with pytest.raises(ValidationError):
+        TimeoutConfig(heartbeat_degraded_after=3, heartbeat_down_after=3)
+    with pytest.raises(ValidationError):
+        TimeoutConfig(heartbeat_degraded_after=5, heartbeat_down_after=3)
+
+
+def test_line_assignment_carries_effective_timeouts() -> None:
+    """Round 24 (review-13 C2): LineAssignment.timeouts exposes the
+    resolved LineTimeouts so the admin adapter can write it through
+    to SQLite verbatim - and it survives a JSON round-trip."""
+    assignment = _assignment()
+    assert assignment.timeouts == LineTimeouts()
+    custom = _assignment(timeouts=LineTimeouts(heartbeat_interval_sec=7.5))
+    assert custom.timeouts.heartbeat_interval_sec == 7.5
+    hydrated = LineAssignment.model_validate(assignment.model_dump(mode="json"))
+    assert hydrated.timeouts == LineTimeouts()
+
+
+def test_line_timeouts_apply_patch_atomic_merge() -> None:
+    """Round 24b (residual MEDIUM-HIGH): ``LineTimeouts.apply_patch``
+    merges a ``TimeoutConfig`` patch via a FULL ``model_validate`` of
+    the merged dict - atomic: a lone patch field that is legal in
+    isolation but breaks the ``down > degraded`` ladder against the
+    stored value maps to ``PhonebridgeError(INVALID_ARGUMENT)``,
+    never a raw ``ValidationError``, and leaves the effective
+    values untouched."""
+    base = LineTimeouts()  # degraded=2, down=3
+    # Valid single-field patch merges cleanly.
+    merged = base.apply_patch(TimeoutConfig(grant_ttl_sec=7.5))
+    assert merged.grant_ttl_sec == 7.5
+    assert merged.heartbeat_degraded_after == 2
+    assert merged.heartbeat_down_after == 3
+    # An all-None patch returns the same effective values.
+    assert base.apply_patch(TimeoutConfig()) == base
+    # Ordering breach visible only after merge: degraded=4 alone is a
+    # legal TimeoutConfig, yet 4 >= the stored down=3.
+    with pytest.raises(PhonebridgeError) as excinfo:
+        base.apply_patch(TimeoutConfig(heartbeat_degraded_after=4))
+    assert excinfo.value.code is ErrorCode.INVALID_ARGUMENT
+    # Round 24c: ErrorData.detail carries ALL joined validation
+    # messages (PII/input-free pydantic msgs), not first-error-only.
+    assert excinfo.value.data.detail is not None
+    assert "heartbeat_down_after must exceed" in excinfo.value.data.detail
+    # Same for a lowered down_after that meets the stored degraded.
+    with pytest.raises(PhonebridgeError) as excinfo2:
+        base.apply_patch(TimeoutConfig(heartbeat_down_after=2))
+    assert excinfo2.value.code is ErrorCode.INVALID_ARGUMENT
+    # The stored values are untouched: the frozen model cannot
+    # half-patch and the merge yields a NEW instance.
+    assert base.heartbeat_down_after == 3
+    assert base.heartbeat_degraded_after == 2
+
+
+def test_heartbeat_interval_ms_conversion() -> None:
+    """Round 24c (reviewer finding on the round-24 C2 model): the
+    sec -> ms conversion is pinned - ``heartbeat_interval_sec`` is
+    floored at millisecond granularity (``ge=0.001``) on BOTH
+    ``LineTimeouts`` and ``TimeoutConfig``, and the canonical
+    ``heartbeat_interval_ms_from_sec`` helper rounds to the nearest
+    ms clamped to >= 1, so a valid config can NEVER stamp a
+    zero-cadence ``ProviderBinding.heartbeat_interval_ms``."""
+    assert heartbeat_interval_ms_from_sec(5.0) == 5000
+    assert heartbeat_interval_ms_from_sec(0.001) == 1
+    assert heartbeat_interval_ms_from_sec(7.5) == 7500
+    assert heartbeat_interval_ms_from_sec(0.0015) == 2
+    assert heartbeat_interval_ms_from_sec(0.0014) == 1
+    # Clamp guard for a caller bypassing model validation.
+    assert heartbeat_interval_ms_from_sec(0.0004) == 1
+    # Granularity floor on the effective model and the patch model.
+    assert LineTimeouts(heartbeat_interval_sec=0.001).heartbeat_interval_sec == 0.001
+    assert TimeoutConfig(heartbeat_interval_sec=0.001).heartbeat_interval_sec == 0.001
+    with pytest.raises(ValidationError):
+        LineTimeouts(heartbeat_interval_sec=0.0005)
+    with pytest.raises(ValidationError):
+        LineTimeouts(heartbeat_interval_sec=0.0)
+    with pytest.raises(ValidationError):
+        TimeoutConfig(heartbeat_interval_sec=0.0009)
+
+
+def test_provider_binding_heartbeat_interval_ms() -> None:
+    """Round 24 (review-13 C2): ProviderBinding stamps the ping
+    cadence negotiated for THIS provider session so the
+    provider.register response can carry heartbeat_interval_ms -
+    default 5000, strictly positive."""
+    binding = ProviderBinding(
+        assignment_id=contract.AssignmentId("bind-1"),
+        line_id=LineId("line-main"),
+        caps=(Intent.DIAL_OUT,),
+        connected_at=NOW_UTC,
+        last_seen_at=NOW_UTC,
+    )
+    assert binding.heartbeat_interval_ms == 5000
+    stamped = ProviderBinding(
+        assignment_id=contract.AssignmentId("bind-2"),
+        line_id=LineId("line-main"),
+        caps=(Intent.DIAL_OUT,),
+        heartbeat_interval_ms=7500,
+        connected_at=NOW_UTC,
+        last_seen_at=NOW_UTC,
+    )
+    assert stamped.heartbeat_interval_ms == 7500
+    with pytest.raises(ValidationError):
+        ProviderBinding(
+            assignment_id=contract.AssignmentId("bind-3"),
+            line_id=LineId("line-main"),
+            caps=(Intent.DIAL_OUT,),
+            heartbeat_interval_ms=0,
+            connected_at=NOW_UTC,
+            last_seen_at=NOW_UTC,
+        )
+
+
+def test_validate_e164_country_helper() -> None:
+    """Round 24 (review-13 M1): the pure helper runs the strict
+    E.164 shape gate, then phonenumbers parse + validity +
+    region cross-check, returning the raw number on success."""
+    assert validate_e164_country(RedactedString(_RAW_NUMBER), "MD") == _RAW_NUMBER
+    assert validate_e164_country(RedactedString("+12025551234"), "US") == "+12025551234"
+    # Shape gate: local/national forms, missing +, leading 0 country
+    # code, punctuation and extensions never reach phonenumbers.
+    for bad in ("79012345", "+01234567", "+373 790 12345", "+37379012345 ext.5"):
+        with pytest.raises(ValueError):
+            validate_e164_country(RedactedString(bad), "MD")
+    # Parses E.164 but not a valid subscriber number.
+    with pytest.raises(ValueError):
+        validate_e164_country(RedactedString("+19999999999"), "US")
+    # Valid number, wrong declared region (country is a cross-check
+    # ASSERTION, never a fallback parse region).
+    with pytest.raises(ValueError):
+        validate_e164_country(RedactedString("+12025551234"), "MD")
+    # country must be ISO alpha-2 (uppercase two letters).
+    for bad_country in ("md", "MDA", "M1", ""):
+        with pytest.raises(ValueError):
+            validate_e164_country(RedactedString(_RAW_NUMBER), bad_country)
+
+
+def test_forward_via_line_model_level_validation() -> None:
+    """Round 24 (review-13 M1): ForwardViaLineFallback validates its
+    dial target at CONSTRUCTION - a corrupt SQLite/config row can
+    never hydrate an invalid policy - and LineAssignment bans the
+    self-loop inside its own invariants validator."""
+    # Valid policy constructs (the pre-existing wire-parity cases).
+    fwd = ForwardViaLineFallback(
+        line_id=LineId("line-b"),
+        target_number=RedactedString("+37379099999"),
+        target_country="MD",
+    )
+    assert fwd.target_country == "MD"
+    # Invalid target_number shape / region mismatch / bad country are
+    # rejected at the model boundary, not deferred to the worker.
+    with pytest.raises(ValidationError):
+        ForwardViaLineFallback(
+            line_id=LineId("line-b"),
+            target_number=RedactedString("79099999"),  # no '+' prefix
+            target_country="MD",
+        )
+    with pytest.raises(ValidationError):
+        ForwardViaLineFallback(
+            line_id=LineId("line-b"),
+            target_number=RedactedString("+12025551234"),  # valid US, declared MD
+            target_country="MD",
+        )
+    with pytest.raises(ValidationError):
+        ForwardViaLineFallback(
+            line_id=LineId("line-b"),
+            target_number=RedactedString("+37379099999"),
+            target_country="md",  # not ISO alpha-2 uppercase
+        )
+    # Self-loop: a forward target equal to the configured line is a
+    # model-level violation on LineAssignment, independent of
+    # configure_line (which DB hydration bypasses).
+    with pytest.raises(ValidationError):
+        _assignment(fallback_policy=fwd.model_copy(update={"line_id": LineId("line-main")}))
+    # A forward target on a DIFFERENT line stays legal.
+    ok = _assignment(fallback_policy=fwd)
+    assert isinstance(ok.fallback_policy, ForwardViaLineFallback)
+
+
+def test_provider_caps_are_telecom_only() -> None:
+    """Round 24 (review-13 M3): provider-declared caps are non-empty
+    and telecom-only - Intent.EXCLUSIVE_LINE is a LineAssignment
+    property, never a hardware capability; rejected on the register
+    ingress, the capability_update ingress and the binding record."""
+    for model, base in (
+        (
+            ProviderRegistration,
+            {"line_id": "line-main", "token": "tok"},
+        ),
+        (
+            ProviderCapabilityUpdate,
+            {"line_id": "line-main", "assignment_id": "bind-1"},
+        ),
+        (
+            ProviderBinding,
+            {
+                "line_id": "line-main",
+                "assignment_id": "bind-1",
+                "connected_at": NOW_UTC.isoformat(),
+                "last_seen_at": NOW_UTC.isoformat(),
+            },
+        ),
+    ):
+        for bad_caps in (
+            [],  # empty caps declare nothing
+            ["exclusive_line"],
+            ["dial_out", "exclusive_line"],
+        ):
+            with pytest.raises(ValidationError):
+                model.model_validate({**base, "caps": bad_caps})
+        ok = model.model_validate({**base, "caps": ["dial_out", "receive_inbound"]})
+        assert Intent.EXCLUSIVE_LINE not in ok.caps

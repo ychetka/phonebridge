@@ -61,6 +61,7 @@ referenced sections.
 | round 21 (architect review 9 — `SA_carbon_review_9`, 2026-11-15) | ProviderCommand/MediaToken wire parity: `PROVIDER_COMMAND_WIRE_NAMES` maps every command to its `line.*` wire method + drift test; `line.dial`/`line.answer` carry `media_endpoint`/`media_token`, `mask_clir` removed; TWO independent per-role `media_token`s per `lease_id` (`MediaCredentials`, media.auth role-spoofing fix); `ProviderActiveCall`/`state_snapshot` + `LivenessState.WS_DISCONNECTED` close the orphan-grace path; `ProviderDisconnectReason`/`CallEndReason` closed reason vocabularies; deterministic external-call rule (human-initiated call → BUSY `external_call`, never Hangup); `ContractModel` frozen + tuple fields; `EventAudience` routing stamped on `EventEnvelope`; `register_intent` rejects empty intents/`exclusive_line`; `ClaimId`/`PendingClaim` + `LineAdminKernel` list reads; `Clock`/`MediaAllocator` injected ports; hci-agent SCO altsetting selection per BT Core Vol 4 Part B §2.1.1 (`SCO_PEER_MISMATCH`/`SCO_SESSION_MISMATCH` counters split) | contract.py, docs/api-contract.md, docs/hci-agent.md §2, §3.3, §5.2, §9 |
 | round 22 (architect review 10 — `SA_carbon_review_10_gemini`, 2026-11-15) | `LineManager.update_provider_capabilities` + `ProviderCapabilityUpdate` (capability_update ingress, no token); `CallLease.session_id` ((session_id, lease_id) ownership, SessionAudience routing, sibling-session safety); `provider.call_state` gains `caller_id?` + `{ok, call_token}` on `ringing` (gateway-minted token echoed for early caller hangups; `IncomingRingIngress` no longer takes call_token as input); event schema/wire alignment (`caller`→`caller_id`, `expires_in_ms`→`expires_at` RFC 3339, `CallStateChangedEvent.state: WireCallState`, `ticket_id` on `event.line_acquired`, `AssignmentRevokedEvent.owner_agent_id` required — ProviderBinding revoke = `line.revoke` + `line_state_changed{DOWN, admin_revoked}`); ephemeral CallLease auto-release (hangup/disconnected end the lease; `call.release{lease_id}` mid-call = hangup-intent; `call.release{assignment_id}` = durable owner release); `receive_inbound`-scoped inbound events + accept gate (shared pool fans out per-session); `admin.assign_line` + `configure_line{idle_revoke_after, timeouts}` (`TimeoutConfig`); LineProvider owns in-band DTMF synthesis + uplink mute + `0x02` flush emission (MediaRouter drains its uplink buffer on receipt); `AnswerAndAnnounceFallback.announcement_ref`, `fallback_worker` acquire bypass, `event.fallback_triggered` as THE delivery; bounded `PendingClaim` (8/agent, 256 total, socket-bound) + bounded `ProviderRegistration.meta` | contract.py, docs/api-contract.md, §3.2-§3.6, §4.1, §4.2, §5.1-§5.4, §6.4, §10 |
 | round 23 (architect review 12 — `SA_carbon_review_12`, Phase-0 contract freeze) | `line.hangup` XOR target `{lease_id? \| call_token?}` (reject-fallback executability); `ForwardViaLineFallback` gains `target_number`/`target_country` + config-time self-loop ban; `MediaAllocator` lifecycle fixed (allocate at dial/accept + idempotent `revoke(lease_id)` on lease ENDED); `_mask_for_log` serializes datetime/timedelta/Enum (json.dumps-safe logs); two-level outbox overflow model (SOFT_CAP pre-flight on acquire/dial/accept/claim, teardown never raises, drain after every call); Saga compensation on `line.dial`/`line.answer` (`{accepted}` ~2 s deadline → `disconnected`/`network_error`); `FallbackTriggeredEvent.expires_at` + `TimeoutConfig.fallback_accept_ttl_sec`; `event.idle_alert`/`IdleAlertEvent` + `AdminAudience` (idle escalation is alert-only, never a revoke); `reissued_ticket_id` on `call_state_changed`; bounded `idempotency_key` (1-128); deterministic `phone_mac → agN` chain + Call Waiting auto-reject; hci-agent token = long-lived per-line pre-shared secret + uplink playout jitter buffer; MediaRouter 20 ms uplink pacing + asymmetric rings (ADR-A); M1↔M2 storage split (SQLite durable config vs in-memory lease/queue state, admin write-through under `asyncio.Lock`); capability matrix (`CAP_NET_ADMIN`/`CAP_NET_RAW` only bluetoothd + wg-supervisor, vhci-feeder zero-caps on wg0 IP); pinned PipeWire node format 16 kHz/S16LE/mono; exec-hooks execve-only + webhook retry deadline `expires_at - 1s`; `profile` informational only (eligibility via `RECEIVE_INBOUND` in caps); `py.typed` + `docs/specs/` skeleton + doc drift fixes | contract.py, docs/api-contract.md, docs/hci-agent.md, §1, §3.5-§3.6, §4.2-§4.5, §5.2-§5.3, §6.3-§6.4, §7, §9-§10 |
+| round 24 (architect review 13 — `SA_carbon_review_13`, final Phase-0 contract freeze v0.0.19, issue #59) | MediaRouter pacing direction CORRECTED (ADR-24.1): the agent-socket reader drains continuously at socket speed (`0x01` → 1500-frame ring, `0x02` → immediate ring drain), pacing applies on EGRESS — one 640 B frame per monotonic 20 ms tick toward the LineProvider; `LineTimeouts` effective-value model (ADR-24.2) split from the `TimeoutConfig` patch — `LineAssignment.timeouts` for SQLite write-through + `ProviderBinding.heartbeat_interval_ms` stamps the negotiated per-session cadence; `heartbeat_down_after > heartbeat_degraded_after` validated on both models; `validate_e164_country` + `ForwardViaLineFallback` model validator + `LineAssignment` self-loop ban move dial-target validation from `configure_line` into the constructors; provider `caps` are non-empty telecom-only (`dial_out`/`receive_inbound` — `exclusive_line` is a `LineAssignment.claimable`/`mode` property, never a cap); docstrings freeze the `ingest_ring` glare matrix (BUSY/DOWN → `INVALID_STATE`, provider Hangup), `tick(now)` as the sole timer driver (`decide_fallback` before `expires_at` → `INVALID_STATE`; `fallback_accept_ttl_sec` expiry → `RINGING_LOCKED -> FREE` + `MissedCallEvent{ACCEPT_WINDOW_EXPIRED}`), error mapping (`CLAIM_NOT_FOUND` under `INVALID_STATE`, unknown `assignment_id` → `STALE_TOKEN`, `call.release` XOR breach → `INVALID_ARGUMENT`) and `AssignmentId` rotation on owner/mode change with bounded `_closed_assignments`; hci-agent `0x16 SCO_STATE` gains `handle?: uint16` (required on open, ADR-24.3) + continuous 2-bit H2 counter rewritten on ALL outbound mSBC packets including silence | contract.py, docs/api-contract.md, docs/hci-agent.md, §3.3, §3.6, §6.3, §6.6, §9 |
 
 ## §1. Service boundary
 
@@ -307,7 +308,7 @@ normal result, not an exception.
 |---|---|
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` -> `{session_id}`; declarative wish resolved by the intent-resolver into a LineAssignment (§4) |
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?, idempotency_key?}` -> `{granted:true, line_id, lease_id, expires_at}` or `{granted:false, queued:true, ticket_id, position}` or `{granted:false, free_lines[]}`; `free_lines:[]` = nothing available - routine result, the client retries itself. `expires_at` is the grant TTL deadline (round 20). Optional `enqueue` joins the FIFO queue (§3.4); a non-empty `(session_id, idempotency_key)` scopes retry dedup (`idempotency_key` bounded 1-128 chars, round 23) |
-| `call.release` | `{session_id, lease_id?, assignment_id?}` - exactly ONE target (round 22): `lease_id` ends the ephemeral lease (undialed grant frees the line; in-flight call is hung up first); `assignment_id` is the durable-binding path - the exclusive owner voluntarily releases its LineAssignment. `OWNER_MISMATCH` on a foreign target |
+| `call.release` | `{session_id, lease_id?, assignment_id?}` - exactly ONE target (round 22): `lease_id` ends the ephemeral lease (undialed grant frees the line; in-flight call is hung up first); `assignment_id` is the durable-binding path - the exclusive owner voluntarily releases its LineAssignment. `OWNER_MISMATCH` on a foreign target; zero or BOTH targets = `INVALID_ARGUMENT` (round 24) |
 | `call.dial` | `{session_id, lease_id, number, country}` -> `{lease_id, media_endpoint, media_token}`; strict E.164 + ISO alpha-2 cross-check BEFORE the line (round 12) - `DIAL_REJECTED` with a typed `data.reason`, otherwise the validated E.164 passes to `line.dial` unchanged |
 | `call.accept` | `{session_id, call_token}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired or the token was already consumed, `OWNER_MISMATCH` as applicable (round 21) |
 | `call.hangup` / `call.send_dtmf` / `call.get_lines` | call control and line listing |
@@ -366,9 +367,12 @@ expires_at}` (first valid `call.accept` wins),
 `event.line_state_changed{line_id, old_state, new_state, reason?}`,
 `event.audio_ready{lease_id, line_id}` (§5.5),
 `event.call_state_changed{lease_id, line_id, state, reason?,
-answer_confidence?}` - `lease_id`
+answer_confidence?, reissued_ticket_id?}` - `lease_id`
 is the single call identifier everywhere; no `call_id` exists
-(round 11). `event.fallback_triggered{line_id, call_token,
+(round 11). `reissued_ticket_id?` is present only on a
+`preempted_by_incoming` teardown of an undialed grant taken with
+`enqueue:true` (round 23) - it names the NEW head-of-queue ticket
+that replaced the dead lease. `event.fallback_triggered{line_id, call_token,
 caller_id?, policy, expires_at}` goes to the `system:fallback_worker` session
 only, when the accept window expires on a WORKER-policy line
 (round 14; `expires_at` is the worker's accept deadline bounded by
@@ -765,6 +769,15 @@ preserved there as the per-line tunnel port pair.)
   watchdog live at the container-side media-UDP ingress (vhci-feeder),
   NOT on the agent↔gateway socket. The local loopback leg needs
   neither.
+- Uplink playout (agent→phone leg): the WAN tunnel's media-UDP
+  channel hands frames to the hci-agent's **uplink playout jitter
+  buffer** (30-45 ms, `docs/hci-agent.md` §2) on the dongle host,
+  which owns HCI SCO packet formation - 3-byte HCI SCO header with
+  the negotiated `handle` (the `0x16 SCO_STATE` wire field,
+  `docs/hci-agent.md`), plus the continuous 2-bit H2 sync
+  counter (`0x08 -> 0x38 -> 0xC8 -> 0xF8`) rewritten on every
+  outbound USB mSBC packet, including generated silence on
+  underrun (round 24, review-13 H1).
 - Latency budget: bridge must add < 100 ms node<->socket; verified
   by a loopback test in CI.
 
@@ -824,19 +837,25 @@ channel of the line's tunnel profile (isochronous semantics: stale
 frames are dropped, never retransmitted); control flows on
 control-TCP. A QUIC/multiplexed-streams unification is a V2 track.
 
-### §6.6 MediaRouter pacing and buffer policy (round 23, ADR-A)
+### §6.6 MediaRouter pacing and buffer policy (round 23 ADR-A; pacing direction corrected round 24)
 
-- **Uplink (agent → phone):** the MediaRouter MUST pace reads from
-  the media socket — consume ONE 640 B frame per 20 ms tick —
-  regardless of how fast the agent produces. The uplink ring is
-  bounded and asymmetric at **1500 frames (30 s), drop-NEWEST**:
-  overproducing agents are slowed by socket backpressure instead of
-  silently queuing tens of seconds of stale audio that would play
-  out long after the call moved on. Each overflow increments the
-  `media.uplink_overflow` counter (plus a warning log at first
-  occurrence per lease) — the counter exists so the "agent wrote
-  30 s of audio in 100 ms" bug class is observable instead of
-  invisible latency.
+- **Uplink (agent → phone):** the MediaRouter reads the agent's
+  media socket CONTINUOUSLY at socket speed (non-blocking drain —
+  the reader loop NEVER sleeps on a timer). Each `0x01` frame is
+  appended to a bounded, asymmetric uplink ring of **1500 frames
+  (30 s), drop-NEWEST** on overflow; a `0x02` frame drains the ring
+  IMMEDIATELY on receipt. Pacing applies strictly on EGRESS: a
+  dedicated pacer task steps on a monotonic 20 ms schedule and
+  writes ONE 640 B frame per tick from the ring into the
+  LineProvider socket. Pacing the socket READ instead (round 24,
+  review-13 C1) would strand an agent-originated `0x02` barge-in
+  behind hundreds of queued audio frames inside `SO_RCVBUF` for
+  seconds while the router ring idles near-empty — so the drain
+  side is deliberately unthrottled. Each overflow drops the NEW
+  frame and increments the `media.uplink_overflow` counter (plus a
+  warning log at first occurrence per lease) — the counter exists
+  so the "agent wrote 30 s of audio in 100 ms" bug class is
+  observable instead of invisible latency.
 - **Downlink (phone → agent):** frames are written through
   IMMEDIATELY (no pacing) through a bounded ring of **100 frames
   (2 s), drop-OLDEST** — a slow reader hears the newest audio, not
@@ -952,10 +971,13 @@ human-initiated EXTERNAL call (the owner dialed or answered on the
 handset itself): the line goes `BUSY` with reason `external_call`,
 no agent lease is minted and no PipeWire bridge is attached (audio
 stays on the phone), and the gateway sends NO `Hangup` — the line
-returns to `FREE` when the provider reports the call gone. The kernel
-re-resolves each line's deterministic D-Bus chain (`adapter_mac →
+returns to `FREE` when the provider reports the call gone. Each
+LineProvider re-resolves its own line's deterministic D-Bus chain
+(`adapter_mac →
 Adapter1.Address → Device1.Adapter → phone_mac → bluez_*` nodes,
-§1), rebuilds PipeWire links for surviving leases, and tears down
+§1 - the kernel has no D-Bus visibility; the provider owns the
+oFono view for its line), the gateway rebuilds PipeWire links for
+surviving leases, and tears down
 the reported-gone ones — a restarted stack never leaves phantom
 lines, links, or leases behind.
 
@@ -1000,7 +1022,10 @@ status (mirrors the busctl commands used in Phase-0).
   heartbeat_degraded_after?, heartbeat_down_after?,
   fallback_accept_ttl_sec?}` (round 22; `fallback_accept_ttl_sec`
   added round 23, ~10 s default, bounds the FallbackWorker accept
-  deadline). Changing `heartbeat_interval_sec` NEVER kills a live
+  deadline). `heartbeat_interval_sec` is floored at 0.001 s
+  (millisecond granularity — the wire unit is ms) and stamped as
+  `heartbeat_interval_ms = round(sec * 1000)`, min 1 (round 24c).
+  Changing `heartbeat_interval_sec` NEVER kills a live
   provider session (round 23, review-12 M6): the new interval is
   negotiated at the provider's next
   `provider.reregister`/`provider.register`, so reconfiguring a

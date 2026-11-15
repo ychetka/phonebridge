@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any, Generic, Literal, NewType, Protocol, TypeVar, cast
 
+import phonenumbers
 from pydantic import (
     AfterValidator,
     BaseModel,
@@ -44,6 +45,7 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     Tag,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -52,6 +54,7 @@ from pydantic_core import core_schema
 __all__ = [
     "CALL_PHASE_WIRE_STATES",
     "DTMF_PATTERN",
+    "E164_PATTERN",
     "EVENT_WIRE_NAMES",
     "MAX_DTMF_DIGITS",
     "MAX_IDEMPOTENCY_KEY_LEN",
@@ -108,6 +111,7 @@ __all__ = [
     "LineState",
     "LineStateChangedEvent",
     "LineSummary",
+    "LineTimeouts",
     "LivenessState",
     "MediaAllocator",
     "MediaCredentials",
@@ -142,6 +146,8 @@ __all__ = [
     "TimeoutConfig",
     "WireCallState",
     "ensure_aware_utc",
+    "heartbeat_interval_ms_from_sec",
+    "validate_e164_country",
 ]
 
 
@@ -748,6 +754,74 @@ class PhonebridgeError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Number validation (docs/api-contract.md "Dial validation", round 12)
+# ---------------------------------------------------------------------------
+
+E164_PATTERN: re.Pattern[str] = re.compile(r"^\+[1-9]\d{6,14}$")
+"""Strict E.164 shape gate (api-contract.md "Dial validation"):
+``+`` followed by a non-zero country-code digit and 7-15 digits
+total. Local/national forms, missing ``+``, bare-``+`` hybrids,
+spaces, punctuation and extension markers never pass - the check
+runs BEFORE phonenumbers parsing so malformed input cannot borrow
+a region."""
+
+_ISO_ALPHA2_PATTERN: re.Pattern[str] = re.compile(r"^[A-Z]{2}$")
+
+
+def validate_e164_country(number: RedactedString, country: str) -> str:
+    """Pure E.164 + ISO alpha-2 cross-check (round 24, review-13 M1).
+
+    Single domain helper for the "who may this number be" question so
+    the check cannot drift between call sites: strict
+    :data:`E164_PATTERN` shape gate first, then
+    ``phonenumbers.parse`` + ``is_valid_number()`` +
+    ``is_valid_number_for_region(parsed, country)`` (the documented
+    ``call.dial`` pipeline - region check via
+    ``is_valid_number_for_region``, NOT
+    ``region_code_for_number() == country``, so shared calling codes
+    like NANP ``+1`` never false-reject). ``country`` is a cross-check
+    ASSERTION only - never a parse region and never a source of
+    prefixes.
+
+    Returns the validated raw E.164 string. Raises ``ValueError`` on
+    any rejection - under pydantic model validation it surfaces as a
+    ``ValidationError`` (INVALID_ARGUMENT at the adapter), on the
+    ``call.dial`` path the kernel maps the same rejections to
+    ``DIAL_REJECTED`` with the typed ``data.reason`` sub-codes."""
+    raw = number.expose()
+    if not E164_PATTERN.fullmatch(raw):
+        raise ValueError("number is not strict E.164")
+    if not _ISO_ALPHA2_PATTERN.fullmatch(country):
+        raise ValueError("country is not ISO 3166-1 alpha-2")
+    try:
+        parsed = phonenumbers.parse(raw, None)
+    except phonenumbers.NumberParseException as exc:
+        raise ValueError("number does not parse") from exc
+    if not phonenumbers.is_valid_number(parsed):
+        raise ValueError("number is not a valid subscriber number")
+    if not phonenumbers.is_valid_number_for_region(parsed, country):
+        raise ValueError("number is not valid for the declared country")
+    return raw
+
+
+def _provider_caps_check(caps: tuple[Intent, ...]) -> tuple[Intent, ...]:
+    """Shared ``caps`` invariant for provider-facing models (round 24,
+    review-13 M3): a provider declares TELECOM capabilities only -
+    ``caps`` must be non-empty and MUST NOT contain
+    ``Intent.EXCLUSIVE_LINE``: durable exclusivity is a property of
+    ``LineAssignment.claimable``/``mode`` granted by the admin claim
+    flow, never of the hardware attachment."""
+    if not caps:
+        raise ValueError("caps must declare at least one intent")
+    if Intent.EXCLUSIVE_LINE in caps:
+        raise ValueError(
+            "exclusive_line is not a provider capability - "
+            "exclusivity lives on LineAssignment.claimable/mode"
+        )
+    return caps
+
+
+# ---------------------------------------------------------------------------
 # Fallback policy (design §5.3, ADR-01)
 #
 # Typed discriminated union on `policy`. The wire spellings
@@ -782,11 +856,19 @@ class ForwardViaLineFallback(ContractModel):
     full dial target (same ``number`` + ``country`` pair semantics
     as ``call.dial``: ``target_number`` is a strict-E.164
     RedactedString, ``target_country`` the ISO 3166-1 alpha-2
-    cross-check assertion; both are pre-validated at
-    ``configure_line`` time).
+    cross-check assertion). Round 24 (review-13 M1) moves the check
+    INTO the model: ``_valid_dial_target`` runs
+    :func:`validate_e164_country` at construction, so a corrupt
+    SQLite/config row can never hydrate an invalid policy that would
+    only explode inside the FallbackWorker at ring time;
+    ``configure_line`` still applies the dial-time
+    ``allowed_number_types`` gate against the TARGET line
+    (``forward.line_id``) on top.
 
-    ``configure_line`` MUST reject a self-loop: ``line_id`` equal to
-    the line being configured would bridge the ring onto itself.
+    A self-loop is banned at two levels: this model cannot know the
+    configured line, so ``LineAssignment`` rejects
+    ``fallback_policy.line_id == self.line_id`` (round 24, review-13
+    M1) and ``configure_line`` rejects the same pair on the wire.
     Wire config spelling:
     ``forward_via_line:<line_id>:<e164_number>:<country>``."""
 
@@ -794,6 +876,16 @@ class ForwardViaLineFallback(ContractModel):
     line_id: LineId
     target_number: RedactedString
     target_country: str
+
+    @model_validator(mode="after")
+    def _valid_dial_target(self) -> ForwardViaLineFallback:
+        """The policy carries a DIAL TARGET, not a label - validate it
+        the way ``call.dial`` would (round 24, review-13 M1) so an
+        invalid ``target_number``/``target_country`` pair can never
+        exist inside a frozen model (including rows hydrated from
+        SQLite, which bypass ``configure_line`` checks entirely)."""
+        validate_e164_country(self.target_number, self.target_country)
+        return self
 
 
 class RecordAndTelegramFallback(ContractModel):
@@ -804,8 +896,19 @@ class RecordAndTelegramFallback(ContractModel):
 
 
 class AnswerAndAnnounceFallback(ContractModel):
-    """Worker policy: answer and play an announcement. Valid only while
-    an agent is registered for inbound on the line.
+    """Worker policy: answer and play an announcement.
+
+    Eligibility predicate inside ``decide_fallback`` (round 24,
+    review-13 M4 - the earlier "only if an agent is registered for
+    inbound" was ambiguous for an EXCLUSIVE line with a sleeping
+    owner and named no default): the policy is eligible when the
+    line's ``assignment.mode == AssignmentMode.EXCLUSIVE`` OR at
+    least one live session holds ``Intent.RECEIVE_INBOUND`` on it
+    (the ``system:fallback_worker`` session itself is EXCLUDED from
+    that count - the worker never satisfies its own precondition);
+    when neither holds, ``decide_fallback`` MUST degrade to
+    ``NoPickupFallback`` instead of dispatching an announcement the
+    worker could never execute.
 
     ``announcement_ref`` (round 22, review-10 MEDIUM-2) is the
     admin-provisioned announcement reference - a WAV asset id or text
@@ -835,6 +938,116 @@ FallbackPolicy = Annotated[
 # ---------------------------------------------------------------------------
 
 
+def heartbeat_interval_ms_from_sec(interval_sec: float) -> int:
+    """Canonical ``heartbeat_interval_sec`` -> ``heartbeat_interval_ms``
+    conversion (round 24c, reviewer finding on the round-24 C2 model).
+
+    The rule is ``round(interval_sec * 1000)`` - nearest millisecond -
+    clamped to ``>= 1``. The interval itself is floored at millisecond
+    granularity (``ge=0.001`` s, the wire unit) on
+    :class:`LineTimeouts` and :class:`TimeoutConfig`, so the clamp only
+    guards a caller that bypasses model validation; the pair together
+    guarantees a stamped ``heartbeat_interval_ms >= 1`` for ANY config
+    that passes validation - a truncation to zero (e.g.
+    ``int(0.0005 * 1000) == 0``) can never reach
+    :class:`ProviderBinding` and break its ``gt=0`` construction."""
+    return max(1, round(interval_sec * 1000))
+
+
+class LineTimeouts(ContractModel):
+    """Effective per-line timeout values (round 24, review-13 C2 /
+    ADR-24.2): the CONCRETIZED counterpart of the ``TimeoutConfig``
+    patch model - every field carries its resolved value, never
+    ``None``.
+
+    Why a second model exists: adapters need effective values the
+    patch model cannot express - the manager adapter answers
+    ``provider.register`` with ``heartbeat_interval_ms`` and the
+    admin adapter write-through-saves the full resolved set into
+    ``lines.timeouts_json`` (design §4.5); ``TimeoutConfig`` holds
+    ``None`` for unpatched knobs and would silently persist holes.
+    ``LineAssignment.timeouts`` therefore carries this model, and
+    ``ProviderBinding.heartbeat_interval_ms`` stamps
+    ``heartbeat_interval_sec`` (as ms, via
+    :func:`heartbeat_interval_ms_from_sec` - ``round(sec * 1000)``
+    clamped to ``>= 1`` ms, round 24c) at register/reregister time so
+    a runtime ``configure_line`` patch never retro-applies to a live
+    provider session."""
+
+    grant_ttl_sec: float = Field(default=5.0, gt=0)
+    """Deadline to consume a grant (``AcquireGranted.expires_at`` /
+    ``QueueReadyEvent.expires_at``) before the lease ends
+    ``grant_ttl_expired``."""
+    orphan_grace_sec: float = Field(default=10.0, gt=0)
+    """WS-drop re-bind window - feeds
+    ``ProviderBinding.orphan_deadline_at``."""
+    heartbeat_interval_sec: float = Field(default=5.0, ge=0.001)
+    """Required ``provider.ping`` cadence for the line's binding;
+    surfaced to the provider as ``heartbeat_interval_ms`` inside the
+    ``provider.register``/``provider.reregister`` response. Floored
+    at millisecond granularity (``ge=0.001`` s - the wire unit is
+    ms, round 24c) and converted via
+    :func:`heartbeat_interval_ms_from_sec`, so no valid value can
+    truncate to a zero-cadence ``heartbeat_interval_ms``."""
+    heartbeat_degraded_after: int = Field(default=2, ge=1)
+    """Missed pings before the line goes DEGRADED."""
+    heartbeat_down_after: int = Field(default=3, ge=1)
+    """Missed pings before the line goes DOWN - MUST strictly exceed
+    ``heartbeat_degraded_after`` (DOWN is the terminal escalation of
+    DEGRADED, not a parallel state)."""
+    fallback_accept_ttl_sec: float = Field(default=10.0, gt=0)
+    """Deadline for the FallbackWorker to ``call.accept`` a re-issued
+    ``fallback_call_token`` - bounds
+    ``FallbackTriggeredEvent.expires_at``."""
+
+    @model_validator(mode="after")
+    def _heartbeat_thresholds_ordered(self) -> LineTimeouts:
+        """Enforce ``heartbeat_down_after > heartbeat_degraded_after``:
+        an inverted pair would mark the line DOWN before it could
+        ever appear DEGRADED."""
+        if self.heartbeat_down_after <= self.heartbeat_degraded_after:
+            raise ValueError("heartbeat_down_after must exceed heartbeat_degraded_after")
+        return self
+
+    def apply_patch(self, patch: TimeoutConfig) -> LineTimeouts:
+        """Atomically merge a :class:`TimeoutConfig` PATCH into these
+        effective values (round 24b, residual review finding on the
+        round-24 C2 model).
+
+        The merge is a full ``model_validate`` of the merged dict -
+        every ``None`` patch field keeps the stored value, every
+        non-``None`` field replaces it - so ALL invariants are
+        re-checked against the RESULT, not against the patch alone.
+        This closes the single-field hole: a lone
+        ``heartbeat_degraded_after=4`` is a legal
+        :class:`TimeoutConfig` in isolation yet inverts the
+        heartbeat ladder against a stored ``heartbeat_down_after=3``.
+        ``LineAdminKernel.configure_line`` MUST merge through this
+        method so such a violation surfaces as a mapped
+        ``PhonebridgeError(ErrorCode.INVALID_ARGUMENT)`` instead of
+        silently hydrating invalid effective values or leaking a raw
+        ``ValidationError`` at the adapter.
+
+        The operation is ATOMIC: either a fully-validated
+        :class:`LineTimeouts` is returned or the error is raised -
+        the stored values are never half-patched. An all-``None``
+        patch re-validates and returns the same effective values.
+        On failure ``ErrorData.detail`` joins ALL validation
+        messages with ``"; "`` (round 24c - first-error-only would
+        hide a second broken knob); the messages are pydantic
+        ``msg`` strings only, so no raw input/PII is echoed
+        (``hide_input_in_errors``)."""
+        merged = {**self.model_dump(), **patch.model_dump(exclude_none=True)}
+        try:
+            return LineTimeouts.model_validate(merged)
+        except ValidationError as exc:
+            detail = "; ".join(err["msg"] for err in exc.errors()) or "invalid timeouts patch"
+            raise PhonebridgeError(
+                ErrorCode.INVALID_ARGUMENT,
+                ErrorData(detail=detail),
+            ) from exc
+
+
 class LineSummary(ContractModel):
     """Agent-facing line listing row (wire: call.get_lines)."""
 
@@ -857,6 +1070,18 @@ class LineAssignment(ContractModel):
     A non-None value means durable exclusive ownership
     (``exclusive_line`` mode). This avoids magic placeholder strings
     ("", "__pool__") in implementations.
+
+    ``assignment_id`` ROTATES (round 24, review-13 M2): every
+    owner/mode change of the durable binding (``assign_line``,
+    ``approve_claim``, owner ``release_assignment`` reverting to
+    SHARED_POOL, ``revoke_assignment``) MINTS a new ``AssignmentId``
+    rather than reusing the old one - reusing it let a stale retry
+    from the previous owner collide with the new binding
+    (OWNER_MISMATCH where idempotent no-op was promised, or a
+    foreign ``{ok}``). The superseded id is retained in a bounded
+    ``_closed_assignments`` LRU ring (cap 1024, same shape as
+    ``_closed_leases``) so a late retry resolves as an idempotent
+    success for its past owner instead.
     """
 
     assignment_id: AssignmentId
@@ -866,6 +1091,12 @@ class LineAssignment(ContractModel):
     claimable: bool
     accept_window_sec: float = Field(default=30.0, gt=0)
     fallback_policy: FallbackPolicy = Field(default_factory=NoPickupFallback)
+    timeouts: LineTimeouts = Field(default_factory=LineTimeouts)
+    """Effective per-line timeout values (round 24, review-13 C2):
+    the resolved counterpart of the ``TimeoutConfig`` patch -
+    hydrated into kernel state on ``configure_line`` and persisted
+    verbatim to ``lines.timeouts_json`` by the admin adapter's
+    write-through save (design §4.5)."""
     allowed_number_types: frozenset[str] = Field(
         default_factory=lambda: frozenset(
             {"FIXED_LINE", "MOBILE", "FIXED_LINE_OR_MOBILE", "VOIP", "TOLL_FREE"}
@@ -879,17 +1110,34 @@ class LineAssignment(ContractModel):
     NANP numbers, so a plain US/CA mobile would otherwise be rejected
     as UNSUPPORTED_NUMBER_TYPE (review round 15)."""
     last_seen_at: AwareDatetime
+    """Activity stamp for the ``idle_revoke_after`` window (round 24,
+    review-13 H4): refreshed to ``now`` on EVERY line operation AND
+    on ``drop_session`` of the owner's LAST open session. A line
+    whose ``owner_agent_id`` still holds at least one open session is
+    NEVER idle - a secretary agent sitting 25 h on a live socket
+    waiting for inbound is ACTIVE and must not trigger a false
+    ``event.idle_alert``; the idle clock only runs against a
+    session-less owner."""
     idle_revoke_after: timedelta | None = None
 
     @model_validator(mode="after")
-    def _owner_matches_mode(self) -> LineAssignment:
-        """Enforce the round-19 owner⇔mode invariant at the model
-        boundary: ``exclusive`` requires an owner, ``shared_pool``
-        forbids one - contradictory states cannot be constructed."""
+    def _validate_assignment_invariants(self) -> LineAssignment:
+        """Enforce the model-boundary invariants (round 19 owner⇔mode;
+        round 24 review-13 M1 self-loop): ``exclusive`` requires an
+        owner, ``shared_pool`` forbids one - contradictory states
+        cannot be constructed - and a ``forward_via_line`` policy can
+        never name its own line as the dial-through target (that
+        would bridge the ring onto itself; the check used to live
+        only in ``configure_line``, which DB hydration bypasses)."""
         if self.mode is AssignmentMode.EXCLUSIVE and self.owner_agent_id is None:
             raise ValueError("exclusive assignment requires owner_agent_id")
         if self.mode is AssignmentMode.SHARED_POOL and self.owner_agent_id is not None:
             raise ValueError("shared_pool assignment cannot carry owner_agent_id")
+        if (
+            isinstance(self.fallback_policy, ForwardViaLineFallback)
+            and self.fallback_policy.line_id == self.line_id
+        ):
+            raise ValueError("forward_via_line cannot target the same line_id")
         return self
 
 
@@ -914,11 +1162,39 @@ class ProviderBinding(ContractModel):
     assignment_id: AssignmentId
     line_id: LineId
     caps: tuple[Intent, ...]
+    """Provider-declared TELECOM capabilities - ``dial_out`` /
+    ``receive_inbound`` only (round 24, review-13 M3): availability
+    of durable exclusivity is a ``LineAssignment.claimable``/``mode``
+    property, never a hardware capability, so
+    ``Intent.EXCLUSIVE_LINE`` is rejected here the same way it is on
+    the ``provider.register``/``provider.capability_update``
+    ingress."""
     profile: str | None = None
     liveness: LivenessState = LivenessState.REACHABLE
+    heartbeat_interval_ms: int = Field(default=5000, gt=0)
+    """Ping cadence negotiated for THIS provider session (round 24,
+    review-13 C2): stamped from the line's effective
+    ``LineTimeouts.heartbeat_interval_sec`` inside
+    ``register_provider`` via
+    :func:`heartbeat_interval_ms_from_sec` - ``round(sec * 1000)``,
+    clamped to ``>= 1`` (round 24c; ``heartbeat_interval_sec`` is
+    floored at ``ge=0.001`` s so a valid config can never stamp 0) -
+    and returned to the adapter so the
+    ``provider.register``/``provider.reregister`` response can carry
+    the wire ``heartbeat_interval_ms``. A ``configure_line`` patch to
+    ``heartbeat_interval_sec`` takes effect on the NEXT
+    ``provider.reregister`` - it is never enforced retroactively
+    against the interval stamped here (round 23, review-12 H6:
+    shrinking it mid-session would kill a healthy provider on a
+    false ping timeout)."""
     connected_at: AwareDatetime
     last_seen_at: AwareDatetime
     orphan_deadline_at: AwareDatetime | None = None
+
+    @field_validator("caps")
+    @classmethod
+    def _caps_are_telecom_only(cls, caps: tuple[Intent, ...]) -> tuple[Intent, ...]:
+        return _provider_caps_check(caps)
 
 
 class CallLease(ContractModel):
@@ -1512,7 +1788,13 @@ class FallbackTriggeredEvent(ContractModel):
     review-12 M6) is the absolute deadline the worker has to
     ``call.accept`` the re-issued token - bounded by the line's
     ``fallback_accept_ttl_sec`` knob (~10 s), so a dead or wedged
-    FallbackWorker can never hold a ring open indefinitely."""
+    FallbackWorker can never hold a ring open indefinitely. The
+    deadline is enforced by ``tick(now)`` (round 24, review-13 H2):
+    on lapse without a worker accept the kernel burns the
+    ``fallback_call_token``, releases the line
+    ``RINGING_LOCKED -> FREE`` and emits
+    ``MissedCallEvent(reason=CallEndReason.ACCEPT_WINDOW_EXPIRED)`` -
+    the no-pickup outcome of last resort."""
 
     line_id: LineId
     call_token: CallToken
@@ -1561,7 +1843,15 @@ class IdleAlertEvent(ContractModel):
     (owner release, admin revoke). Emitted at most once per
     continuous idle period - ``tick(now)`` records the alert so a
     still-idle line does not re-alert on every tick until activity
-    resets the window."""
+    resets the window.
+
+    Activity rule (round 24, review-13 H4): a line whose
+    ``owner_agent_id`` holds at least one OPEN session is ACTIVE -
+    the idle clock never runs against it, so a secretary agent
+    waiting days on a live socket for inbound rings cannot trigger
+    a false alert. ``last_seen_at`` refreshes on every line
+    operation and when ``drop_session`` closes the owner's LAST
+    session - that is the moment the idle window starts."""
 
     assignment_id: AssignmentId
     line_id: LineId
@@ -1592,7 +1882,12 @@ class ProviderRegistration(ContractModel):
     """Distilled registration fact (provider.register at the boundary).
 
     ``token`` is the per-line shared secret - RedactedString so a
-    registration record can never leak it to logs (rule 10)."""
+    registration record can never leak it to logs (rule 10). The
+    kernel MUST NOT retain the raw token in its in-memory state once
+    the binding exists (review-13 security audit): the shared secret
+    authenticates the register handshake itself, not the session.
+    ``caps`` is non-empty and telecom-only - see
+    :func:`_provider_caps_check` (round 24, review-13 M3)."""
 
     line_id: LineId
     token: RedactedString
@@ -1617,6 +1912,13 @@ class ProviderRegistration(ContractModel):
     inside the 10 s orphan-grace window so the kernel can verify a
     surviving call still exists on the D-Bus before re-binding its
     lease (design §5.4). ``None`` on a first-time register."""
+
+    @field_validator("caps")
+    @classmethod
+    def _caps_are_telecom_only(cls, caps: tuple[Intent, ...]) -> tuple[Intent, ...]:
+        """A provider declares TELECOM capabilities only (round 24,
+        review-13 M3)."""
+        return _provider_caps_check(caps)
 
     @field_validator("meta")
     @classmethod
@@ -1747,7 +2049,15 @@ class ProviderCapabilityUpdate(ContractModel):
     line_id: LineId
     assignment_id: AssignmentId
     caps: tuple[Intent, ...]
+    """Replacement capabilities - same non-empty telecom-only
+    invariant as ``ProviderRegistration.caps`` (round 24, review-13
+    M3)."""
     profile: str | None = None
+
+    @field_validator("caps")
+    @classmethod
+    def _caps_are_telecom_only(cls, caps: tuple[Intent, ...]) -> tuple[Intent, ...]:
+        return _provider_caps_check(caps)
 
 
 class FallbackDecision(ContractModel):
@@ -1761,7 +2071,15 @@ class FallbackDecision(ContractModel):
     ``accept_window_sec`` first (round 23, review-12 H6): wake-and-
     grant hooks (webhook/exec) exist precisely to wake a sleeping
     agent inside that window, so "no live session right now" is NOT
-    an immediate-fallback trigger."""
+    an immediate-fallback trigger.
+
+    The eligibility predicate for ``answer_and_announce``
+    (round 24, review-13 M4): the policy is eligible when the
+    line's ``assignment.mode == AssignmentMode.EXCLUSIVE`` OR at
+    least one live session holds ``Intent.RECEIVE_INBOUND`` on the
+    line - the ``system:fallback_worker`` session is EXCLUDED from
+    that count; when neither holds the decision degrades to
+    ``NoPickupFallback``."""
 
     line_id: LineId
     call_token: CallToken
@@ -1964,6 +2282,12 @@ class LineManager(ABC):
         trailing ``release`` after them is an idempotent no-op.
         OWNER_MISMATCH on a foreign ``(session_id, lease_id)`` pair.
 
+        The wire ``call.release`` carries exactly ONE target
+        (``lease_id`` XOR ``assignment_id``, round 22); a request
+        carrying ZERO or BOTH targets is ``INVALID_ARGUMENT`` at the
+        adapter boundary (round 24, review-13 L1) and never reaches
+        this method or :meth:`release_assignment`.
+
         The DURABLE ``LineAssignment`` has its own voluntary-release
         path - :meth:`release_assignment`."""
         ...
@@ -1980,10 +2304,19 @@ class LineManager(ABC):
 
         The wire ``call.release`` carries exactly ONE target
         (``lease_id`` XOR ``assignment_id``); the adapter dispatches
-        to :meth:`release` or this method. OWNER_MISMATCH when the
-        session's ``agent_id`` is not the assignment owner;
-        PhonebridgeError on an id unknown to the LineAssignment
-        object space. Idempotent on an already-released binding."""
+        to :meth:`release` or this method, and a request carrying
+        ZERO or BOTH targets is ``INVALID_ARGUMENT`` (round 24,
+        review-13 L1). OWNER_MISMATCH when the session's
+        ``agent_id`` is not the assignment owner;
+        ``PhonebridgeError(ErrorCode.STALE_TOKEN)`` on an id unknown
+        to the LineAssignment object space - the durable-binding
+        counterpart of a consumed ``call_token`` (round 24,
+        review-13 L1). Idempotent on an already-released binding:
+        the superseded id stays resolvable via the bounded
+        ``_closed_assignments`` ring after the rotation documented
+        on :class:`LineAssignment` (round 24, review-13 M2) - a
+        retried release by the previous owner is a no-op, not an
+        ``OWNER_MISMATCH``."""
         ...
 
     @abstractmethod
@@ -2091,7 +2424,15 @@ class LineManager(ABC):
         self, session_id: SessionId, intent: Intent | None = None
     ) -> list[LineSummary]:
         """call.get_lines: pool view filtered by intent. Always bounded
-        (rule 7): the line set is finite config, not a stream."""
+        (rule 7): the line set is finite config, not a stream.
+
+        ``intent=Intent.EXCLUSIVE_LINE`` filter semantics (round 24,
+        review-13 M3): returns the lines whose
+        ``assignment.claimable is True and assignment.mode ==
+        AssignmentMode.SHARED_POOL`` - exclusivity AVAILABILITY is a
+        ``LineAssignment`` property, never a provider capability;
+        ``ProviderBinding.caps`` carries only the telecom intents
+        ``dial_out``/``receive_inbound``."""
         ...
 
     # --- provider ingress (narrowed: facts and decisions, not transport) ---
@@ -2111,6 +2452,17 @@ class LineManager(ABC):
         the line's default ``LineAssignment`` (SHARED_POOL,
         owner_agent_id=None) if none exists - the binding itself is
         the returned record.
+
+        The returned :class:`ProviderBinding` stamps
+        ``heartbeat_interval_ms`` from the line's EFFECTIVE
+        ``LineTimeouts.heartbeat_interval_sec`` (round 24,
+        review-13 C2) via :func:`heartbeat_interval_ms_from_sec`
+        (``round(sec * 1000)``, min 1 ms - round 24c) so the adapter
+        can answer
+        ``provider.register``/``provider.reregister`` with the wire
+        ``heartbeat_interval_ms`` - a ``configure_line`` patch to the
+        interval applies on the NEXT reregister, never
+        retroactively to the stamped session value.
         """
         ...
 
@@ -2163,7 +2515,32 @@ class LineManager(ABC):
         Atomic w.r.t. concurrent acquires on the same line
         (single-event-loop invariant). Idempotent: re-ingesting a
         ring on an already RINGING_LOCKED line returns the existing
-        event with the SAME ``call_token``."""
+        event with the SAME ``call_token``.
+
+        Line-state contract (round 24, review-13 H3 - the glare
+        matrix is defined for EVERY state, including the classic
+        race where the agent's ``call.dial`` is still in flight to
+        the provider while the cellular network lands a genuinely
+        first inbound call on the handset - Call Waiting filtering
+        cannot see it):
+        - ``FREE`` -> transition to ``RINGING_LOCKED``, mint the
+          ``call_token``;
+        - ``BUSY`` holding a lease still in ``CallPhase.ACQUIRED``
+          (granted-but-undialed) WITH ``Intent.RECEIVE_INBOUND`` in
+          the binding's ``caps`` -> preempt the grant
+          (``preempted_by_incoming``) and lock the ring;
+        - ``RINGING_LOCKED`` -> idempotent return of the open ring's
+          event;
+        - ``BUSY`` in every other phase (the glare case in
+          ``DIALING``/``ALERTING``/``ACTIVE`` or an ``external_call``
+          hold), ``DOWN``, or a binding whose ``caps`` lack
+          ``RECEIVE_INBOUND`` -> ``PhonebridgeError`` with
+          ``ErrorCode.INVALID_STATE``. The LineProvider maps that
+          error (or a ``{ok: false}`` wire result) to a
+          ``VoiceCall.Hangup`` on the inbound call object (and
+          counts ``glare_inbound_rejected``) - it MUST NOT leave the
+          glare call ringing and MUST NOT report the line
+          ``RINGING_LOCKED``."""
         ...
 
     @abstractmethod
@@ -2196,7 +2573,16 @@ class LineManager(ABC):
         even with zero live subscribed/owner sessions the kernel waits
         the full ``accept_window_sec`` so configured wake-and-grant
         hooks can wake a sleeping agent (round 23, review-12 H6) -
-        "no live session" is never an immediate-fallback trigger."""
+        "no live session" is never an immediate-fallback trigger.
+
+        Timer ownership (round 24, review-13 H2): this method NEVER
+        sleeps - ``tick(now)`` is the ONLY timer driver in the kernel
+        (rules 2/4 forbid a parked await inside the domain). ``tick``
+        runs the fallback decision internally once
+        ``now >= ring.expires_at``; a DIRECT ``decide_fallback``
+        call on a ring whose ``expires_at`` has NOT yet elapsed
+        raises ``PhonebridgeError(ErrorCode.INVALID_STATE)`` - the
+        accept window cannot be short-circuited from outside."""
         ...
 
     # --- agent session lifecycle ---
@@ -2225,6 +2611,25 @@ class LineManager(ABC):
         """Single generic lifecycle hook for time-driven housekeeping:
         accept-window expiry, queue grant-TTL advancement, heartbeat
         DEGRADED->DOWN escalation.
+
+        Tick OWNS both ring timers (round 24, review-13 H2): at
+        ``now >= ring.expires_at`` (``accept_window_sec`` elapsed) it
+        performs the :meth:`decide_fallback` policy decision
+        internally - including minting the ``fallback_call_token``
+        and emitting ``event.fallback_triggered`` for worker
+        policies; a second deadline, ``fallback_accept_ttl_sec``
+        (surfaced as ``FallbackTriggeredEvent.expires_at``), bounds
+        the worker's ``call.accept``. When that second timer lapses
+        without an accept, ``tick`` burns the
+        ``fallback_call_token``, releases the line
+        ``RINGING_LOCKED -> FREE`` and emits
+        ``MissedCallEvent(reason=CallEndReason.ACCEPT_WINDOW_EXPIRED)``
+        - a dead or wedged FallbackWorker can never hold a ring
+        open. ``tick`` also drives idle bookkeeping: an EXCLUSIVE
+        line whose ``owner_agent_id`` holds at least one open
+        session is never idle; ``last_seen_at`` is stamped by
+        ``drop_session`` and by every line operation (round 24,
+        review-13 H4).
 
         Justification for a hook at all: the narrowed ingress surface
         forbids per-timer public methods, yet all of the above are
@@ -2308,6 +2713,13 @@ class TimeoutConfig(ContractModel):
 
     Passed to :meth:`LineAdminKernel.configure_line` as a PATCH:
     every member is optional, ``None`` means "leave unchanged".
+    The merge into the line's stored :class:`LineTimeouts` is
+    ATOMIC and MUST go through :meth:`LineTimeouts.apply_patch`
+    (round 24b): the merged dict is re-validated in full, so a
+    single-field patch that passes THIS model's own checks can
+    still be rejected against the stored effective values -
+    failure maps to ``PhonebridgeError(ErrorCode.INVALID_ARGUMENT)``,
+    never a raw ``ValidationError``, and leaves no partial state.
     Values are scoped per line - the line's provider binding and
     queue grants share them."""
 
@@ -2320,8 +2732,12 @@ class TimeoutConfig(ContractModel):
     """WS-drop re-bind window - feeds
     ``ProviderBinding.orphan_deadline_at`` (default 10 s, round
     5b/20)."""
-    heartbeat_interval_sec: float | None = Field(default=None, gt=0)
-    """Required ``provider.ping`` cadence for the line's binding.
+    heartbeat_interval_sec: float | None = Field(default=None, ge=0.001)
+    """Required ``provider.ping`` cadence for the line's binding,
+    floored at millisecond granularity (``ge=0.001`` s - the wire
+    unit is ms, round 24c; the sec -> ms conversion is pinned by
+    :func:`heartbeat_interval_ms_from_sec`, ``round(sec * 1000)``
+    min 1, so a valid value can never stamp a zero cadence).
     A runtime change takes effect on the provider's NEXT
     ``provider.reregister`` - the live provider learns
     ``heartbeat_interval_ms`` only from the register response, so
@@ -2339,6 +2755,25 @@ class TimeoutConfig(ContractModel):
     illustrative default): bounds
     ``FallbackTriggeredEvent.expires_at``, so a dead worker never
     leaves a ring pending past its TTL."""
+
+    @model_validator(mode="after")
+    def _heartbeat_thresholds_ordered(self) -> TimeoutConfig:
+        """Same invariant as :class:`LineTimeouts` (round 24,
+        review-13 C2): when BOTH thresholds are patched at once,
+        ``heartbeat_down_after`` must exceed
+        ``heartbeat_degraded_after`` - catching the inverted pair at
+        patch time instead of after hydration into the effective
+        values. A LONE threshold passes here and is re-checked
+        against the stored effective values by
+        :meth:`LineTimeouts.apply_patch` at merge time (round
+        24b)."""
+        if (
+            self.heartbeat_down_after is not None
+            and self.heartbeat_degraded_after is not None
+            and self.heartbeat_down_after <= self.heartbeat_degraded_after
+        ):
+            raise ValueError("heartbeat_down_after must exceed heartbeat_degraded_after")
+        return self
 
 
 class LineAdminKernel(ABC):
@@ -2366,20 +2801,32 @@ class LineAdminKernel(ABC):
         be held exclusive by another agent
         (LINE_EXCLUSIVE_NOT_OWNER); an existing SHARED_POOL
         assignment is converted in place (``mode=EXCLUSIVE``,
-        ``owner_agent_id`` set)."""
+        ``owner_agent_id`` set) and mints a FRESH ``assignment_id``
+        for the new owner/mode pair (rotation, round 24, review-13
+        M2 - see :class:`LineAssignment`)."""
         ...
 
     @abstractmethod
     async def approve_claim(self, claim_id: ClaimId) -> LineAssignment:
         """Approve a pending ``call.claim_exclusive`` request: grants
         the durable ``exclusive_line`` assignment (moderator action,
-        §4.2). Unknown claim_id -> PhonebridgeError."""
+        §4.2) and mints a FRESH ``assignment_id`` for it (rotation,
+        round 24, review-13 M2). Unknown or already-resolved
+        ``claim_id`` ->
+        ``PhonebridgeError(ErrorCode.INVALID_STATE,
+        ErrorData(reason=ErrorReason.CLAIM_NOT_FOUND))`` (round 24,
+        review-13 L1 - a claim is pending STATE, not a token, so the
+        missing id reports as INVALID_STATE with the typed
+        sub-code)."""
         ...
 
     @abstractmethod
     async def reject_claim(self, claim_id: ClaimId, reason: str | None = None) -> None:
         """Reject a pending claim request with an optional PII-free
-        reason string."""
+        reason string. Unknown or already-resolved ``claim_id`` ->
+        ``PhonebridgeError(ErrorCode.INVALID_STATE,
+        ErrorData(reason=ErrorReason.CLAIM_NOT_FOUND))`` - same
+        mapping as :meth:`approve_claim` (round 24, review-13 L1)."""
         ...
 
     @abstractmethod
@@ -2424,7 +2871,17 @@ class LineAdminKernel(ABC):
         reason=CallEndReason.ADMIN_REVOKED)`` - NEVER an
         ``AssignmentRevokedEvent``, because a provider attachment
         has no agent audience (round 22, review-10 HIGH-6).
-        Unknown id in BOTH spaces -> PhonebridgeError."""
+        Unknown id in BOTH spaces ->
+        ``PhonebridgeError(ErrorCode.STALE_TOKEN)`` (round 24,
+        review-13 L1 - an unresolvable durable id is a stale
+        reference, the counterpart of a consumed ``call_token``).
+        Revoking an agent assignment reverts the line to
+        SHARED_POOL and mints a FRESH ``assignment_id`` for the
+        reverted binding (rotation, round 24, review-13 M2 - see
+        :class:`LineAssignment`); the revoked id resolves through
+        the bounded ``_closed_assignments`` ring so a retried
+        revoke/release is idempotent rather than
+        ``OWNER_MISMATCH``."""
         ...
 
     @abstractmethod
@@ -2440,7 +2897,11 @@ class LineAdminKernel(ABC):
         timeouts: TimeoutConfig | None = None,
     ) -> LineAssignment:
         """Runtime line-config patch (admin.configure_line): apply only
-        the non-None fields, return the updated LineAssignment. All
+        the non-None fields, return the updated LineAssignment - the
+        returned record carries the line's EFFECTIVE
+        :class:`LineTimeouts` in ``timeouts`` (round 24, review-13
+        C2) so the admin adapter can write it through to
+        ``lines.timeouts_json`` verbatim (design §4.5). All
         windows are admin-configurable without a daemon restart
         (round 10a). ``idle_revoke_after`` (round 22, review-10
         HIGH-5) patches the ALERT-ONLY idle-escalation deadline
@@ -2449,16 +2910,38 @@ class LineAdminKernel(ABC):
         heartbeat DEGRADED/DOWN thresholds, fallback accept TTL) as
         a partial :class:`TimeoutConfig` patch.
 
-        Fallback-policy validation (round 23, review-12 C2): a
-        ``forward_via_line`` policy is pre-validated HERE, at config
-        time - ``target_number``/``target_country`` go through the
-        same strict-E.164 + ISO alpha-2 + ``allowed_number_types``
-        checks ``call.dial`` applies (INVALID_ARGUMENT /
-        DIAL_REJECTED-class rejections, not a deferred runtime
-        surprise), and a SELF-LOOP is rejected outright:
-        ``forward.line_id == line_id`` is INVALID_ARGUMENT - the
-        line can never be its own forward target. A patched
+        Fallback-policy validation (round 23, review-12 C2; refined
+        round 24, review-13 M1): a ``forward_via_line`` policy is
+        pre-validated HERE, at config time -
+        ``target_number``/``target_country`` go through the same
+        strict-E.164 + ISO alpha-2 checks ``call.dial`` applies -
+        and are additionally enforced INSIDE
+        :class:`ForwardViaLineFallback` itself via
+        :func:`validate_e164_country`, so a corrupt hydrated row can
+        never carry an invalid policy past the model boundary. The
+        ``allowed_number_types`` gate is evaluated against the
+        TARGET line ``forward.line_id`` (when that line is already
+        registered in the store - checking the CONFIGURED line's
+        allowlist would gate the wrong policy, review-13 M1) and
+        re-checked at dial time by the FallbackWorker against the
+        target's effective allowlist. A SELF-LOOP is rejected
+        outright: ``forward.line_id == line_id`` is
+        INVALID_ARGUMENT - the line can never be its own forward
+        target (the same invariant is model-enforced inside
+        :class:`LineAssignment`). A patched
         ``heartbeat_interval_sec`` takes effect on the provider's
         next reregister, never mid-session (see
-        :class:`TimeoutConfig`)."""
+        :class:`TimeoutConfig`).
+
+        ``timeouts`` merge semantics (round 24b): the patch is
+        merged into the line's stored :class:`LineTimeouts`
+        ATOMICALLY via :meth:`LineTimeouts.apply_patch` - a full
+        ``model_validate`` of the merged dict, so the heartbeat
+        ladder invariant is checked on the RESULT: a lone
+        ``heartbeat_degraded_after`` patch that is legal in
+        isolation can still be rejected when the merged
+        ``heartbeat_down_after`` no longer exceeds it. A failed
+        merge maps to ``PhonebridgeError(ErrorCode.INVALID_ARGUMENT)``
+        - never a raw ``ValidationError`` at the adapter - and
+        leaves the stored values untouched (no partial state)."""
         ...
