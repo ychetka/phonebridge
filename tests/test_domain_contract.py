@@ -21,23 +21,29 @@ from phonebridge.domain.contract import (
     DTMF_PATTERN,
     EVENT_WIRE_NAMES,
     MAX_DTMF_DIGITS,
+    PROVIDER_COMMAND_WIRE_NAMES,
     AcceptResult,
     AcquireGranted,
     AcquireQueued,
     AcquireRefused,
     AcquireResult,
+    AgentAudience,
     AnswerAndAnnounceFallback,
     AssignmentMode,
     AssignmentRevokedEvent,
     AudioReadyEvent,
+    BroadcastAudience,
+    CallEndReason,
     CallLease,
     CallPhase,
     CallStateChangedEvent,
     CallToken,
+    ClaimId,
     DialResult,
     ErrorCode,
     ErrorData,
     ErrorReason,
+    EventAudience,
     EventEnvelope,
     EventName,
     FallbackDecision,
@@ -56,16 +62,20 @@ from phonebridge.domain.contract import (
     LineStateChangedEvent,
     LineSummary,
     LivenessState,
+    MediaCredentials,
     MediaToken,
     MissedCallEvent,
     NoPickupFallback,
+    PendingClaim,
     PhonebridgeError,
+    ProviderActiveCall,
     ProviderAnswerCommand,
     ProviderBinding,
     ProviderCallState,
     ProviderCallStateUpdate,
     ProviderCommand,
     ProviderDialCommand,
+    ProviderDisconnectReason,
     ProviderHangupCommand,
     ProviderLiveness,
     ProviderRegistration,
@@ -77,6 +87,7 @@ from phonebridge.domain.contract import (
     RecordAndTelegramFallback,
     RedactedString,
     RejectFallback,
+    SessionAudience,
     SessionId,
     TicketId,
     ensure_aware_utc,
@@ -430,7 +441,13 @@ def test_acquire_result_union_discrimination() -> None:
 
     refused = adapter.validate_python({"granted": False, "free_lines": []})
     assert isinstance(refused, AcquireRefused)
-    assert refused.free_lines == []
+    assert refused.free_lines == ()
+    # Round 21 (MEDIUM-8): DTOs are frozen and collections are tuples -
+    # JSON output still emits arrays, but no subscriber can mutate a
+    # shared model.
+    assert refused.model_dump(mode="json")["free_lines"] == []
+    with pytest.raises(ValidationError):
+        refused.granted = True  # type: ignore[assignment,misc]
 
 
 def test_call_lease_answer_defaults_provisional() -> None:
@@ -486,12 +503,17 @@ def test_fallback_policy_union_and_assignment_default() -> None:
 def test_line_admin_kernel_surface() -> None:
     """Round 19: the admin kernel is a separate narrow ABC — the
     agent-facing LineManager deliberately exposes no privileged
-    mutations (approve/reject/revoke/configure)."""
+    mutations (approve/reject/revoke/configure). Round 21 (HIGH-7)
+    adds the typed read surface (list_*) so the admin adapter never
+    reaches into kernel internals."""
     assert set(LineAdminKernel.__abstractmethods__) == {
         "approve_claim",
         "reject_claim",
         "revoke_assignment",
         "configure_line",
+        "list_pending_claims",
+        "list_assignments",
+        "list_provider_bindings",
     }
     with pytest.raises(TypeError):
         LineAdminKernel()  # type: ignore[abstract]
@@ -534,15 +556,19 @@ def test_event_envelope_and_payloads() -> None:
         expires_at=NOW_UTC,
     )
     envelope = EventEnvelope[IncomingCallEvent](
-        name=EventName.INCOMING_CALL, emitted_at=NOW_UTC, payload=payload
+        name=EventName.INCOMING_CALL,
+        audience=AgentAudience(agent_id="agent-1"),
+        emitted_at=NOW_UTC,
+        payload=payload,
     )
     assert envelope.payload.call_token == CallToken("tok-1")
+    assert isinstance(envelope.audience, AgentAudience)
 
     csc = CallStateChangedEvent(
         lease_id=LeaseId("l-1"),
         line_id=LineId("line-main"),
         phase=CallPhase.ACTIVE,
-        reason="provider active",
+        reason=CallEndReason.NORMAL,
         answer_confidence="provisional",
     )
     qr = QueueReadyEvent(
@@ -575,9 +601,67 @@ def test_event_envelope_and_payloads() -> None:
         old_state=LineState.FREE,
         new_state=LineState.BUSY,
     )
-    mc = MissedCallEvent(line_id=LineId("line-main"), reason="accept_window_expired")
+    mc = MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.ACCEPT_WINDOW_EXPIRED)
     for ev in (csc, qr, qu, ar, are, ft, lsc, mc):
         assert ev.model_dump_json()
+
+
+def test_call_end_reason_wired_into_events() -> None:
+    """Round-21 review (WARNING-1): the ``reason`` fields of
+    call_state_changed / missed_call / line_state_changed ride the
+    CLOSED CallEndReason vocabulary - including ``external_call``,
+    the documented wire value for human-initiated calls (design §9).
+    The provider-side ProviderCallStateUpdate.reason deliberately
+    stays on the narrower ProviderDisconnectReason."""
+    # EXTERNAL_CALL exists and ProviderDisconnectReason is a strict
+    # subset (every provider-reported reason is a legal event reason).
+    assert CallEndReason.EXTERNAL_CALL.value == "external_call"
+    provider_values = {r.value for r in ProviderDisconnectReason}
+    event_values = {r.value for r in CallEndReason}
+    assert provider_values < event_values
+
+    # Valid enum members and their raw wire spellings both validate.
+    lsc = LineStateChangedEvent(
+        line_id=LineId("line-main"),
+        old_state=LineState.FREE,
+        new_state=LineState.BUSY,
+        reason=CallEndReason.EXTERNAL_CALL,
+    )
+    assert lsc.reason is CallEndReason.EXTERNAL_CALL
+    csc = CallStateChangedEvent.model_validate(
+        {
+            "lease_id": "l-1",
+            "line_id": "line-main",
+            "phase": "ended",
+            "reason": "provider_lost",
+        }
+    )
+    assert csc.reason is CallEndReason.PROVIDER_LOST
+
+    # A reason outside the closed vocabulary is rejected on all three
+    # event payloads.
+    with pytest.raises(ValidationError):
+        CallStateChangedEvent(
+            lease_id=LeaseId("l-1"),
+            line_id=LineId("line-main"),
+            phase=CallPhase.ENDED,
+            reason="made_up_reason",
+        )
+    with pytest.raises(ValidationError):
+        LineStateChangedEvent(
+            line_id=LineId("line-main"),
+            old_state=LineState.FREE,
+            new_state=LineState.DOWN,
+            reason="made_up_reason",
+        )
+    with pytest.raises(ValidationError):
+        MissedCallEvent(
+            line_id=LineId("line-main"),
+            reason="made_up_reason",
+        )
+    # reason is REQUIRED on missed_call (wire table marks it non-?).
+    with pytest.raises(ValidationError):
+        MissedCallEvent(line_id=LineId("line-main"))  # type: ignore[call-arg]
 
 
 def test_ingress_payloads_validate() -> None:
@@ -588,11 +672,79 @@ def test_ingress_payloads_validate() -> None:
         state=ProviderCallState.RINGING,
         observed_at=NOW_UTC,
     )
+    # Round 21: external human-initiated call - an update with NEITHER
+    # call_token nor lease_id is legal and means "the owner dialed or
+    # answered on the handset itself" (line -> BUSY external_call,
+    # never Hangup; design §9).
+    external = ProviderCallStateUpdate(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("asg-1"),
+        state=ProviderCallState.ACTIVE,
+        observed_at=NOW_UTC,
+    )
+    assert external.call_token is None and external.lease_id is None
+    # reason rides the CLOSED ProviderDisconnectReason vocabulary.
+    ProviderCallStateUpdate(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("asg-1"),
+        lease_id=LeaseId("l-1"),
+        state=ProviderCallState.DISCONNECTED,
+        reason=ProviderDisconnectReason.NORMAL,
+        observed_at=NOW_UTC,
+    )
+    with pytest.raises(ValidationError):
+        ProviderCallStateUpdate.model_validate(
+            {
+                "line_id": "line-main",
+                "assignment_id": "asg-1",
+                "lease_id": "l-1",
+                "state": "disconnected",
+                "reason": "provider_lost",  # gateway-minted, not provider-reported
+                "observed_at": NOW_UTC,
+            }
+        )
     ProviderLiveness(
         line_id=LineId("line-main"),
         state=LivenessState.UNREACHABLE,
         checked_at=NOW_UTC,
     )
+    # Round 21 (CRITICAL-3): ws_disconnected is the WS-drop fact that
+    # starts the orphan-grace window - distinct from UNREACHABLE
+    # (heartbeat timeout -> immediate teardown).
+    ProviderLiveness(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("asg-1"),
+        state=LivenessState.WS_DISCONNECTED,
+        checked_at=NOW_UTC,
+    )
+    # Round-21 review (WARNING-2): a ping may carry the same
+    # state_snapshot shape as reregister - ProviderLiveness is its
+    # domain carrier.
+    ping = ProviderLiveness(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("asg-1"),
+        state=LivenessState.REACHABLE,
+        checked_at=NOW_UTC,
+        state_snapshot=[
+            ProviderActiveCall(lease_id=LeaseId("l-1"), state=ProviderCallState.ACTIVE),
+            ProviderActiveCall(state=ProviderCallState.DIALING),  # external call
+        ],
+    )
+    assert ping.state_snapshot is not None
+    assert ping.state_snapshot[1].lease_id is None
+    # Round 21 (CRITICAL-3): reregister carries a state_snapshot of
+    # the provider's live calls for orphan-grace reconciliation.
+    reg = ProviderRegistration(
+        line_id=LineId("line-main"),
+        token=RedactedString("line-secret-token-value"),
+        caps=[Intent.DIAL_OUT],
+        state_snapshot=[
+            ProviderActiveCall(lease_id=LeaseId("l-1"), state=ProviderCallState.ACTIVE),
+            ProviderActiveCall(state=ProviderCallState.DIALING),  # external call
+        ],
+    )
+    assert reg.state_snapshot is not None
+    assert reg.state_snapshot[1].lease_id is None
     IncomingRingIngress(
         line_id=LineId("line-main"),
         assignment_id=contract.AssignmentId("asg-1"),
@@ -681,7 +833,7 @@ class _FakeLineManager(LineManager):
         return None
 
     async def claim_exclusive(self, session_id: SessionId, line_id: LineId) -> contract.ClaimResult:
-        return contract.ClaimResult(claim_id="claim-1")
+        return contract.ClaimResult(claim_id=ClaimId("claim-1"))
 
     async def get_lines(
         self, session_id: SessionId, intent: Intent | None = None
@@ -738,8 +890,9 @@ class _FakeLineManager(LineManager):
         return [
             EventEnvelope[MissedCallEvent](
                 name=EventName.MISSED_CALL,
+                audience=BroadcastAudience(),
                 emitted_at=NOW_UTC,
-                payload=MissedCallEvent(line_id=LineId("line-main"), reason="test"),
+                payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NORMAL),
             )
         ]
 
@@ -897,11 +1050,16 @@ def test_provider_command_union_roundtrip() -> None:
             assignment_id=contract.AssignmentId("bind-1"),
             lease_id=LeaseId("l-1"),
             number=RedactedString(_RAW_NUMBER),
+            media_endpoint="unix:///run/phonebridge/media.sock",
+            media_token=MediaToken("p-tok-1"),
         ),
         ProviderAnswerCommand(
             line_id=LineId("line-main"),
             assignment_id=contract.AssignmentId("bind-1"),
             call_token=CallToken("tok-1"),
+            lease_id=LeaseId("l-2"),
+            media_endpoint="unix:///run/phonebridge/media.sock",
+            media_token=MediaToken("p-tok-2"),
         ),
         ProviderHangupCommand(
             line_id=LineId("line-main"),
@@ -981,15 +1139,41 @@ def test_queue_ticket_idempotency_key() -> None:
 
 
 class _FakeLineAdminKernel(LineAdminKernel):
-    """Minimal admin-kernel stub exercising all four privileged
+    """Minimal admin-kernel stub exercising all privileged and read
     methods (round 20 spec: the admin surface must be drivable
-    independently of the agent surface)."""
+    independently of the agent surface; round 21 adds the list_*
+    reads)."""
 
-    async def approve_claim(self, claim_id: str) -> LineAssignment:
+    async def approve_claim(self, claim_id: ClaimId) -> LineAssignment:
         return _assignment()
 
-    async def reject_claim(self, claim_id: str, reason: str | None = None) -> None:
+    async def reject_claim(self, claim_id: ClaimId, reason: str | None = None) -> None:
         return None
+
+    async def list_pending_claims(self) -> list[PendingClaim]:
+        return [
+            PendingClaim(
+                claim_id=ClaimId("claim-1"),
+                line_id=LineId("line-main"),
+                requester_agent_id="agent-1",
+                session_id=SessionId("sess-1"),
+                created_at=NOW_UTC,
+            )
+        ]
+
+    async def list_assignments(self) -> list[LineAssignment]:
+        return [_assignment()]
+
+    async def list_provider_bindings(self) -> list[ProviderBinding]:
+        return [
+            ProviderBinding(
+                assignment_id=contract.AssignmentId("bind-1"),
+                line_id=LineId("line-main"),
+                caps=(Intent.DIAL_OUT,),
+                connected_at=NOW_UTC,
+                last_seen_at=NOW_UTC,
+            )
+        ]
 
     async def revoke_assignment(
         self, assignment_id: contract.AssignmentId, reason: str | None = None
@@ -1010,11 +1194,125 @@ class _FakeLineAdminKernel(LineAdminKernel):
 
 async def test_line_admin_kernel_all_methods() -> None:
     kernel = _FakeLineAdminKernel()
-    granted = await kernel.approve_claim("claim-1")
+    granted = await kernel.approve_claim(ClaimId("claim-1"))
     assert isinstance(granted, LineAssignment)
-    await kernel.reject_claim("claim-2", reason="not claimable")
+    await kernel.reject_claim(ClaimId("claim-2"), reason="not claimable")
+    pending = await kernel.list_pending_claims()
+    assert pending[0].claim_id == ClaimId("claim-1")
+    assert isinstance((await kernel.list_assignments())[0], LineAssignment)
+    assert isinstance((await kernel.list_provider_bindings())[0], ProviderBinding)
     await kernel.revoke_assignment(contract.AssignmentId("asg-1"), reason="admin")
     updated = await kernel.configure_line(
         LineId("line-main"), claimable=False, accept_window_sec=10.0
     )
     assert isinstance(updated, LineAssignment)
+
+
+# ---------------------------------------------------------------------------
+# Round 21: line.* wire parity, media credential pair, event audiences
+# ---------------------------------------------------------------------------
+
+
+def _doc_line_command_table() -> dict[str, dict[str, bool]]:
+    """Parse the "## Manager → Line — `line.*`" table in
+    docs/api-contract.md: wire method name -> {param: is_optional}.
+    The trailing ``?`` marker is KEPT (round-21 review): optionality
+    must be compared against the model fields, not stripped away."""
+    text = API_CONTRACT_MD.read_text(encoding="utf-8")
+    section = text.split("## Manager → Line", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    table: dict[str, dict[str, bool]] = {}
+    for m in re.finditer(r"^\|\s*`(line\.[a-z_]+)`\s*\|\s*`\{([^}]*)\}`", section, flags=re.M):
+        params: dict[str, bool] = {}
+        for p in m.group(2).split(","):
+            p = p.strip()
+            if p:
+                params[p.rstrip("?")] = p.endswith("?")
+        table[m.group(1)] = params
+    return table
+
+
+def test_provider_command_wire_parity() -> None:
+    """Round 21 (CRITICAL-1) drift test: every ProviderCommand
+    discriminator resolves to a documented ``line.*`` method via
+    PROVIDER_COMMAND_WIRE_NAMES, and each command model's fields match
+    the params declared in the api-contract table - by name AND by
+    required-vs-optional (the doc's ``?`` suffix vs the model field
+    carrying a default; round-21 review: stripping ``?`` let
+    optionality drift pass silently).
+
+    ``command`` (the discriminator) and ``line_id`` are excluded from
+    the comparison: commands ride the provider's own inbound
+    connection, which is already bound to exactly one line, so the
+    wire table carries no ``line_id`` param."""
+    table = _doc_line_command_table()
+    assert table, "parsed zero line.* commands - doc table format changed?"
+    assert set(table) == set(PROVIDER_COMMAND_WIRE_NAMES.values())
+
+    command_models: list[type[contract.ContractModel]] = [
+        ProviderDialCommand,
+        ProviderAnswerCommand,
+        ProviderHangupCommand,
+        ProviderSendDtmfCommand,
+        ProviderRevokeCommand,
+    ]
+    assert len(command_models) == len(PROVIDER_COMMAND_WIRE_NAMES)
+    for model in command_models:
+        discriminator = model.__pydantic_fields__["command"].default
+        wire_name = PROVIDER_COMMAND_WIRE_NAMES[discriminator]
+        model_fields = model.__pydantic_fields__
+        fields = set(model_fields) - {"command", "line_id"}
+        doc_params = table[wire_name]
+        assert fields == set(doc_params), (
+            f"{model.__name__} drift vs {wire_name}: "
+            f"missing={set(doc_params) - fields}, extra={fields - set(doc_params)}"
+        )
+        model_optional = {f for f in fields if not model_fields[f].is_required()}
+        doc_optional = {p for p, optional in doc_params.items() if optional}
+        assert model_optional == doc_optional, (
+            f"{model.__name__} optionality drift vs {wire_name}: "
+            f"doc-optional-only={doc_optional - model_optional}, "
+            f"model-optional-only={model_optional - doc_optional}"
+        )
+
+
+def test_media_credentials_distinct_role_tokens() -> None:
+    """Round 21 (CRITICAL-2): the per-lease credential pair issues two
+    INDEPENDENT one-time tokens - agent and provider roles can never
+    share one token (media.auth role spoofing fix)."""
+    creds = MediaCredentials(
+        media_endpoint="unix:///run/phonebridge/media.sock",
+        agent_media_token=MediaToken("a-tok"),
+        provider_media_token=MediaToken("p-tok"),
+    )
+    assert creds.agent_media_token != creds.provider_media_token
+    with pytest.raises(ValidationError):
+        MediaCredentials(
+            media_endpoint="unix:///run/phonebridge/media.sock",
+            agent_media_token=MediaToken("same"),
+            provider_media_token=MediaToken("same"),
+        )
+
+
+def test_event_audience_union_and_envelope() -> None:
+    """Round 21 (HIGH-4): EventAudience is a discriminated union
+    (broadcast | agent | session) and a REQUIRED envelope field -
+    every event leaves the kernel with a routing target."""
+    adapter = TypeAdapter(EventAudience)
+    assert isinstance(adapter.validate_python({"scope": "broadcast"}), BroadcastAudience)
+    agent = adapter.validate_python({"scope": "agent", "agent_id": "system:fallback_worker"})
+    assert isinstance(agent, AgentAudience)
+    assert agent.agent_id == "system:fallback_worker"
+    session = adapter.validate_python({"scope": "session", "session_id": "sess-1"})
+    assert isinstance(session, SessionAudience)
+    assert session.session_id == SessionId("sess-1")
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"scope": "room"})
+
+    # An envelope without an audience cannot be constructed.
+    with pytest.raises(ValidationError):
+        EventEnvelope[MissedCallEvent](
+            name=EventName.MISSED_CALL,  # type: ignore[call-arg]
+            emitted_at=NOW_UTC,
+            payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NORMAL),
+        )

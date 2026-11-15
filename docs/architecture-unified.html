@@ -42,8 +42,8 @@
   <div class="zone-title">DOCKER container "phonebridge-gateway" — the single deployment artifact</div>
 
   <div class="box core">Manager + APICallService<span class="small">two surfaces of one daemon: Manager accepts <code>provider.register/line.*</code> from lines; APICallService accepts <code>agent.*/call.*</code> from agents; shared LineManager kernel; separate token scopes</span></div>
-  <div class="box core">LineManager<span class="small">LineAssignment (durable, no heartbeat) + CallLease (ephemeral) + intent-resolver; queues: per-line + global pool</span></div>
-  <div class="box core">EventBus<span class="small">fan-out: socket-subscribe · webhook (retry+HMAC) · exec/file-drop — wakes any agent type</span></div>
+  <div class="box core">LineManager<span class="small">LineAssignment (durable, no heartbeat) + CallLease (ephemeral) + intent-resolver + ProviderBinding; queues: per-line + global pool; bounded outboxes (<code>drain_events</code>/<code>drain_provider_commands</code>, round 20); admin surface on narrow <code>LineAdminKernel</code> (round 19)</span></div>
+  <div class="box core">EventBus<span class="small">audience-routed fan-out (broadcast | agent | session, round 21): socket-subscribe · webhook (retry+HMAC) · exec/file-drop — wakes any agent type</span></div>
 
   <div class="wire">▼ internal call to address <code>127.0.0.1</code> — every provider is container-local (all adapters are virtual)</div>
 

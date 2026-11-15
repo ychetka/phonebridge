@@ -58,6 +58,7 @@ referenced sections.
 | round 19 (architect review 7 — blind spots, 2026-11-14) | `LineAssignment.owner_agent_id` nullable (`None` = pool/provider attachment, no magic strings); `LineAdminKernel` separate admin interface (`approve_claim`/`reject_claim`/`revoke_assignment`/`configure_line`) — agent surface has no privileged mutations; queue fairness = one global monotonic `seq` (lowest eligible seq wins, no scope starvation); incoming ring PREEMPTS an undialed grant (`preempted_by_incoming`, ticket reissued at head); deterministic D-Bus resolution chain `adapter_mac → Adapter1.Address → Device1.Adapter → phone_mac → bluez_input/output.<phone_mac>`; `0x16 SCO_STATE` feeder→agent USB altsetting control; in-container BlueZ `Agent1` + `admin.pair_window` for headless pairing; MCP adapter = control plane only (media via agent audio worker / MediaSidecar) | §2.1, §3.4, §4.2, §10, docs/api-contract.md, docs/hci-agent.md §2/§5 |
 | round 19b (event-wire parity) | `event.assignment_revoked` wire event + authoritative `EVENT_WIRE_NAMES` map + bidirectional doc-drift test | contract.py, docs/api-contract.md |
 | round 20 (hardening spec `SA_carbon_review_changes_8`, 2026-11-14) | `RedactedString` rewritten fail-CLOSED (non-str container — json.dumps/concat leak impossible); bounded transactional outbox on `LineManager` (`drain_events`/`drain_provider_commands`, typed `ProviderCommand` union, no network await inside mutations); `ProviderBinding` split from `LineAssignment` (two assignment_id object spaces); acquire `idempotency_key` dedup + `INVALID_STATE`/`INVALID_ARGUMENT`/`RESOURCE_EXHAUSTED` codes; `AcquireGranted.expires_at` + `CallPhase.ACQUIRED` + `CALL_PHASE_WIRE_STATES`; `DTMF_PATTERN` + provider-side tone synthesis muting agent uplink; `ensure_aware_utc` runtime helper (mandatory in `tick()`); media-UDP `session_nonce` binding + `SCO_STATE` air_mode/lengths; orphan-grace two-level failure model; D-Bus privilege split + stack-restart reconciliation; `phonenumbers` runtime dep | contract.py, docs/api-contract.md, docs/hci-agent.md, §4.2, §5.4, §6.4, §9 |
+| round 21 (architect review 9 — `SA_carbon_review_9`, 2026-11-15) | ProviderCommand/MediaToken wire parity: `PROVIDER_COMMAND_WIRE_NAMES` maps every command to its `line.*` wire method + drift test; `line.dial`/`line.answer` carry `media_endpoint`/`media_token`, `mask_clir` removed; TWO independent per-role `media_token`s per `lease_id` (`MediaCredentials`, media.auth role-spoofing fix); `ProviderActiveCall`/`state_snapshot` + `LivenessState.WS_DISCONNECTED` close the orphan-grace path; `ProviderDisconnectReason`/`CallEndReason` closed reason vocabularies; deterministic external-call rule (human-initiated call → BUSY `external_call`, never Hangup); `ContractModel` frozen + tuple fields; `EventAudience` routing stamped on `EventEnvelope`; `register_intent` rejects empty intents/`exclusive_line`; `ClaimId`/`PendingClaim` + `LineAdminKernel` list reads; `Clock`/`MediaAllocator` injected ports; hci-agent SCO altsetting selection per BT Core Vol 4 Part B §2.1.1 (`SCO_PEER_MISMATCH`/`SCO_SESSION_MISMATCH` counters split) | contract.py, docs/api-contract.md, docs/hci-agent.md §2, §3.3, §5.2, §9 |
 
 ## §1. Service boundary
 
@@ -175,7 +176,7 @@ interface LineProviderConfig {
   profile?: string;           // config preset, see §4.4
   reconnect: { backoff_ms: [number, number]; jitter_pct: number };
   heartbeat_interval_ms: number;
-  media_transport: "rtp_wss"; // ALWAYS packetized; LocalLine targets 127.0.0.1
+  media_transport: "ws_pcm";  // ALWAYS packetized: framed PCM over WebSocket; LocalLine targets 127.0.0.1
 }
 ```
 
@@ -287,7 +288,7 @@ normal result, not an exception.
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?}` -> `{granted:true, line_id, lease_id}` or `{granted:false, free_lines[]}`; `free_lines:[]` = nothing available - routine result, the client retries itself. Optional `enqueue` joins the FIFO queue (§3.4) |
 | `call.release` | release a lease; `OWNER_MISMATCH` on foreign lease |
 | `call.dial` | `{session_id, lease_id, number, country}` -> `{lease_id, media_endpoint, media_token}`; strict E.164 + ISO alpha-2 cross-check BEFORE the line (round 12) - `DIAL_REJECTED` with a typed `data.reason`, otherwise the validated E.164 passes to `line.dial` unchanged |
-| `call.accept` | `{session_id, call_token}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired, `LINE_BUSY_INCOMING`/`OWNER_MISMATCH` as applicable |
+| `call.accept` | `{session_id, call_token}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired or the token was already consumed, `OWNER_MISMATCH` as applicable (round 21) |
 | `call.hangup` / `call.send_dtmf` / `call.get_lines` | call control and line listing |
 
 DTMF is mandatory from v1 - an agent cannot survive IVR trees
@@ -465,8 +466,9 @@ Profiles are **config presets** over primitive policies
    expires_in_ms}` is emitted.
 4. First `call.accept(call_token)` = atomic lease + answer + media
    attach. Owner-scoped lines reject non-owner accepts with
-   `OWNER_MISMATCH`; a second accept gets `STALE_TOKEN` /
-   `LINE_BUSY_INCOMING`.
+   `OWNER_MISMATCH`; a second accept gets `STALE_TOKEN` (round 21 -
+   `LINE_BUSY_INCOMING` never applies here: the accept consumes the
+   ring, it does not contend with one).
 5. **Accept window: default 30 s; ALL timeouts and windows are
    admin-configurable** (round 10a).
 6. Timeout -> the line's `fallback_policy` (§5.3) -> release back to
@@ -513,7 +515,9 @@ remains single-use and TTL-bound) and delivers `event.incoming_call`
   applies ONLY to the WS-drop level above; a provider that reports
   tunnel/USB death, or stays unreachable past DEGRADED->DOWN,
   tears its calls down immediately (round 20). Mechanics (round 20b):
-  on WS drop the binding's `ProviderBinding.orphan_deadline_at` is
+  on WS drop — ingested as `LivenessState.WS_DISCONNECTED` (round 21,
+  distinct from heartbeat-timeout `UNREACHABLE`) — the binding's
+  `ProviderBinding.orphan_deadline_at` is
   set to `now + orphan_grace_sec` (admin-configurable, default 10 s);
   a `provider.reregister` inside the window whose
   `state_snapshot` confirms the call still lives on the D-Bus
@@ -724,10 +728,16 @@ reconnect or name-owner change of `org.pipewire.Telephony` /
 `GetCalls()` reconciliation and report
 `provider.call_state{state:"disconnected", reason:"stack_restart"}`
 for every call that no longer exists on the bus. The reconciliation
-is BIDIRECTIONAL (round 20b): a call found on the bus that the
-kernel does not know is either adopted/re-leased under the line's
-policy or hung up via the provider — never silently left ringing.
-The kernel
+is BIDIRECTIONAL (round 20b) with a DETERMINISTIC unknown-call rule
+(round 21): a call found on the bus that the kernel does not know is
+NEVER silently left ringing and NEVER force-hung-up — an unknown
+call in `incoming` state is fed to `ingest_ring` like any physical
+ring; an unknown call in `dialing`/`alerting`/`active` state is a
+human-initiated EXTERNAL call (the owner dialed or answered on the
+handset itself): the line goes `BUSY` with reason `external_call`,
+no agent lease is minted and no PipeWire bridge is attached (audio
+stays on the phone), and the gateway sends NO `Hangup` — the line
+returns to `FREE` when the provider reports the call gone. The kernel
 re-resolves each line's deterministic D-Bus chain (`adapter_mac →
 Adapter1.Address → Device1.Adapter → phone_mac → bluez_*` nodes,
 §1), rebuilds PipeWire links for surviving leases, and tears down
