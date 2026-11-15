@@ -31,8 +31,16 @@ anchor `docs/specs/<domain>.md#outbox-soft-cap-pre-flight`.
   must still exist after the change.
 - `removes:` — the PR deletes a requirement; the anchor must be
   gone after the change.
-- `- none` — the change touches no documented behavior (must not be
-  combined with anchor entries).
+- `-` — a bare dash marks "no documented behavior changed" (the
+  literal used by `controller-manager/harness.md`; `- none` and
+  `n/a` spellings also parse in `tools/check_spec_anchors.sh`, but
+  the canonical spelling is `-`). A noop marker must not be
+  combined with anchor entries.
+
+Note: spec requirements were written ahead of the M1-M5
+implementation milestones, so implementation PRs typically
+`modifies:` (or `removes:`) existing anchors rather than `adds:` —
+`adds:` is only for a genuinely new requirement.
 
 Spec files group requirements by domain (`line-manager.md`,
 `media.md`, ...). Keep the requirement heading text stable once a

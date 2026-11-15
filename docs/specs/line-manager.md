@@ -55,10 +55,19 @@ assignment revocation is produced ONLY by explicit revoke paths
 
 ### Requirement: Accept window always elapses before fallback
 
-`decide_fallback` MUST wait the full `accept_window_sec` even when
+The kernel MUST let the full `accept_window_sec` elapse even when
 zero live sessions exist for the line, so configured wake-and-grant
-hooks can wake a sleeping agent; `event.fallback_triggered`
-carries `expires_at` bounded by `fallback_accept_ttl_sec`.
+hooks can wake a sleeping agent. `tick(now)` is the ONLY timer
+driver — the kernel itself MUST NEVER sleep to implement the wait:
+when `now >= ring.expires_at` the kernel runs the fallback decision
+inside `tick(now)`, and a direct `decide_fallback` call before
+`expires_at` MUST raise `PhonebridgeError(INVALID_STATE)`. When the
+second timer (`fallback_accept_ttl_sec`) expires without a worker
+`call.accept`, the kernel MUST burn the fallback token, transition
+`RINGING_LOCKED -> FREE`, and emit
+`MissedCallEvent(reason=ACCEPT_WINDOW_EXPIRED)`;
+`event.fallback_triggered` carries `expires_at` bounded by
+`fallback_accept_ttl_sec`.
 
 ### Requirement: MediaAllocator lifecycle
 
@@ -73,3 +82,30 @@ credentials so no socket outlives its `lease_id`.
 `datetime` as ISO strings, `timedelta` as total seconds, `Enum` as
 `.value`, containers recursively; `RedactedString` values MUST
 never appear unmasked.
+
+### Requirement: Effective timeouts hydrate the kernel DTOs
+
+`LineAssignment.timeouts` MUST carry the fully-resolved
+`LineTimeouts` snapshot (no `None` fields) so the admin adapter can
+write it through to SQLite verbatim, and
+`ProviderBinding.heartbeat_interval_ms` MUST stamp the heartbeat
+interval negotiated for the current provider session (default
+`5000`, `> 0`). A `heartbeat_interval_sec` config change applies at
+the next `provider.reregister`, never retroactively to a live
+session. `heartbeat_down_after` MUST strictly exceed
+`heartbeat_degraded_after` on `LineTimeouts` and on `TimeoutConfig`
+when both fields are set.
+
+### Requirement: Dial-target and caps validation is model-level
+
+`ForwardViaLineFallback.target_number`/`target_country` MUST be
+validated by `validate_e164_country` at model construction (strict
+E.164 shape `^\+[1-9]\d{6,14}$` plus a phonenumbers
+parse/validity/region cross-check), and `LineAssignment` MUST
+reject a `forward_via_line` policy whose `line_id` equals its own
+`line_id` — a corrupt SQLite/config row can never hydrate an
+invalid policy. Provider-declared `caps` (on
+`ProviderRegistration`, `ProviderCapabilityUpdate`, and
+`ProviderBinding`) MUST be non-empty and MUST NOT contain
+`exclusive_line` — durable exclusivity is a `LineAssignment`
+property, not a hardware capability.

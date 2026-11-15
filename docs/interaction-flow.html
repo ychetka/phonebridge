@@ -36,14 +36,14 @@
 <div class="zone">
   <div class="zone-title">API boundary — UDS (local) / WSS (remote): JSON-RPC 2.0 control + separate packetized media channel</div>
   <code>control: agent.* / call.* / event.*</code>
-  <span class="small">commands: agent.register_intent · call.acquire(enqueue) · call.cancel_acquire · call.dial · call.accept · call.hangup · call.send_dtmf · call.claim_exclusive &nbsp;|&nbsp; events (audience-routed, round 21): event.incoming_call · event.queue_updated · event.line_acquired · event.missed_call · event.fallback_triggered · event.line_state_changed · event.audio_ready · event.call_state_changed · event.assignment_revoked</span>
+  <span class="small">commands: agent.register_intent · call.acquire(enqueue) · call.cancel_acquire · call.dial · call.accept · call.hangup · call.send_dtmf · call.claim_exclusive &nbsp;|&nbsp; events (audience-routed, round 21; admin audience added round 23): event.incoming_call · event.queue_updated · event.line_acquired · event.missed_call · event.fallback_triggered · event.line_state_changed · event.audio_ready · event.call_state_changed · event.assignment_revoked · event.idle_alert (admin-only)</span>
 </div>
 
 <div class="zone">
   <div class="zone-title">phonebridge container (owns telephony exclusively)</div>
   <div class="box core">LineManager (gateway daemon)<span class="small">Line{dongle, phone, oFono modem, caps, profile, state} — N-line architecture, works with one; LineAssignment + CallLease + intent-resolver</span></div>
   <div class="box core">Call queue<span class="small">FIFO, ticket_id, position, grant TTL, socket-bound tickets</span></div>
-  <div class="box core">EventBus<span class="small">audience-routed fan-out (broadcast | agent | session, round 21): socket subscribe · webhook (retry+delivery_id+HMAC) · exec/file-drop — drains a bounded outbox</span></div>
+  <div class="box core">EventBus<span class="small">audience-routed fan-out (broadcast | agent | session | admin, round 23): socket subscribe · webhook (retry+delivery_id+HMAC) · exec/file-drop — drains a bounded outbox; admin-audience events (event.idle_alert) go to escalation_hooks + the c_admin MCP stream</span></div>
   <div class="box sys">Line bundle ×N<span class="small">per line in the same container: vhci-feeder + shim/audio-forwarder + LineProvider process; registers at wss://127.0.0.1:7001/provider</span></div>
   <span class="arrow">▼ D-Bus (container-internal)</span>
   <div class="box sys">oFono-shim / BlueZ (shared)<span class="small">VoiceCallManager: Dial/Answer/Hangup — verified live (SMS: OUT OF SCOPE — no MessageManager on bus)</span></div>
@@ -60,7 +60,7 @@
 <h2>OUTBOUND CALL — step by step</h2>
 <ol class="seq">
   <li>Agent calls <code>call.acquire{intent:"dial_out", enqueue?}</code>.</li>
-  <li>Line free → <code>{granted:true, line_id, lease_id}</code>. All busy → <code>{granted:false, free_lines[]}</code> (retry later), or with <code>enqueue:true</code> → <code>{granted:false, queued:true, ticket_id, position}</code> plus <code class="evt">event.queue_updated</code> events as it advances; on grant — <code class="evt">event.line_acquired{lease_id}</code> (short grant TTL to react, else next ticket; tickets are socket-bound).</li>
+  <li>Line free → <code>{granted:true, line_id, lease_id, expires_at}</code>. All busy → <code>{granted:false, free_lines[]}</code> (retry later), or with <code>enqueue:true</code> → <code>{granted:false, queued:true, ticket_id, position}</code> plus <code class="evt">event.queue_updated</code> events as it advances; on grant — <code class="evt">event.line_acquired{session_id, ticket_id, line_id, lease_id, intent, expires_at}</code> (grant TTL to react, else next ticket; tickets are socket-bound).</li>
   <li>Agent calls <code>call.dial("+373…", country:"MD")</code> — strict E.164 + ISO alpha-2 cross-check (DIAL_REJECTED on failure, never reaches the line) → gateway → <code>line.dial</code> to the owning provider → oFono → phone dials (validated E.164 passed through unchanged).</li>
   <li>Call reaches <code>alerting</code> → media attaches; <code class="evt">event.audio_ready</code> = local SCO path up (from <code>provider.audio_ready</code>); remote answer = <code>event.call_state_changed{state:"active"}</code> — greeting starts only on <b>both</b>.</li>
   <li>Duplex: agent sends audio frames (its voice) over the media channel → callee hears; callee's voice arrives as frames → agent listens/transcribes. <code>call.send_dtmf("1")</code> — IVR navigation.</li>

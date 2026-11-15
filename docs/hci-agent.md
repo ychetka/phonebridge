@@ -69,7 +69,7 @@ monotonic counter assigned by each sender independently
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
 | `0x14` STATUS | agent→ | `{state: UP|DEGRADED|DONGLE_DEAD|TUNNEL_FLAP, detail}` |
 | `0x15` SHUTDOWN | both | graceful close |
-| `0x16` SCO_STATE | container→ | `{open: bool, air_mode?, rx_pkt_len?, tx_pkt_len?}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-21, see below); on `open: true` `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"` — mirrors the HCI `air_mode` field of the sync connection) and `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the three fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
+| `0x16` SCO_STATE | container→ | `{open: bool, handle?, air_mode?, rx_pkt_len?, tx_pkt_len?}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-21, see below); on `open: true` `handle` carries the 12-bit synchronous connection handle (`uint16`, meaningful bits `0x0FFF`) that the feeder parsed from `Synchronous Connection Complete 0x2c`/`0x03` — REQUIRED on `open: true` (round 24) so the agent can form HCI SCO headers and underrun silence packets before the first UDP datagram ever arrives; `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"` — mirrors the HCI `air_mode` field of the sync connection) and `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the trailing fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
 
 **USB SCO altsetting control (rounds 19-21).** The Bluetooth USB
 Transport spec keeps Interface 1 (SCO audio) at `altsetting 0` —
@@ -199,6 +199,22 @@ endpoint:
   the mSBC silence frame for `air_mode == "msbc"`, or `0x55`-filled
   payload for `air_mode == "cvsd"` — so the air link never starves
   and the far side hears attenuated silence instead of garbage;
+- **every packet the agent pushes to USB isoc OUT is a complete HCI
+  SCO packet** with the 3-byte header `2 B handle/flags · 1 B
+  payload_len` formed around the `handle` delivered in
+  `0x16 SCO_STATE` (round 24) — transit UDP packets keep their
+  header, generated silence packets get a fresh one built from the
+  same handle;
+- **continuous H2 sync counter (round 24).** In `air_mode ==
+  "msbc"` each 60-byte eSCO payload starts with the 2-byte H2 sync
+  header (`0x01`, then a cyclic 2-bit sequence byte from the cycle
+  `0x08 -> 0x38 -> 0xC8 -> 0xF8`). The agent runs ONE monotonic
+  counter at the playout-buffer egress and REWRITES the sequence
+  byte of every outbound USB mSBC packet — generated silence and
+  UDP transit packets alike — so the phone's DSP never observes an
+  H2 phase jump at a silence↔voice boundary (a raw passthrough of
+  the tunnel's counter after inserted silence would click or mute
+  the PLC);
 - on overflow the buffer drops the OLDEST packets (playout must stay
   near real time; holding stale audio only compounds the delay);
 - the buffer depth and under/overflow counts feed the agent's
