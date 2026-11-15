@@ -146,7 +146,7 @@ from these input rejections and from ordinary no-answer termination.
 
 | method | params | returns |
 |---|---|---|
-| `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` — `media_endpoint` is the static socket address; the per-lease `media_token` arrives later inside `line.dial`/`line.answer` (round 14). `meta` is bounded (round 22): ≤16 keys, keys ≤64 chars, values ≤256 chars — `INVALID_ARGUMENT` beyond. `caps` MUST be non-empty and telecom-only (`dial_out`/`receive_inbound`): an empty set or any `exclusive_line` entry → `INVALID_ARGUMENT` (round 24) — durable exclusivity is a `LineAssignment.claimable`/`mode` property granted by the claim flow, never a hardware capability |
+| `provider.register` | `{line_id, token, caps, profile?, meta?}` | `{assignment_id, heartbeat_interval_ms, media_endpoint?, server_time}` — `media_endpoint` is the static socket address; the per-lease `media_token` arrives later inside `line.dial`/`line.answer` (round 14). `heartbeat_interval_ms` is stamped from the line's effective `heartbeat_interval_sec` as `round(sec * 1000)` clamped to ≥1 ms — the interval is floored at 0.001 s (millisecond granularity, the wire unit) so a valid config can never yield a zero cadence (round 24c). `meta` is bounded (round 22): ≤16 keys, keys ≤64 chars, values ≤256 chars — `INVALID_ARGUMENT` beyond. `caps` MUST be non-empty and telecom-only (`dial_out`/`receive_inbound`): an empty set or any `exclusive_line` entry → `INVALID_ARGUMENT` (round 24) — durable exclusivity is a `LineAssignment.claimable`/`mode` property granted by the claim flow, never a hardware capability |
 | `provider.reregister` | same as register + `state_snapshot?` | idempotent; preserves lease state during the 10 s orphan-grace window — `state_snapshot` lists the calls the provider still sees on the D-Bus (`{lease_id?, state, caller_id?}[]`, `lease_id` absent for a call the gateway never issued) so the kernel can re-bind surviving leases (round 21, design §5.4); grace covers the WS-drop level only — provider-reported tunnel/USB death or DEGRADED→DOWN unreachable = immediate teardown, no grace (round 20) |
 | `provider.ping` | `{line_id, assignment_id, state_snapshot?}` | `{ok, server_time}` — missed N pings → DEGRADED → DOWN |
 | `provider.capability_update` | `{line_id, assignment_id, caps, profile?}` | `{ok}` — replaces caps/profile on the ACTIVE binding; carries NO `token` (the binding id authenticates the already-registered peer); an identical update is an idempotent no-op (round 22); the same `caps` invariant as `provider.register` applies — non-empty and telecom-only, `exclusive_line` → `INVALID_ARGUMENT` (round 24) |
@@ -411,7 +411,9 @@ to the admin adapter:
   admin-configurable knobs `{grant_ttl_sec?, orphan_grace_sec?,
   heartbeat_interval_sec?, heartbeat_degraded_after?,
   heartbeat_down_after?, fallback_accept_ttl_sec?}` (rounds 22-23,
-  design §10). A patched `heartbeat_interval_sec` takes effect on
+  design §10). `heartbeat_interval_sec` is floored at 0.001 s —
+  millisecond granularity, the wire unit (round 24c). A patched
+  `heartbeat_interval_sec` takes effect on
   the provider's NEXT `provider.reregister` — the live provider
   learns its interval only from the register response, so the new
   cadence is never enforced against the current session (round 23).

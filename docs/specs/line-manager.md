@@ -90,7 +90,13 @@ never appear unmasked.
 write it through to SQLite verbatim, and
 `ProviderBinding.heartbeat_interval_ms` MUST stamp the heartbeat
 interval negotiated for the current provider session (default
-`5000`, `> 0`). A `heartbeat_interval_sec` config change applies at
+`5000`, `> 0`), converted from the effective
+`heartbeat_interval_sec` by `heartbeat_interval_ms_from_sec` —
+`round(sec * 1000)` clamped to ≥ 1 ms; `heartbeat_interval_sec`
+itself is floored at `0.001` s (millisecond granularity, the wire
+unit) on both `LineTimeouts` and `TimeoutConfig`, so a valid config
+can never stamp a zero cadence. A `heartbeat_interval_sec` config
+change applies at
 the next `provider.reregister`, never retroactively to a live
 session. `heartbeat_down_after` MUST strictly exceed
 `heartbeat_degraded_after` on `LineTimeouts` and on `TimeoutConfig`

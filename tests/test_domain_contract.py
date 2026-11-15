@@ -102,6 +102,7 @@ from phonebridge.domain.contract import (
     TicketId,
     TimeoutConfig,
     ensure_aware_utc,
+    heartbeat_interval_ms_from_sec,
     validate_e164_country,
 )
 
@@ -1881,6 +1882,10 @@ def test_line_timeouts_apply_patch_atomic_merge() -> None:
     with pytest.raises(PhonebridgeError) as excinfo:
         base.apply_patch(TimeoutConfig(heartbeat_degraded_after=4))
     assert excinfo.value.code is ErrorCode.INVALID_ARGUMENT
+    # Round 24c: ErrorData.detail carries ALL joined validation
+    # messages (PII/input-free pydantic msgs), not first-error-only.
+    assert excinfo.value.data.detail is not None
+    assert "heartbeat_down_after must exceed" in excinfo.value.data.detail
     # Same for a lowered down_after that meets the stored degraded.
     with pytest.raises(PhonebridgeError) as excinfo2:
         base.apply_patch(TimeoutConfig(heartbeat_down_after=2))
@@ -1889,6 +1894,32 @@ def test_line_timeouts_apply_patch_atomic_merge() -> None:
     # half-patch and the merge yields a NEW instance.
     assert base.heartbeat_down_after == 3
     assert base.heartbeat_degraded_after == 2
+
+
+def test_heartbeat_interval_ms_conversion() -> None:
+    """Round 24c (reviewer finding on the round-24 C2 model): the
+    sec -> ms conversion is pinned - ``heartbeat_interval_sec`` is
+    floored at millisecond granularity (``ge=0.001``) on BOTH
+    ``LineTimeouts`` and ``TimeoutConfig``, and the canonical
+    ``heartbeat_interval_ms_from_sec`` helper rounds to the nearest
+    ms clamped to >= 1, so a valid config can NEVER stamp a
+    zero-cadence ``ProviderBinding.heartbeat_interval_ms``."""
+    assert heartbeat_interval_ms_from_sec(5.0) == 5000
+    assert heartbeat_interval_ms_from_sec(0.001) == 1
+    assert heartbeat_interval_ms_from_sec(7.5) == 7500
+    assert heartbeat_interval_ms_from_sec(0.0015) == 2
+    assert heartbeat_interval_ms_from_sec(0.0014) == 1
+    # Clamp guard for a caller bypassing model validation.
+    assert heartbeat_interval_ms_from_sec(0.0004) == 1
+    # Granularity floor on the effective model and the patch model.
+    assert LineTimeouts(heartbeat_interval_sec=0.001).heartbeat_interval_sec == 0.001
+    assert TimeoutConfig(heartbeat_interval_sec=0.001).heartbeat_interval_sec == 0.001
+    with pytest.raises(ValidationError):
+        LineTimeouts(heartbeat_interval_sec=0.0005)
+    with pytest.raises(ValidationError):
+        LineTimeouts(heartbeat_interval_sec=0.0)
+    with pytest.raises(ValidationError):
+        TimeoutConfig(heartbeat_interval_sec=0.0009)
 
 
 def test_provider_binding_heartbeat_interval_ms() -> None:

@@ -32,7 +32,15 @@ dev_summary: >-
   counter rewritten on every outbound mSBC packet including
   silence; spec-impact noop literal unified to bare "-";
   interaction-flow/architecture-unified HTML updated (expires_at,
-  ticket_id, event.idle_alert, admin audience).
+  ticket_id, event.idle_alert, admin audience). Round 24c
+  (post-review nits): the heartbeat_interval_sec ->
+  heartbeat_interval_ms conversion is pinned -
+  heartbeat_interval_ms_from_sec (round(sec*1000), min 1 ms) +
+  ge=0.001 granularity floor on LineTimeouts and TimeoutConfig -
+  so a valid config can never stamp a zero cadence;
+  LineTimeouts.apply_patch ErrorData.detail now joins ALL
+  validation messages; design.md aligns to the 0x16 SCO_STATE
+  wire field name "handle".
 why: >-
   Close the last contract/documentation drift before the M1-M5
   implementation milestones: the review found two critical defects

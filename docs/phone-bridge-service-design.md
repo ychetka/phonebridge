@@ -773,7 +773,8 @@ preserved there as the per-line tunnel port pair.)
   channel hands frames to the hci-agent's **uplink playout jitter
   buffer** (30-45 ms, `docs/hci-agent.md` §2) on the dongle host,
   which owns HCI SCO packet formation - 3-byte HCI SCO header with
-  the negotiated `sco_handle`, plus the continuous 2-bit H2 sync
+  the negotiated `handle` (the `0x16 SCO_STATE` wire field,
+  `docs/hci-agent.md`), plus the continuous 2-bit H2 sync
   counter (`0x08 -> 0x38 -> 0xC8 -> 0xF8`) rewritten on every
   outbound USB mSBC packet, including generated silence on
   underrun (round 24, review-13 H1).
@@ -1021,7 +1022,10 @@ status (mirrors the busctl commands used in Phase-0).
   heartbeat_degraded_after?, heartbeat_down_after?,
   fallback_accept_ttl_sec?}` (round 22; `fallback_accept_ttl_sec`
   added round 23, ~10 s default, bounds the FallbackWorker accept
-  deadline). Changing `heartbeat_interval_sec` NEVER kills a live
+  deadline). `heartbeat_interval_sec` is floored at 0.001 s
+  (millisecond granularity — the wire unit is ms) and stamped as
+  `heartbeat_interval_ms = round(sec * 1000)`, min 1 (round 24c).
+  Changing `heartbeat_interval_sec` NEVER kills a live
   provider session (round 23, review-12 M6): the new interval is
   negotiated at the provider's next
   `provider.reregister`/`provider.register`, so reconfiguring a

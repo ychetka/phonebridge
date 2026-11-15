@@ -146,6 +146,7 @@ __all__ = [
     "TimeoutConfig",
     "WireCallState",
     "ensure_aware_utc",
+    "heartbeat_interval_ms_from_sec",
     "validate_e164_country",
 ]
 
@@ -937,6 +938,22 @@ FallbackPolicy = Annotated[
 # ---------------------------------------------------------------------------
 
 
+def heartbeat_interval_ms_from_sec(interval_sec: float) -> int:
+    """Canonical ``heartbeat_interval_sec`` -> ``heartbeat_interval_ms``
+    conversion (round 24c, reviewer finding on the round-24 C2 model).
+
+    The rule is ``round(interval_sec * 1000)`` - nearest millisecond -
+    clamped to ``>= 1``. The interval itself is floored at millisecond
+    granularity (``ge=0.001`` s, the wire unit) on
+    :class:`LineTimeouts` and :class:`TimeoutConfig`, so the clamp only
+    guards a caller that bypasses model validation; the pair together
+    guarantees a stamped ``heartbeat_interval_ms >= 1`` for ANY config
+    that passes validation - a truncation to zero (e.g.
+    ``int(0.0005 * 1000) == 0``) can never reach
+    :class:`ProviderBinding` and break its ``gt=0`` construction."""
+    return max(1, round(interval_sec * 1000))
+
+
 class LineTimeouts(ContractModel):
     """Effective per-line timeout values (round 24, review-13 C2 /
     ADR-24.2): the CONCRETIZED counterpart of the ``TimeoutConfig``
@@ -951,7 +968,9 @@ class LineTimeouts(ContractModel):
     ``None`` for unpatched knobs and would silently persist holes.
     ``LineAssignment.timeouts`` therefore carries this model, and
     ``ProviderBinding.heartbeat_interval_ms`` stamps
-    ``heartbeat_interval_sec`` (as ms) at register/reregister time so
+    ``heartbeat_interval_sec`` (as ms, via
+    :func:`heartbeat_interval_ms_from_sec` - ``round(sec * 1000)``
+    clamped to ``>= 1`` ms, round 24c) at register/reregister time so
     a runtime ``configure_line`` patch never retro-applies to a live
     provider session."""
 
@@ -962,10 +981,14 @@ class LineTimeouts(ContractModel):
     orphan_grace_sec: float = Field(default=10.0, gt=0)
     """WS-drop re-bind window - feeds
     ``ProviderBinding.orphan_deadline_at``."""
-    heartbeat_interval_sec: float = Field(default=5.0, gt=0)
+    heartbeat_interval_sec: float = Field(default=5.0, ge=0.001)
     """Required ``provider.ping`` cadence for the line's binding;
     surfaced to the provider as ``heartbeat_interval_ms`` inside the
-    ``provider.register``/``provider.reregister`` response."""
+    ``provider.register``/``provider.reregister`` response. Floored
+    at millisecond granularity (``ge=0.001`` s - the wire unit is
+    ms, round 24c) and converted via
+    :func:`heartbeat_interval_ms_from_sec`, so no valid value can
+    truncate to a zero-cadence ``heartbeat_interval_ms``."""
     heartbeat_degraded_after: int = Field(default=2, ge=1)
     """Missed pings before the line goes DEGRADED."""
     heartbeat_down_after: int = Field(default=3, ge=1)
@@ -1008,12 +1031,17 @@ class LineTimeouts(ContractModel):
         The operation is ATOMIC: either a fully-validated
         :class:`LineTimeouts` is returned or the error is raised -
         the stored values are never half-patched. An all-``None``
-        patch re-validates and returns the same effective values."""
+        patch re-validates and returns the same effective values.
+        On failure ``ErrorData.detail`` joins ALL validation
+        messages with ``"; "`` (round 24c - first-error-only would
+        hide a second broken knob); the messages are pydantic
+        ``msg`` strings only, so no raw input/PII is echoed
+        (``hide_input_in_errors``)."""
         merged = {**self.model_dump(), **patch.model_dump(exclude_none=True)}
         try:
             return LineTimeouts.model_validate(merged)
         except ValidationError as exc:
-            detail = exc.errors()[0]["msg"] if exc.errors() else "invalid timeouts patch"
+            detail = "; ".join(err["msg"] for err in exc.errors()) or "invalid timeouts patch"
             raise PhonebridgeError(
                 ErrorCode.INVALID_ARGUMENT,
                 ErrorData(detail=detail),
@@ -1146,8 +1174,12 @@ class ProviderBinding(ContractModel):
     heartbeat_interval_ms: int = Field(default=5000, gt=0)
     """Ping cadence negotiated for THIS provider session (round 24,
     review-13 C2): stamped from the line's effective
-    ``LineTimeouts.heartbeat_interval_sec`` (as ms) inside
-    ``register_provider`` and returned to the adapter so the
+    ``LineTimeouts.heartbeat_interval_sec`` inside
+    ``register_provider`` via
+    :func:`heartbeat_interval_ms_from_sec` - ``round(sec * 1000)``,
+    clamped to ``>= 1`` (round 24c; ``heartbeat_interval_sec`` is
+    floored at ``ge=0.001`` s so a valid config can never stamp 0) -
+    and returned to the adapter so the
     ``provider.register``/``provider.reregister`` response can carry
     the wire ``heartbeat_interval_ms``. A ``configure_line`` patch to
     ``heartbeat_interval_sec`` takes effect on the NEXT
@@ -2424,7 +2456,9 @@ class LineManager(ABC):
         The returned :class:`ProviderBinding` stamps
         ``heartbeat_interval_ms`` from the line's EFFECTIVE
         ``LineTimeouts.heartbeat_interval_sec`` (round 24,
-        review-13 C2) so the adapter can answer
+        review-13 C2) via :func:`heartbeat_interval_ms_from_sec`
+        (``round(sec * 1000)``, min 1 ms - round 24c) so the adapter
+        can answer
         ``provider.register``/``provider.reregister`` with the wire
         ``heartbeat_interval_ms`` - a ``configure_line`` patch to the
         interval applies on the NEXT reregister, never
@@ -2698,8 +2732,12 @@ class TimeoutConfig(ContractModel):
     """WS-drop re-bind window - feeds
     ``ProviderBinding.orphan_deadline_at`` (default 10 s, round
     5b/20)."""
-    heartbeat_interval_sec: float | None = Field(default=None, gt=0)
-    """Required ``provider.ping`` cadence for the line's binding.
+    heartbeat_interval_sec: float | None = Field(default=None, ge=0.001)
+    """Required ``provider.ping`` cadence for the line's binding,
+    floored at millisecond granularity (``ge=0.001`` s - the wire
+    unit is ms, round 24c; the sec -> ms conversion is pinned by
+    :func:`heartbeat_interval_ms_from_sec`, ``round(sec * 1000)``
+    min 1, so a valid value can never stamp a zero cadence).
     A runtime change takes effect on the provider's NEXT
     ``provider.reregister`` - the live provider learns
     ``heartbeat_interval_ms`` only from the register response, so
