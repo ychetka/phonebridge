@@ -21,7 +21,7 @@ _No user-visible changes._
 ### Codebase
 
 #### contract
-- [fix] SA_carbon_review_changes_8 applied: RedactedString is a non-str container (json.dumps/concat can no longer leak PII; pydantic accepts instance-or-str, JSON serializes to_wire()); LineManager gains drain_events()/drain_provider_commands() + a discriminated ProviderCommand union (dial/answer/hangup/send_dtmf/revoke); a bounded per-manager outbox replaces ad-hoc emission (rule 4); register_provider returns ProviderBinding (distinct assignment_id space); acquire gains idempotency_key dedup + INVALID_STATE/INVALID_ARGUMENT/RESOURCE_EXHAUSTED codes and GRANT_TTL_EXPIRED/SESSION_LIMIT_EXCEEDED/CLAIM_NOT_FOUND/ INVALID_DTMF reasons; AcquireGranted.expires_at + CallPhase.ACQUIRED + CallLease.grant_expires_at + CALL_PHASE_WIRE_STATES; DTMF_PATTERN/MAX_DTMF_DIGITS; ensure_aware_utc() public helper; media-UDP header gains a session_nonce bound to HELLO_ACK; SCO_STATE gains air_mode/rx_pkt_len/tx_pkt_len; SCO_SESSION_MISMATCH telemetry; orphan grace resolved into a two-level failure model; D-Bus split + stack-restart reconciliation documented; phonenumbers added as a runtime dependency. Why: Three CRITICAL findings closed: RedactedString(str) leaked PII through C-level string paths; LineManager had no safe event/provider-command channel (network awaits inside mutations violate rule 4); register_provider conflated provider attachment with agent ownership. Plus seven HIGH/MEDIUM contract gaps ahead of M1. (SA_carbon_review_changes_8; dev session 2026-11-14)
+- [fix] SA_carbon_review_changes_8 applied: RedactedString is a non-str container (json.dumps/concat can no longer leak PII; pydantic accepts instance-or-str, JSON serializes to_wire()); LineManager gains drain_events()/drain_provider_commands() + a discriminated ProviderCommand union (dial/answer/hangup/send_dtmf/revoke); a bounded per-manager outbox replaces ad-hoc emission (rule 4); register_provider returns ProviderBinding (distinct assignment_id space); acquire gains idempotency_key dedup + INVALID_STATE/INVALID_ARGUMENT/RESOURCE_EXHAUSTED codes and GRANT_TTL_EXPIRED/SESSION_LIMIT_EXCEEDED/CLAIM_NOT_FOUND/INVALID_DTMF reasons; AcquireGranted.expires_at + CallPhase.ACQUIRED + CallLease.grant_expires_at + CALL_PHASE_WIRE_STATES; DTMF_PATTERN/MAX_DTMF_DIGITS; ensure_aware_utc() public helper; media-UDP header gains a session_nonce bound to HELLO_ACK; SCO_STATE gains air_mode/rx_pkt_len/tx_pkt_len; SCO_SESSION_MISMATCH telemetry; orphan grace resolved into a two-level failure model; D-Bus split + stack-restart reconciliation documented; phonenumbers added as a runtime dependency. Why: Three CRITICAL findings closed: RedactedString(str) leaked PII through C-level string paths; LineManager had no safe event/provider-command channel (network awaits inside mutations violate rule 4); register_provider conflated provider attachment with agent ownership. Plus seven HIGH/MEDIUM contract gaps ahead of M1. (SA_carbon_review_changes_8; dev session 2026-11-14)
 
 ## [0.0.12] - 2026-11-14
 
@@ -128,6 +128,16 @@ _No user-visible changes._
 #### domain contract
 - [contract] `ProviderCallState` canonical vocabulary (breaking);
   `ProviderCallStateUpdate.lease_id`. (issue #31)
+- [fix] Architect review round 14 (issue #31): per-lease media
+  credentials for the provider on `line.dial`/`line.answer`;
+  `provider.audio_ready` feeds `event.audio_ready`; `call.acquire`
+  limited to `dial_out`; MediaRouter pair TTL + bounded queues;
+  `fallback_call_token` mechanics for FallbackWorker; `adapter_mac`
+  added to `LineProviderConfig`; HTML diagrams clarified. Why:
+  the second architect review found wire-level edge cases that
+  would break in M1-M3 (media auth per lease, early-media gating,
+  fallback worker acceptance after accept-window expiry, resource
+  bounds). (issue #31; SA_argon_review2; dev session 2026-11-13)
 
 #### docs
 - [docs] Unified hci-agent model: `docs/hci-agent.md` agent spec +
@@ -135,6 +145,30 @@ _No user-visible changes._
   control channel, agent-side SCO isoc reassembly, feeder SCO handle
   gate, media health events — locked by the live vhci experiment.
   (issues #22, #29, #31)
+- [docs] Round-12 architecture decisions: unified hci-agent model
+  (kernel vhci fed by dumb USB-HCI relay agents over
+  transport_profile tunnels: control-TCP + media-UDP), thin-slice
+  per-line worker bundles, strict E.164+ISO dial validation with
+  `DIAL_REJECTED` and per-line number-type allowlist, MCP adapter
+  for the agent surface, live-probe results; new
+  `docs/hci-agent.md` agent spec. Why: live probes (Answer/Reject/
+  SendTones/WirePlumber echo loop) and the USB-passthrough
+  blast-radius analysis invalidated the `--device` and
+  remote-provider deployment sketches. (issue #22, #25; dev
+  session 2026-11-13)
+- [docs] hci-agent wire-protocol invariants proven by the
+  one-dongle vhci end-to-end experiment: lossless sequenced control
+  channel (`ctrl_seq`; gap/overflow = fatal session reset),
+  agent-side USB isochronous reassembly into complete HCI SCO
+  packets (`media_seq`, one packet per datagram), feeder SCO handle
+  gate (open on `0x2c`/`0x03` status 0, close before `0x05`,
+  <=4-frame unknown-handle hold), media health events
+  `SCO_UNEXPECTED_HANDLE` / `SCO_RX_STARVATION` /
+  `SCO_FRAMING_ERROR`. Why: the live experiment showed
+  silent-audio failure modes (media frames outrunning
+  sync-connection events; unaligned USB isoc buffers) that must be
+  impossible in the production protocol. (issue #29; dev session
+  2026-11-13)
 
 ## [0.0.5] - 2026-11-13
 
@@ -184,7 +218,7 @@ _No user-visible changes._
   `docs/interaction-flow.html`. (issue #1)
 
 #### tools
-- [tools] Synced canonical `repo_merge.sh` (v0.15.5): the pre-merge
+- [chore] Synced canonical `repo_merge.sh` (v0.15.5): the pre-merge
   `version_not_bumped` gate blocks shipping-path merges without a
   `[project].version` bump (ruling: every merged PR bumps the
   version unless exempt). (devin-session-bridge PR #162)
