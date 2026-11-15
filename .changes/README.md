@@ -30,9 +30,8 @@ the previous field's value):
 
 - `type`: fix | feat | refactor | chore | docs
 - `scope`: the module/subsystem the change touches - one of
-  `cli`, `daemon`, `state`, `acp`, `mailbox`, `wake`, `ingress`,
-  `tooling`, `docs`, `deploy` (extend the list here when a new
-  module lands)
+  `domain`, `daemon`, `hci`, `media`, `docs`, `tooling`, `ci`,
+  `deploy` (extend the list here when a new module lands)
 - `user_visible`: true | false - does an operator/integrator notice?
 - `breaking`: true | false - does anything consuming the CLI/API
   surface need to change?

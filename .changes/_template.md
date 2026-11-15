@@ -2,8 +2,9 @@
 # NNNN-slug.md - one file per PR, public-safe content only.
 # type: fix | feat | refactor | chore | docs
 type: fix
-# scope: module/subsystem touched (cli, daemon, state, acp, ...)
-scope: cli
+# scope: module/subsystem touched (domain, daemon, hci, media,
+# docs, tooling, ci, deploy - see README for the canonical list)
+scope: domain
 user_visible: false
 breaking: false
 # user_summary: one sentence for the User-facing section; required

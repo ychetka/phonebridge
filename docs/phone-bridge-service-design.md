@@ -50,7 +50,7 @@ referenced sections.
 | round 9 | `NO_FREE_LINE` error REMOVED - busy is a normal result: `call.acquire` returns `{granted:true,...}` or `{granted:false, free_lines[]}` | §3.3 |
 | round 10 | Accept window default 30 s, ALL timeouts admin-configurable; per-line inbound fallback policy set; idle_revoke = alert-only via escalation channels; exclusive binding = claim + moderator approval; admin = private MCP server; `line.revoke` admin-only | §5.3, §4.2, §10 |
 | round 11 (architecture review hardening) | Unified ID taxonomy (`lease_id` is the only call id); `call.dial`/`call.accept` return `media_endpoint`+`media_token`; `call.accept` takes only `{session_id, call_token}`; `receive_inbound` keeps line `FREE` until a physical ring; `line_id:"default"` input-only alias; `RedactedString` PII masking; ADR-01 FallbackWorker owns complex fallbacks; ADR-02 binary 20 ms media framing with in-band flush; ADR-03 BDADDR binding + mandatory `/var/lib/bluetooth` + `/var/lib/phonebridge` volumes; WAN media reclassified to prod gate | §2.1, §3.3, §4.1, §5.3, §5.5, §6.2, §12 |
-| round 12 (live probes + unified agent model, 2026-11-13) | Live-verified on the real stack: `VoiceCall.Answer` works (incoming→`active` ~0.3 s, SCO ~0.6 s), inbound `Hangup` rejects a ringing call, full E.164 terminates via `Dial` unchanged, `SendTones` is broken on this stack (fallback = in-band DTMF in uplink), WirePlumber auto-routes SCO to the default sink+monitor (echo loop; service must own routing via per-line virtual endpoints + static `node.autoconnect=false` on bluez5 HFP nodes). Architecture: UNIFIED AGENT MODEL — every BT dongle sits behind a dumb `hci-agent` (libusb, btusb detached) feeding a kernel `vhci` adapter inside the container over a pluggable `transport_profile` tunnel (control-TCP + media-UDP; QUIC is a V2 track); container is isolated-netns, sees only virtual adapters; thin-slice per-line worker bundles + shared bluetoothd/PipeWire; `call.dial` requires `number` (strict E.164) + `country` (ISO alpha-2) with phonenumbers cross-validation and a per-line number-type allowlist; agent surface reachable via MCP adapter | §2.1, §2.2, §5.5, §6.4, §9, §10, §12, docs/hci-agent.md |
+| round 12 (live probes + unified agent model, 2026-11-13) | Live-verified on the real stack: `VoiceCall.Answer` works (incoming→`active` ~0.3 s, SCO ~0.6 s), inbound `Hangup` rejects a ringing call, full E.164 terminates via `Dial` unchanged, `SendTones` is broken on this stack (fallback = in-band DTMF in uplink), WirePlumber auto-routes SCO to the default sink+monitor (echo loop; service must own routing via per-line virtual endpoints + static `node.autoconnect=false` on bluez5 HFP nodes). Architecture: UNIFIED AGENT MODEL — every BT dongle sits behind a dumb `hci-agent` (libusb, btusb detached) feeding a kernel `vhci` adapter inside the container over a pluggable `transport_profile` tunnel (control-TCP + media-UDP; QUIC is a V2 track); container is isolated-netns, sees only virtual adapters; thin-slice per-line worker bundles + shared bluetoothd/PipeWire; `call.dial` requires `number` (strict E.164) + `country` (ISO alpha-2) with phonenumbers cross-validation and a per-line number-type allowlist; agent surface reachable via MCP adapter. *(Deployment portion SUPERSEDED by round 25 — `AF_BLUETOOTH` is `init_net`-only, so the production profile is `--network=host` + `/dev/vhci`, not isolated netns.)* | §2.1, §2.2, §5.5, §6.4, §9, §10, §12, docs/hci-agent.md |
 | round 13 (vhci experiment — protocol hardening, 2026-11-13) | One-dongle end-to-end experiment PASSED (issue #29): dongle → hci-agent → control-TCP/media-UDP → `/dev/vhci` → bluetoothd/oFono → live call with bidirectional SCO. Silent-audio incident diagnosed and fixed live — media frames outrun the sync-connection event across the split channels, and raw USB isoc buffers are not HCI-frame-aligned. Locked invariants: control channel is strictly lossless + `ctrl_seq` sequenced (gap/overflow = fatal session reset); agent reassembles complete HCI SCO packets at the isoc boundary (`media_seq`, one packet per datagram); feeder gates SCO on `0x2c`/`0x03` events, closes before `0x05`, caps unknown-handle holds at ≤4 frames; loud media health events `SCO_UNEXPECTED_HANDLE`/`SCO_RX_STARVATION`/`SCO_FRAMING_ERROR` | docs/hci-agent.md §2 |
 | round 14 (architect review — edge cases, 2026-11-13) | Second review pass (issue #31): `line.dial`/`line.answer` now carry per-lease `{media_endpoint, media_token}` for the provider's `media.auth`; `call.acquire` restricted to `dial_out` only (inbound via `call.accept`, exclusive via `call.claim_exclusive`); `provider.call_state` uses the canonical state set `ringing\|dialing\|alerting\|active\|disconnected` + `lease_id?`; new `provider.audio_ready` notification feeds `event.audio_ready`; MediaRouter gains pair TTL (~5 s) and bounded frame queues; `fallback_call_token` mechanics defined for FallbackWorker on `accept_window_sec` expiry; `adapter_mac` added to `LineProviderConfig` | §2.2, §5.3, §5.5, docs/api-contract.md |
 | round 15-16 (contract parity + doc tails, 2026-11-13) | contract.py aligned to api-contract (issue #33): `country` in `dial()`, `allowed_number_types` on LineAssignment (+mandatory `FIXED_LINE_OR_MOBILE` for NANP), full EventName vocabulary + event models, `fallback_call_token`, `drop_session`, `ingest_audio_ready`, explicit `RedactedString` JSON serializer, `MAX_CTRL_FRAME_LEN=4096`. Review 4 (SA_hidrogen): `answer_confidence` carried on `event.call_state_changed`; §3.5/§3.6/§13 updated for provider.audio_ready, event.fallback_triggered and the hci-agent/vhci line-bundle topology | §3.5, §3.6, §5.5, §13, docs/api-contract.md |
@@ -240,8 +240,12 @@ interface LineProviderConfig {
   server-initiated JSON-RPC - no reverse dial ever happens.
 - **Reconnect = re-register** (`provider.reregister`, idempotent;
   preserves lease state during the grace window).
-- Liveness: `provider.ping`; missed N pings -> line `DEGRADED` ->
-  `DOWN` (interval and N admin-configurable).
+- Liveness: `provider.ping`; missed pings escalate the binding's
+  `LivenessState` `reachable` -> `unreachable` via the
+  `heartbeat_degraded_after`/`heartbeat_down_after` ladder and
+  surface as `event.line_health_changed` (interval and rungs
+  admin-configurable; `DEGRADED`/`DOWN` are no longer `LineState`
+  members since round 25).
 - Two distinct failure levels (round 20 — resolves the §5.4
   contradiction): (a) provider **WS drop** while the underlying
   telephony path survives -> in-flight calls stay up at the provider,
@@ -324,7 +328,9 @@ type Intent   = "dial_out" | "receive_inbound" | "exclusive_line";
 // Occupancy axis ONLY (round 25 — RESERVED had no transitions;
 // DEGRADED/DOWN moved to the liveness axis):
 type LineState     = "FREE"|"BUSY"|"RINGING_LOCKED";
-type LivenessState = "reachable"|"ws_disconnected"|"unreachable";
+type LivenessState = "reachable"|"ws_disconnected"|"unreachable"|"unbound";
+// "unbound" is a LineSummary listing value for provider-less lines —
+// never an event.line_health_changed endpoint (round 26).
 type LineSummary = { line_id: string, caps: Intent[], state: LineState,
                      liveness: LivenessState, profile?: string };
 ```
@@ -497,7 +503,9 @@ AGENT purposes; ProviderBinding = which provider physically
 serves it. Both share the `AssignmentId` tag; admin operations
 disambiguate by which object the id resolves to — revoking a
 LineAssignment reverts the line to the shared pool, revoking a
-ProviderBinding drops the line to DOWN with lease teardown.
+ProviderBinding drops the binding's liveness to `unreachable`
+(`event.line_health_changed{new_state:"unreachable"}`) with lease
+teardown.
 
 - **Exclusive binding = claim + approval** (round 10d): the agent
   files a CLAIM REQUEST; a moderator approves it in the admin
@@ -740,7 +748,8 @@ removed.
   ACTIVE call is hangup-intent (hangup first, then the lease ends).
 - Orphan-lease grace on provider reconnect: **10 s** (round 5b) —
   applies ONLY to the WS-drop level above; a provider that reports
-  tunnel/USB death, or stays unreachable past DEGRADED->DOWN,
+  tunnel/USB death, or stays unreachable past the
+  `heartbeat_down_after` rung of the liveness ladder,
   tears its calls down immediately (round 20). Mechanics (round 20b):
   on WS drop — ingested as `LivenessState.WS_DISCONNECTED` (round 21,
   distinct from heartbeat-timeout `UNREACHABLE`) — the binding's
@@ -1145,19 +1154,20 @@ status (mirrors the busctl commands used in Phase-0).
     one adapter (by `adapter_mac`) and auto-confirms SSP within the
     window — no `docker exec bluetoothctl` per line.
 - **ALL timeouts and windows are admin-configurable** (round 10a):
-  accept window (default 30 s), queue grant TTL, ping/degraded/down
-  liveness thresholds, orphan grace, `idle_revoke_after` —
-  `idle_revoke_after:null` in the PATCH disables the idle clock
-  entirely (round 25; an absent key keeps the current value —
-  PATCH-without-tombstone ambiguity closed via the explicit
-  `clear_idle_revoke_after:true` flag, both keys together →
-  `INVALID_ARGUMENT`). The kernel surface for all of them is
+  accept window (default 30 s), queue grant TTL,
+  heartbeat liveness thresholds, orphan grace, `idle_revoke_after` —
+  `clear_idle_revoke_after:true` in the PATCH disables the idle
+  clock entirely (round 25; an absent `idle_revoke_after` key keeps
+  the current value — PATCH-without-tombstone ambiguity closed via
+  the explicit flag, both keys together → `INVALID_ARGUMENT`).
+  The kernel surface for all of them is
   `admin.configure_line{..., idle_revoke_after?,
   clear_idle_revoke_after?, timeouts?}` where `timeouts` carries
   `{grant_ttl_sec?, orphan_grace_sec?, heartbeat_interval_sec?,
   heartbeat_degraded_after?, heartbeat_down_after?,
   fallback_accept_ttl_sec?, ring_drain_ttl_sec?,
-  max_call_duration_sec?}` (round 22; `fallback_accept_ttl_sec`
+  max_call_duration_sec?, clear_max_call_duration?}` (round 22;
+  `fallback_accept_ttl_sec`
   added round 23, ~10 s default, bounds the FallbackWorker accept
   deadline; `ring_drain_ttl_sec` ~60 s default bounds the
   ring-drain wait of §5.2 step 6; `max_call_duration_sec` — round
@@ -1191,8 +1201,9 @@ status (mirrors the busctl commands used in Phase-0).
   `transport_profile` (`wireguard`/`direct_mtls`/`sstp`/
   `openconnect`/`vless_xray`) for each remote line; protocol
   parameters are canonical system packs, not user-editable. Line
-  onboarding lifecycle: `PROVISIONING → PAIRING → READY → IN_CALL →
-  DEGRADED → FAULTED`.
+  onboarding lifecycle (dongle-level FSM — a separate vocabulary
+  from `LineState`/`LivenessState`): `PROVISIONING → PAIRING →
+  READY → IN_CALL → LINK_DEGRADED → FAULTED`.
 - **Exclusive assignment requires moderator approval** in admin -
   an agent's claim request is never self-granted (round 10d).
 - Webhook events are authenticated via HMAC + `delivery_id`
@@ -1224,7 +1235,8 @@ status (mirrors the busctl commands used in Phase-0).
   real Bluetooth sessions, oFono/PipeWire daemons, or touch the
   system D-Bus.
 - **Fake LineProvider**: a WSS client double exercising
-  register/ping/reregister, DEGRADED->DOWN transitions, media-frame
+  register/ping/reregister, `LivenessState` transitions
+  (`reachable` -> `ws_disconnected`/`unreachable`), media-frame
   routing and stream-auth - the local provider's loopback path is
   tested identically since code is unified.
 - **ofono-phonesim**: optional deeper fidelity for the oFono dialect

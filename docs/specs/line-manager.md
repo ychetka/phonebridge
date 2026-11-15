@@ -159,7 +159,8 @@ did what.
 
 `configure_line` MUST reject a `forward_via_line` policy creating a
 self-loop AND detect transitive cycles (`A → B → … → A`) by walking
-the stored policy chain bounded at 8 hops — a forward loop would
+the stored policy chain bounded at 8 hops (contract constant
+`MAX_FORWARD_HOPS = 8`, contract.py — round 26) — a forward loop would
 otherwise spin fallback workers forever. `max_call_duration_sec`
 (`None` = uncapped, ≤ 86400 s when set) bounds every call's
 wall-clock length and the `record_and_telegram` recording length;
