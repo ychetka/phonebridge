@@ -56,6 +56,8 @@ referenced sections.
 | round 15-16 (contract parity + doc tails, 2026-11-13) | contract.py aligned to api-contract (issue #33): `country` in `dial()`, `allowed_number_types` on LineAssignment (+mandatory `FIXED_LINE_OR_MOBILE` for NANP), full EventName vocabulary + event models, `fallback_call_token`, `drop_session`, `ingest_audio_ready`, explicit `RedactedString` JSON serializer, `MAX_CTRL_FRAME_LEN=4096`. Review 4 (SA_hidrogen): `answer_confidence` carried on `event.call_state_changed`; §3.5/§3.6/§13 updated for provider.audio_ready, event.fallback_triggered and the hci-agent/vhci line-bundle topology | §3.5, §3.6, §5.5, §13, docs/api-contract.md |
 | round 17-18 (review tails 5-6, 2026-11-13) | `EventName.QUEUE_UPDATED` + `QueueUpdatedEvent`; `QueueReadyEvent` gains `session_id`+`intent` (wire `event.line_acquired` needs no adapter-side ticket table); full round-15 test coverage; `_mask_for_log` hardened for `set`/`frozenset`; local media endpoint specified as **WebSocket over AF_UNIX** (raw SOCK_STREAM has no message boundaries); `0x04 MEDIA_PING` uplink endpoint binding + WireGuard `/32` peer isolation on the container side | docs/api-contract.md, docs/hci-agent.md §2/§6 |
 | round 19 (architect review 7 — blind spots, 2026-11-14) | `LineAssignment.owner_agent_id` nullable (`None` = pool/provider attachment, no magic strings); `LineAdminKernel` separate admin interface (`approve_claim`/`reject_claim`/`revoke_assignment`/`configure_line`) — agent surface has no privileged mutations; queue fairness = one global monotonic `seq` (lowest eligible seq wins, no scope starvation); incoming ring PREEMPTS an undialed grant (`preempted_by_incoming`, ticket reissued at head); deterministic D-Bus resolution chain `adapter_mac → Adapter1.Address → Device1.Adapter → phone_mac → bluez_input/output.<phone_mac>`; `0x16 SCO_STATE` feeder→agent USB altsetting control; in-container BlueZ `Agent1` + `admin.pair_window` for headless pairing; MCP adapter = control plane only (media via agent audio worker / MediaSidecar) | §2.1, §3.4, §4.2, §10, docs/api-contract.md, docs/hci-agent.md §2/§5 |
+| round 19b (event-wire parity) | `event.assignment_revoked` wire event + authoritative `EVENT_WIRE_NAMES` map + bidirectional doc-drift test | contract.py, docs/api-contract.md |
+| round 20 (hardening spec `SA_carbon_review_changes_8`, 2026-11-14) | `RedactedString` rewritten fail-CLOSED (non-str container — json.dumps/concat leak impossible); bounded transactional outbox on `LineManager` (`drain_events`/`drain_provider_commands`, typed `ProviderCommand` union, no network await inside mutations); `ProviderBinding` split from `LineAssignment` (two assignment_id object spaces); acquire `idempotency_key` dedup + `INVALID_STATE`/`INVALID_ARGUMENT`/`RESOURCE_EXHAUSTED` codes; `AcquireGranted.expires_at` + `CallPhase.ACQUIRED` + `CALL_PHASE_WIRE_STATES`; `DTMF_PATTERN` + provider-side tone synthesis muting agent uplink; `ensure_aware_utc` runtime helper (mandatory in `tick()`); media-UDP `session_nonce` binding + `SCO_STATE` air_mode/lengths; orphan-grace two-level failure model; D-Bus privilege split + stack-restart reconciliation; `phonenumbers` runtime dep | contract.py, docs/api-contract.md, docs/hci-agent.md, §4.2, §5.4, §6.4, §9 |
 
 ## §1. Service boundary
 
@@ -185,9 +187,14 @@ interface LineProviderConfig {
   preserves lease state during the grace window).
 - Liveness: `provider.ping`; missed N pings -> line `DEGRADED` ->
   `DOWN` (interval and N admin-configurable).
-- In-flight call on provider drop = treated as hangup; orphaned agent
-  leases get a **10 s grace** window to re-bind through the
-  re-registered provider before teardown.
+- Two distinct failure levels (round 20 — resolves the §5.4
+  contradiction): (a) provider **WS drop** while the underlying
+  telephony path survives -> in-flight calls stay up at the provider,
+  orphaned agent leases get a **10 s grace** window to re-bind
+  through the re-registered provider; (b) provider-reported tunnel/
+  USB death (`provider.call_state{state:"disconnected"}` /
+  `dongle_lost`) or unreachable provider after DEGRADED->DOWN ->
+  in-flight calls are treated as hangup immediately, no grace.
 
 RemoteLine example - Raspberry Pi site (round 12): the Pi no longer
 runs the provider. It runs the **hci-agent** — a dumb USB↔HCI relay
@@ -377,6 +384,18 @@ LineAssignment fields: `owner_agent_id`, `mode
 (exclusive|shared_pool)`, `claimable`, `accept_window_sec`,
 `fallback_policy`, `last_seen_at`, `idle_revoke_after`.
 
+**ProviderBinding is a third, distinct object space** (round 20 —
+the ≤0.0.12 conflation where `register_provider` returned a
+LineAssignment is removed): the provider attachment record
+(`assignment_id` in the *binding* space, `caps`, `profile`,
+`liveness`, `connected_at`, `last_seen_at`,
+`orphan_deadline_at`). LineAssignment = who owns the line for
+AGENT purposes; ProviderBinding = which provider physically
+serves it. Both share the `AssignmentId` tag; admin operations
+disambiguate by which object the id resolves to — revoking a
+LineAssignment reverts the line to the shared pool, revoking a
+ProviderBinding drops the line to DOWN with lease teardown.
+
 - **Exclusive binding = claim + approval** (round 10d): the agent
   files a CLAIM REQUEST; a moderator approves it in the admin
   surface - it is NOT self-granted. Admin may also assign directly
@@ -489,7 +508,13 @@ remains single-use and TTL-bound) and delivers `event.incoming_call`
 
 - Dead-man switch: a dead/disconnected agent loses its CallLease and
   its call is hung up.
-- Orphan-lease grace on provider reconnect: **10 s** (round 5b).
+- Orphan-lease grace on provider reconnect: **10 s** (round 5b) —
+  applies ONLY to the WS-drop level above; a provider that reports
+  tunnel/USB death, or stays unreachable past DEGRADED->DOWN,
+  tears its calls down immediately (round 20).
+- Provider-side teardown commands are idempotent: a Hangup racing a
+  remote teardown may surface as "method doesn't exist" — that is
+  treated as already-gone success, verified via GetCalls/HangupAll.
 - Missed-call path emits `event.missed_call{reason, voicemail_ref?}`.
 
 ### §5.5 Audio attach semantics
@@ -611,7 +636,12 @@ Design consequences:
   proves "line has media", the binding to a call is via
   `line_id`+`lease_id`, never via the node.
 - In-band DTMF (SendTones is broken on the bus, §5.5) is generated
-  by mixing synthesized tones into the uplink endpoint.
+  by mixing synthesized tones into the uplink endpoint. While tones
+  are synthesized the agent's uplink PCM is MUTED (round 20) so a
+  tone never races the agent's audio stream; tone ~70 ms, pause
+  ~50 ms, `,`/`w`/`W` = ~500 ms pauses. The `0x02` flush flag drops
+  all still-queued older uplink frames for the lease on receipt —
+  a flush after a DTMF segment never replays buffered stale audio.
 
 ### §6.5 Remote-line audio transport (round 12)
 
@@ -668,6 +698,20 @@ Single-writer applies twice: (a) lease/assignment arbitration inside
 LineManager, (b) exactly one gateway instance per deployment
 (socket path / listen port held exclusively, refuse to start if
 held).
+
+D-Bus split and restart reconciliation (round 20): inside the
+container the privilege boundary is explicit — `bluetoothd`/oFono
+ride the SYSTEM bus while PipeWire/WirePlumber ride the USER-session
+bus (`org.pipewire.Telephony`); the gateway and line bundles bridge
+the two through the shared container dbus-daemon. On ANY stack
+restart (bluetoothd, oFono, PipeWire, WirePlumber, or the gateway
+itself) the affected component re-enumerates its objects and the
+kernel runs reconciliation: re-resolve every line's deterministic
+D-Bus chain (`adapter_mac → Adapter1.Address → Device1.Adapter →
+phone_mac → bluez_*` nodes, §1), rebuild PipeWire links for live
+leases, and resync `CallLease`/`LineAssignment` state against
+provider `state_snapshot` reports — a restarted stack never leaves
+phantom lines, links, or leases behind.
 
 Observability: structured logs, `line_state_changed`/call events on
 the event stream, `phonebridgectl` CLI for manual dial/hangup/

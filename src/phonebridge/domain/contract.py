@@ -29,6 +29,7 @@ Hazard rules applied (docs/CODING_HAZARDS.md):
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
@@ -48,7 +49,10 @@ from pydantic import (
 from pydantic_core import core_schema
 
 __all__ = [
+    "CALL_PHASE_WIRE_STATES",
+    "DTMF_PATTERN",
     "EVENT_WIRE_NAMES",
+    "MAX_DTMF_DIGITS",
     "AcceptResult",
     "AcquireGranted",
     "AcquireQueued",
@@ -93,10 +97,17 @@ __all__ = [
     "MissedCallEvent",
     "NoPickupFallback",
     "PhonebridgeError",
+    "ProviderAnswerCommand",
+    "ProviderBinding",
     "ProviderCallState",
     "ProviderCallStateUpdate",
+    "ProviderCommand",
+    "ProviderDialCommand",
+    "ProviderHangupCommand",
     "ProviderLiveness",
     "ProviderRegistration",
+    "ProviderRevokeCommand",
+    "ProviderSendDtmfCommand",
     "QueueReadyEvent",
     "QueueTicket",
     "QueueUpdatedEvent",
@@ -105,6 +116,8 @@ __all__ = [
     "RejectFallback",
     "SessionId",
     "TicketId",
+    "WireCallState",
+    "ensure_aware_utc",
 ]
 
 
@@ -185,6 +198,7 @@ class CallPhase(str, Enum):
     uncertainty explicitly. A later PLAN_DELTA may redefine ACTIVE.
     """
 
+    ACQUIRED = "acquired"
     DIALING = "dialing"
     RINGING = "ringing"
     ALERTING = "alerting"
@@ -209,6 +223,31 @@ class ProviderCallState(str, Enum):
     ALERTING = "alerting"
     ACTIVE = "active"
     DISCONNECTED = "disconnected"
+
+
+WireCallState = Literal["dialing", "alerting", "active", "disconnected"]
+"""The four ``state`` values legal on the wire event
+``event.call_state_changed`` (docs/api-contract.md). Internal
+phases that have no wire spelling map to ``None`` in
+``CALL_PHASE_WIRE_STATES`` (round 20)."""
+
+
+CALL_PHASE_WIRE_STATES: dict[CallPhase, WireCallState | None] = {
+    CallPhase.ACQUIRED: None,
+    CallPhase.DIALING: "dialing",
+    CallPhase.RINGING: None,
+    CallPhase.ALERTING: "alerting",
+    CallPhase.ACTIVE: "active",
+    CallPhase.TERMINATING: None,
+    CallPhase.ENDED: "disconnected",
+}
+"""Authoritative CallPhase → wire-state map (round 20).
+
+``None`` means "kernel-internal - never emitted as
+``event.call_state_changed.state``" (ACQUIRED is pre-dial, RINGING
+surfaces as ``event.incoming_call``, TERMINATING is transient).
+Drift against the doc's state vocabulary is caught by
+``test_call_phase_wire_state_parity``."""
 
 
 class AssignmentMode(str, Enum):
@@ -242,6 +281,9 @@ class ErrorCode(str, Enum):
     STALE_TOKEN = "STALE_TOKEN"
     PROVIDER_UNREACHABLE = "PROVIDER_UNREACHABLE"
     DIAL_REJECTED = "DIAL_REJECTED"
+    INVALID_STATE = "INVALID_STATE"
+    INVALID_ARGUMENT = "INVALID_ARGUMENT"
+    RESOURCE_EXHAUSTED = "RESOURCE_EXHAUSTED"
 
 
 class ErrorReason(str, Enum):
@@ -268,6 +310,12 @@ class ErrorReason(str, Enum):
     INVALID_NUMBER = "INVALID_NUMBER"
     UNSUPPORTED_NUMBER_TYPE = "UNSUPPORTED_NUMBER_TYPE"
     LINE_POLICY_REJECT = "LINE_POLICY_REJECT"
+    # Round 20 additions (paired with the new INVALID_STATE /
+    # INVALID_ARGUMENT / RESOURCE_EXHAUSTED wire codes).
+    GRANT_TTL_EXPIRED = "GRANT_TTL_EXPIRED"
+    SESSION_LIMIT_EXCEEDED = "SESSION_LIMIT_EXCEEDED"
+    CLAIM_NOT_FOUND = "CLAIM_NOT_FOUND"
+    INVALID_DTMF = "INVALID_DTMF"
 
 
 class EventName(str, Enum):
@@ -316,19 +364,36 @@ table and docs/api-contract.md's ``event.*`` table is caught by
 # ---------------------------------------------------------------------------
 
 
-def _require_aware_utc(value: datetime) -> datetime:
+def ensure_aware_utc(value: datetime) -> datetime:
     """Enforce CODING_HAZARDS rule 6: reject naive datetimes; normalize
-    aware values to canonical UTC."""
+    aware values to canonical UTC. Public (round 20) so that runtime
+    entry points - e.g. every ``LineManager.tick(now)`` implementation
+    and any adapter ingress bypassing pydantic validation - can apply
+    the same check the ``AwareDatetime`` annotation only documents."""
+    if not isinstance(value, datetime):
+        raise TypeError(f"expected datetime, got {type(value).__name__}")
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
         raise ValueError("naive datetime rejected: contract timestamps must be timezone-aware")
     return value.astimezone(timezone.utc)
 
 
-AwareDatetime = Annotated[datetime, AfterValidator(_require_aware_utc)]
+AwareDatetime = Annotated[datetime, AfterValidator(ensure_aware_utc)]
 """Annotated datetime that REJECTS naive input and normalizes to UTC."""
 
 AnswerConfidence = Literal["provisional", "confirmed"]
 """Confidence that the remote party actually answered (see CallPhase.ACTIVE)."""
+
+
+MAX_DTMF_DIGITS: int = 32
+"""Upper bound for a single call.send_dtmf `digits` payload (round
+20, rule 7): an unbounded digit string could park synthesized tones
+in the provider queue for minutes."""
+
+DTMF_PATTERN: re.Pattern[str] = re.compile(rf"^[0-9A-D*#,wW]{{1,{MAX_DTMF_DIGITS}}}$")
+"""Legal DTMF alphabet (round 20): digits 0-9, letters A-D, `*` and
+`#`, plus pause commands `,`/`w`/`W` (~500 ms pause each); length
+bound derives from MAX_DTMF_DIGITS. Violation -> INVALID_ARGUMENT +
+ErrorReason.INVALID_DTMF."""
 
 _MASK = "****"
 _MASK_PREFIX_LEN = 4
@@ -339,32 +404,41 @@ nothing. Above it the visible frame is capped at half the length, so a
 masked rendering never reveals more than half the raw characters."""
 
 
-class RedactedString(str):
-    """PII-safe str subclass (api-contract.md "Common types"; CODING_HAZARDS
-    rule 10).
+class RedactedString:
+    """PII-safe string container (api-contract.md "Common types";
+    CODING_HAZARDS rule 10). NOT a str subclass (round 20 rewrite).
 
-    The instance IS a str holding the raw value, so JSON/wire
-    serialization (``model_dump_json()``, ``json.dumps``) emits the
-    full value with no special-casing - while ``repr()`` / ``str()``
-    render a MASKED form (e.g. "+373****45"), so accidental
-    f-string/logging use cannot leak PII.
+    Inheriting ``str`` was fail-open: CPython's ``json.dumps`` and
+    ``+``-concatenation read the inner ``PyUnicodeObject`` buffer
+    directly, bypassing the masked ``__str__`` - structured loggers
+    would emit the raw secret. This class is fail-CLOSED instead: the
+    raw value is unreachable except through the explicit
+    ``.expose()`` / ``.to_wire()`` accessors, while
+    ``json.dumps(redacted)``, ``"x" + redacted`` and implicit
+    ``isinstance(x, str)`` paths all raise/behave safely.
 
-    - ``.expose()`` returns the raw value for in-memory use.
-    - ``.to_wire()`` returns the raw value for wire serialization.
-    - ``__format__`` applies any format spec to the MASKED value, so
-      ``f"{s:>20}"`` / ``format(s, ">20")`` pad/align the mask and can
-      never emit the raw string (unlike inherited ``str.__format__``).
-    - ``model_dump()`` (python mode) keeps this object - its masked
-      repr is safe, but for logs use ``safe_dump()``/``to_log_dict()``
-      which render explicit masked strings.
-    - Equality/hash are str-native (compare by raw content); slicing
-      returns raw fragments - deliberate access, same as .expose().
+    - ``.expose()`` / ``.to_wire()`` return the raw value - for
+      deliberate in-memory / wire use only, never for logs.
+    - ``__str__`` / ``__repr__`` / ``__format__`` render only the
+      masked form ("+373****45"); any format spec applies to the mask.
+    - ``model_dump_json()`` / ``model_dump(mode="json")`` emit the raw
+      value via the explicit serializer (socket contract unchanged).
+    - Equality is RedactedString-to-RedactedString only; comparing
+      with a plain ``str`` is ``False`` so a raw string can never
+      silently stand in for a secret.
     """
 
-    def __new__(cls, value: str) -> RedactedString:
-        if not isinstance(value, str):
+    __slots__ = ("_value",)
+
+    _value: str
+
+    def __init__(self, value: str | RedactedString) -> None:
+        if isinstance(value, RedactedString):
+            self._value = value._value
+        elif isinstance(value, str):
+            self._value = value
+        else:
             raise TypeError(f"RedactedString expects str, got {type(value).__name__}")
-        return super().__new__(cls, value)
 
     @staticmethod
     def _mask(value: str) -> str:
@@ -382,35 +456,51 @@ class RedactedString(str):
 
     def expose(self) -> str:
         """Raw value (plain str) for in-memory use. Never log it."""
-        return str.__str__(self)
+        return self._value
 
     def to_wire(self) -> str:
         """Raw value (plain str) for explicit wire serialization."""
-        return str.__str__(self)
+        return self._value
+
+    def __len__(self) -> int:
+        return len(self._value)
+
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
+    def __hash__(self) -> int:
+        return hash(self._value)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, RedactedString):
+            return False
+        return self._value == other._value
 
     def __repr__(self) -> str:
-        return f"RedactedString({self._mask(str.__str__(self))!r})"
+        return f"RedactedString({self._mask(self._value)!r})"
 
     def __str__(self) -> str:
-        return self._mask(str.__str__(self))
+        return self._mask(self._value)
 
     def __format__(self, format_spec: str) -> str:
         """Apply the spec to the MASKED value: ``f"{s:>20}"`` aligns the
         mask, so no format spec can ever emit the raw string."""
-        return str.__format__(self._mask(str.__str__(self)), format_spec)
+        return self._mask(self._value).__format__(format_spec)
 
     @classmethod
     def __get_pydantic_core_schema__(
         cls, source_type: Any, handler: GetCoreSchemaHandler
     ) -> core_schema.CoreSchema:
-        """Validate any str into the redacting subclass; JSON mode uses
-        an explicit serializer so ``model_dump_json()`` always emits
-        ``.to_wire()`` (raw value for the socket) regardless of how
-        pydantic-core treats the str subclass - Python-mode dumps keep
-        the object with its masked repr (round 15)."""
-        return core_schema.no_info_after_validator_function(
-            cls,
-            core_schema.str_schema(),
+        """Accept an existing RedactedString or wrap a raw ``str``;
+        JSON mode uses an explicit serializer so
+        ``model_dump_json()`` always emits ``.to_wire()`` (raw value
+        for the socket) - Python-mode dumps keep the container with
+        its masked repr (rounds 15/20)."""
+        return core_schema.union_schema(
+            [
+                core_schema.is_instance_schema(cls),
+                core_schema.no_info_after_validator_function(cls, core_schema.str_schema()),
+            ],
             serialization=core_schema.plain_serializer_function_ser_schema(
                 lambda v: v.to_wire(),
                 return_schema=core_schema.str_schema(),
@@ -614,6 +704,34 @@ class LineAssignment(ContractModel):
         return self
 
 
+class ProviderBinding(ContractModel):
+    """Provider attachment record - a distinct object space from
+    LineAssignment (round 20, fixes the ≤0.0.12 conflation where
+    ``register_provider`` returned the AGENT-ownership record).
+
+    Identity card of the registered provider: which line it serves,
+    its caps/profile and liveness bookkeeping. ``assignment_id`` here
+    is a *provider-binding id* - it shares the ``AssignmentId`` type
+    tag but lives in a separate object space from
+    ``LineAssignment.assignment_id`` (api-contract.md Identifier
+    taxonomy); admin operations disambiguate by which object the id
+    resolves to - the kernel MUST mint ids unique across BOTH spaces
+    (a collision is a defect: the operation rejects the id as
+    ambiguous rather than guessing). ``orphan_deadline_at`` is set
+    only while a disconnected provider is inside the wire's 10 s
+    orphan-grace window.
+    """
+
+    assignment_id: AssignmentId
+    line_id: LineId
+    caps: list[Intent]
+    profile: str | None = None
+    liveness: LivenessState = LivenessState.REACHABLE
+    connected_at: AwareDatetime
+    last_seen_at: AwareDatetime
+    orphan_deadline_at: AwareDatetime | None = None
+
+
 class CallLease(ContractModel):
     """Ephemeral call/line-hold record (design §4.2).
 
@@ -635,10 +753,18 @@ class CallLease(ContractModel):
     line_id: LineId
     owner_agent_id: str
     intent: Intent
-    phase: CallPhase = CallPhase.DIALING
+    phase: CallPhase = CallPhase.ACQUIRED
     created_at: AwareDatetime
     answered_at: AwareDatetime | None = None
     answer_confidence: AnswerConfidence = "provisional"
+    grant_expires_at: AwareDatetime | None = None
+    """Grant deadline copied from AcquireGranted/QueueReadyEvent
+    (round 20): a lease still in CallPhase.ACQUIRED whose
+    grant_expires_at lapses is torn down as
+    call_state_changed{reason: "grant_ttl_expired"} by tick(). None
+    means "no grant TTL pending" (dial already issued, or the lease
+    came from accept() - inbound rings carry their own call_token
+    expiry)."""
 
 
 class QueueTicket(ContractModel):
@@ -653,7 +779,12 @@ class QueueTicket(ContractModel):
     of docs/api-contract.md "Queue semantics". Tickets are
     socket-bound - disconnect kills them;
     the queue itself must be bounded (rule 7: queue overflow reports
-    STALE_TOKEN/QUEUE_FULL reason detail, never an unbounded park).
+    RESOURCE_EXHAUSTED/QUEUE_FULL reason detail - round 20 - never an
+    unbounded park). ``idempotency_key`` (round 20) scopes the
+    retry-dedup: identical retries carrying the SAME non-empty
+    ``(session_id, idempotency_key)`` collapse into one ticket;
+    calls without a key always create separate tickets so a
+    multi-call agent can hold N parallel acquires.
     """
 
     ticket_id: TicketId
@@ -662,6 +793,7 @@ class QueueTicket(ContractModel):
     intent: Intent
     preferred_line_id: LineId | None = None
     enqueued_at: AwareDatetime
+    idempotency_key: str | None = None
 
     def __lt__(self, other: object) -> bool:
         if not isinstance(other, QueueTicket):
@@ -675,11 +807,17 @@ class QueueTicket(ContractModel):
 
 
 class AcquireGranted(ContractModel):
-    """Immediate grant: line + lease issued at once."""
+    """Immediate grant: line + lease issued at once. ``expires_at``
+    (round 20) is the grant TTL - symmetric with the queued path's
+    QueueReadyEvent; an agent that never calls ``call.dial`` before
+    the deadline loses the lease to
+    ``event.call_state_changed{reason: "grant_ttl_expired"}`` and the
+    line goes to the next eligible ticket (rule 7)."""
 
     granted: Literal[True] = True
     line_id: LineId
     lease_id: LeaseId
+    expires_at: AwareDatetime
 
 
 class AcquireQueued(ContractModel):
@@ -754,6 +892,88 @@ class ClaimResult(ContractModel):
 
     claim_id: str
     status: Literal["pending_approval"] = "pending_approval"
+
+
+# ---------------------------------------------------------------------------
+# ProviderCommand union (round 20 outbox)
+# ---------------------------------------------------------------------------
+#
+# Typed provider-side effects produced inside LineManager mutations and
+# stored in the transactional outbox (Rule 4: no network await inside a
+# mutation critical section). The adapter drains them via
+# ``drain_provider_commands()`` after the mutation commits and performs
+# the actual D-Bus/provider call. Every command model carries
+# ``RedactedString`` fields where PII occurs so ``safe_dump()``
+# redaction - the path taken for metrics/logs - is verified by tests.
+
+
+class ProviderDialCommand(ContractModel):
+    """Initiate an outbound call on a bound provider (oFono Dial)."""
+
+    command: Literal["dial"] = "dial"
+    line_id: LineId
+    assignment_id: AssignmentId
+    lease_id: LeaseId
+    number: RedactedString
+    mask_clir: bool = False
+
+
+class ProviderAnswerCommand(ContractModel):
+    """Answer an inbound ring on a bound provider (oFono Answer)."""
+
+    command: Literal["answer"] = "answer"
+    line_id: LineId
+    assignment_id: AssignmentId
+    call_token: CallToken
+
+
+class ProviderHangupCommand(ContractModel):
+    """Tear down a call on a bound provider (oFono Hangup). Reaching a
+    provider that already tore the call down ("method doesn't exist"
+    racing remote teardown) MUST be treated as idempotent success,
+    verified via GetCalls/HangupAll (§5.4)."""
+
+    command: Literal["hangup"] = "hangup"
+    line_id: LineId
+    assignment_id: AssignmentId
+    lease_id: LeaseId
+
+
+class ProviderSendDtmfCommand(ContractModel):
+    """Synthesized DTMF tones on a bound provider (oFono SendTones).
+    `digits` MUST match DTMF_PATTERN; while tones are synthesized the
+    agent-side uplink PCM is muted (§6.4) so tones never race the
+    agent's audio stream."""
+
+    command: Literal["send_dtmf"] = "send_dtmf"
+    line_id: LineId
+    assignment_id: AssignmentId
+    lease_id: LeaseId
+    digits: str = Field(pattern=DTMF_PATTERN.pattern)
+
+
+class ProviderRevokeCommand(ContractModel):
+    """Detach a provider binding (revocation or dead-man teardown).
+    After issuing, the line drops to DOWN and all its leases follow
+    the teardown path."""
+
+    command: Literal["revoke_assignment"] = "revoke_assignment"
+    line_id: LineId
+    assignment_id: AssignmentId
+    reason: str | None = None
+
+
+ProviderCommand = Annotated[
+    ProviderDialCommand
+    | ProviderAnswerCommand
+    | ProviderHangupCommand
+    | ProviderSendDtmfCommand
+    | ProviderRevokeCommand,
+    Field(discriminator="command"),
+]
+"""Discriminated union of provider-side outbox commands (round 20).
+`TypeAdapter(ProviderCommand)` round-trips every variant; the adapter
+executes them idempotently in drain order."""
 
 
 # ---------------------------------------------------------------------------
@@ -1011,6 +1231,7 @@ class LineManager(ABC):
         line_id: LineId | None = None,
         profile: str | None = None,
         enqueue: bool = False,
+        idempotency_key: str | None = None,
     ) -> AcquireResult:
         """call.acquire: immediate grant, clean refusal, or FIFO ticket.
 
@@ -1022,8 +1243,13 @@ class LineManager(ABC):
         LINE_EXCLUSIVE_NOT_OWNER (+ ErrorData.free_lines) on exclusive
         conflict; LINE_BUSY_INCOMING on a RINGING_LOCKED line. A busy
         pool returns AcquireRefused - routine result, never an error.
-        Retry semantics: identical retry while queued returns the SAME
-        ticket (idempotent), not a duplicate queue entry.
+        Retry/dedup semantics (round 20): retry dedup is scoped to the
+        SAME non-empty ``(session_id, idempotency_key)`` pair - an
+        identical retry while queued returns the SAME ticket. Calls
+        WITHOUT a key always create independent tickets/grants
+        (subject to the per-session limit, RESOURCE_EXHAUSTED /
+        SESSION_LIMIT_EXCEEDED on overflow), so a multi-call agent
+        can run N parallel acquires.
         """
         ...
 
@@ -1059,8 +1285,8 @@ class LineManager(ABC):
         knows which line backs the lease, so this check cannot live in
         the transport adapter (round 15). OWNER_MISMATCH /
         PROVIDER_UNREACHABLE / DIAL_REJECTED apply; a duplicate dial on
-        one lease is rejected (INVALID_CALL_STATE reason under
-        STALE_TOKEN is the convention)."""
+        one lease is rejected with INVALID_STATE (round 20 - the
+        INVALID_CALL_STATE case no longer rides STALE_TOKEN)."""
         ...
 
     @abstractmethod
@@ -1081,7 +1307,11 @@ class LineManager(ABC):
     @abstractmethod
     async def send_dtmf(self, session_id: SessionId, lease_id: LeaseId, digits: str) -> None:
         """call.send_dtmf: IVR navigation tones; mandatory from v1.
-        INVALID_CALL_STATE reason when the lease has no live call."""
+        ``digits`` MUST match ``DTMF_PATTERN`` (<= MAX_DTMF_DIGITS
+        chars) - violation is INVALID_ARGUMENT with reason
+        INVALID_DTMF (round 20). INVALID_STATE when the lease has no
+        ACTIVE call - tones are synthesized provider-side, so they
+        only make sense mid-call."""
         ...
 
     @abstractmethod
@@ -1103,14 +1333,20 @@ class LineManager(ABC):
     # --- provider ingress (narrowed: facts and decisions, not transport) ---
 
     @abstractmethod
-    async def register_provider(self, registration: ProviderRegistration) -> LineAssignment:
-        """Provider attach fact -> durable LineAssignment.
+    async def register_provider(self, registration: ProviderRegistration) -> ProviderBinding:
+        """Provider attach fact -> ProviderBinding (round 20; the
+        ≤0.0.12 signature returned the agent-side LineAssignment,
+        conflating two object spaces).
 
         This is the DISTILLED domain fact of a provider.register, not
         the WSS transport method - credential checks and socket
         lifecycle stay in the adapter. Reregister during the grace
         window is idempotent and preserves in-flight leases (wire:
-        provider.reregister, 10 s orphan grace, §5.4).
+        provider.reregister, 10 s orphan grace, §5.4). On the first
+        registration of a new ``line_id`` the kernel ALSO initializes
+        the line's default ``LineAssignment`` (SHARED_POOL,
+        owner_agent_id=None) if none exists - the binding itself is
+        the returned record.
         """
         ...
 
@@ -1126,8 +1362,11 @@ class LineManager(ABC):
     async def ingest_ring(self, ring: IncomingRingIngress) -> IncomingCallEvent:
         """Ring ingress: physical call ringing -> RINGING_LOCKED +
         wake-and-grant routing (§4.3). Returns the incoming_call event
-        the implementation must emit. Atomic w.r.t. concurrent acquires
-        on the same line (single-event-loop invariant)."""
+        - the same instance is ALSO appended to the outbox inside the
+        mutation transaction; the EventBus publishes exclusively from
+        ``drain_events()``, the return value exists for caller
+        convenience (round 20). Atomic w.r.t. concurrent acquires on
+        the same line (single-event-loop invariant)."""
         ...
 
     @abstractmethod
@@ -1192,10 +1431,35 @@ class LineManager(ABC):
         parameters: ``AfterValidator`` runs only under pydantic model
         validation, so the aware-UTC requirement is a caller/
         implementation contract, not a runtime check. Implementations
-        SHOULD apply the same rule as :data:`AwareDatetime` (reject
-        naive, normalize to UTC) when tick is driven from an untrusted
-        entry point.
+        MUST begin with ``now = ensure_aware_utc(now)`` (round 20 -
+        the public helper applies the same reject-naive/normalize-UTC
+        rule at runtime).
         """
+        ...
+
+    # --- transactional outbox (round 20; CODING_HAZARDS rule 4) ---
+    #
+    # Every mutating method above appends domain events and provider
+    # commands to a bounded, per-manager in-memory outbox inside its
+    # mutation transaction - never performing a network await inside
+    # the critical section. The runtime/adapter calls the two drains
+    # AFTER the mutation commits: envelopes go to the EventBus, typed
+    # ProviderCommands to the provider adapter. Ordering is
+    # deterministic (mutation order); the bounded capacity turns an
+    # overflow into RESOURCE_EXHAUSTED rather than unbounded growth.
+
+    @abstractmethod
+    def drain_events(self) -> list[EventEnvelope[Any]]:
+        """Atomically drain pending domain-event envelopes in emission
+        order. The EventBus MUST publish ONLY from this queue - a
+        mutation never emits to subscribers directly."""
+        ...
+
+    @abstractmethod
+    def drain_provider_commands(self) -> list[ProviderCommand]:
+        """Atomically drain pending provider commands in emission
+        order. The provider adapter executes them idempotently
+        (already-gone teardowns are success, §5.4)."""
         ...
 
 
@@ -1228,9 +1492,17 @@ class LineAdminKernel(ABC):
     async def revoke_assignment(
         self, assignment_id: AssignmentId, reason: str | None = None
     ) -> None:
-        """Admin ``line.revoke``: end a durable binding, emit
-        AssignmentRevokedEvent. Covers BOTH exclusive-owner bindings
-        and provider attachments (round 19)."""
+        """Admin ``line.revoke``: end a durable binding.
+
+        ``assignment_id`` disambiguates by which object space it
+        resolves to (round 20 - two identifier spaces share the
+        AssignmentId tag, api-contract.md Identifier taxonomy): a
+        ``LineAssignment`` (agent ownership) -> revert the line to
+        SHARED_POOL and emit AssignmentRevokedEvent to the revoked
+        owner; a ``ProviderBinding`` -> enqueue a
+        ``ProviderRevokeCommand`` in the outbox, drop the line to
+        DOWN and tear down its leases. Unknown id in BOTH spaces ->
+        PhonebridgeError."""
         ...
 
     @abstractmethod

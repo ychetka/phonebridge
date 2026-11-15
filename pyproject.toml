@@ -4,11 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "phonebridge"
-version = "0.0.12"
+version = "0.0.13"
 description = "Standalone Bluetooth telephony bridge service (oFono/PipeWire over D-Bus) with a JSON-RPC + PCM agent API"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "phonenumbers>=8.13,<9",
     "pydantic>=2.9,<3",
     "websockets>=14",
 ]

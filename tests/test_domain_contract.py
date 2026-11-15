@@ -5,6 +5,7 @@ renders as ``test_name[ITEM-03.GWT-N]`` (same convention as the
 tooling-baseline tests).
 """
 
+import json
 import re
 from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,10 @@ from pydantic import TypeAdapter, ValidationError
 
 import phonebridge.domain.contract as contract
 from phonebridge.domain.contract import (
+    CALL_PHASE_WIRE_STATES,
+    DTMF_PATTERN,
     EVENT_WIRE_NAMES,
+    MAX_DTMF_DIGITS,
     AcceptResult,
     AcquireGranted,
     AcquireQueued,
@@ -37,6 +41,7 @@ from phonebridge.domain.contract import (
     EventEnvelope,
     EventName,
     FallbackDecision,
+    FallbackPolicy,
     FallbackTriggeredEvent,
     ForwardViaLineFallback,
     IncomingCallEvent,
@@ -55,10 +60,17 @@ from phonebridge.domain.contract import (
     MissedCallEvent,
     NoPickupFallback,
     PhonebridgeError,
+    ProviderAnswerCommand,
+    ProviderBinding,
     ProviderCallState,
     ProviderCallStateUpdate,
+    ProviderCommand,
+    ProviderDialCommand,
+    ProviderHangupCommand,
     ProviderLiveness,
     ProviderRegistration,
+    ProviderRevokeCommand,
+    ProviderSendDtmfCommand,
     QueueReadyEvent,
     QueueTicket,
     QueueUpdatedEvent,
@@ -67,6 +79,7 @@ from phonebridge.domain.contract import (
     RejectFallback,
     SessionId,
     TicketId,
+    ensure_aware_utc,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +158,7 @@ def test_public_surface_exists(_gwt: object) -> None:
         "DOWN",
     }
     assert {p.value for p in CallPhase} == {
+        "acquired",
         "dialing",
         "ringing",
         "alerting",
@@ -192,6 +206,29 @@ def test_redacted_string_contract(_gwt: object) -> None:
     assert _RAW_NUMBER not in repr(safe)
     log_dict = event.to_log_dict()
     assert _RAW_NUMBER not in repr(log_dict)
+
+    # Round 20 fail-closed: the container is NOT a str, so none of
+    # CPython's C-level string paths (json encoder, concatenation,
+    # implicit isinstance(x, str) checks in loggers) can leak PII.
+    assert not isinstance(caller, str)
+    with pytest.raises(TypeError):
+        json.dumps(caller)
+    with pytest.raises(TypeError):
+        # python-mode dumps hold the container -> json.dumps on the
+        # whole dump fails closed instead of emitting the raw value.
+        json.dumps(event.model_dump())
+    with pytest.raises(TypeError):
+        "x" + caller  # type: ignore[operator]
+    # Equality is RedactedString-to-RedactedString only: a raw str can
+    # never silently stand in for a secret.
+    assert caller != _RAW_NUMBER
+    assert caller == RedactedString(_RAW_NUMBER)
+    assert hash(caller) == hash(RedactedString(_RAW_NUMBER))
+    # Constructing from an existing RedactedString is idempotent.
+    assert RedactedString(caller).expose() == _RAW_NUMBER
+    # Re-validating a python-mode dump (which carries the container)
+    # succeeds - the union schema accepts an existing instance.
+    assert IncomingCallEvent.model_validate(event.model_dump()) == event
 
 
 def test_mask_for_log_set_and_frozenset() -> None:
@@ -369,10 +406,16 @@ def test_acquire_result_union_discrimination() -> None:
     adapter = TypeAdapter(AcquireResult)
 
     granted = adapter.validate_python(
-        {"granted": True, "line_id": "line-main", "lease_id": "lease-9"}
+        {
+            "granted": True,
+            "line_id": "line-main",
+            "lease_id": "lease-9",
+            "expires_at": NOW_UTC.isoformat(),
+        }
     )
     assert isinstance(granted, AcquireGranted)
     assert granted.lease_id == LeaseId("lease-9")
+    assert granted.expires_at == NOW_UTC
 
     queued = adapter.validate_python(
         {
@@ -402,7 +445,8 @@ def test_call_lease_answer_defaults_provisional() -> None:
     )
     assert lease.answered_at is None
     assert lease.answer_confidence == "provisional"
-    assert lease.phase == CallPhase.DIALING
+    assert lease.phase == CallPhase.ACQUIRED  # round 20: pre-dial phase
+    assert lease.grant_expires_at is None
 
 
 def test_fallback_policy_union_and_assignment_default() -> None:
@@ -599,8 +643,11 @@ class _FakeLineManager(LineManager):
         line_id: LineId | None = None,
         profile: str | None = None,
         enqueue: bool = False,
+        idempotency_key: str | None = None,
     ) -> AcquireResult:
-        return AcquireGranted(line_id=LineId("line-main"), lease_id=LeaseId("l-1"))
+        return AcquireGranted(
+            line_id=LineId("line-main"), lease_id=LeaseId("l-1"), expires_at=NOW_UTC
+        )
 
     async def cancel_acquire(self, session_id: SessionId, ticket_id: TicketId) -> None:
         return None
@@ -647,8 +694,14 @@ class _FakeLineManager(LineManager):
             )
         ]
 
-    async def register_provider(self, registration: ProviderRegistration) -> LineAssignment:
-        return _assignment()
+    async def register_provider(self, registration: ProviderRegistration) -> ProviderBinding:
+        return ProviderBinding(
+            assignment_id=contract.AssignmentId("bind-1"),
+            line_id=registration.line_id,
+            caps=registration.caps,
+            connected_at=NOW_UTC,
+            last_seen_at=NOW_UTC,
+        )
 
     async def note_provider_liveness(self, liveness: ProviderLiveness) -> None:
         return None
@@ -681,6 +734,24 @@ class _FakeLineManager(LineManager):
     async def tick(self, now: datetime) -> None:
         return None
 
+    def drain_events(self) -> list[EventEnvelope[Any]]:
+        return [
+            EventEnvelope[MissedCallEvent](
+                name=EventName.MISSED_CALL,
+                emitted_at=NOW_UTC,
+                payload=MissedCallEvent(line_id=LineId("line-main"), reason="test"),
+            )
+        ]
+
+    def drain_provider_commands(self) -> list[ProviderCommand]:
+        return [
+            ProviderHangupCommand(
+                line_id=LineId("line-main"),
+                assignment_id=contract.AssignmentId("bind-1"),
+                lease_id=LeaseId("l-1"),
+            )
+        ]
+
 
 def test_line_manager_is_abstract() -> None:
     with pytest.raises(TypeError):
@@ -689,7 +760,8 @@ def test_line_manager_is_abstract() -> None:
 
 async def test_line_manager_async_surface() -> None:
     """Non-e2e async exercise: EVERY abstract method is awaitable and
-    returns its contracted result type (all 18 methods)."""
+    returns its contracted result type (all 20 methods - 18 async +
+    the two sync outbox drains, round 20)."""
     assert set(LineManager.__abstractmethods__) == {
         "register_intent",
         "acquire",
@@ -709,14 +781,17 @@ async def test_line_manager_async_surface() -> None:
         "decide_fallback",
         "drop_session",
         "tick",
+        "drain_events",
+        "drain_provider_commands",
     }
     mgr = _FakeLineManager()
 
     # --- agent-facing surface ---
     session = await mgr.register_intent("agent-1", {Intent.DIAL_OUT})
-    result = await mgr.acquire(session, Intent.DIAL_OUT)
+    result = await mgr.acquire(session, Intent.DIAL_OUT, idempotency_key="k-1")
     assert isinstance(result, AcquireGranted)
     assert isinstance(result.lease_id, str)
+    assert result.expires_at.tzinfo is not None  # grant TTL rides the wire
     await mgr.cancel_acquire(session, TicketId("ticket-1"))
     dial = await mgr.dial(session, result.lease_id, RedactedString(_RAW_NUMBER), "MD")
     assert isinstance(dial.media_token, str)
@@ -731,14 +806,14 @@ async def test_line_manager_async_surface() -> None:
     assert claim.status == "pending_approval"
 
     # --- provider ingress ---
-    assignment = await mgr.register_provider(
+    binding = await mgr.register_provider(
         ProviderRegistration(
             line_id=LineId("line-main"),
             token=RedactedString("line-secret-token-value"),
             caps=[Intent.DIAL_OUT],
         )
     )
-    assert isinstance(assignment, LineAssignment)
+    assert isinstance(binding, ProviderBinding)  # round 20: distinct object space
     await mgr.note_provider_liveness(
         ProviderLiveness(
             line_id=LineId("line-main"),
@@ -771,5 +846,175 @@ async def test_line_manager_async_surface() -> None:
     )
     await mgr.drop_session(session)
 
-    # --- lifecycle hook ---
+    # --- lifecycle hook + outbox drains (round 20) ---
     await mgr.tick(NOW_UTC)
+    drained_events = mgr.drain_events()
+    assert all(isinstance(env, EventEnvelope) for env in drained_events)
+    drained_commands = mgr.drain_provider_commands()
+    assert all(
+        isinstance(
+            cmd,
+            (
+                ProviderDialCommand,
+                ProviderAnswerCommand,
+                ProviderHangupCommand,
+                ProviderSendDtmfCommand,
+                ProviderRevokeCommand,
+            ),
+        )
+        for cmd in drained_commands
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round 20 hardening: wire-state parity, outbox commands, DTMF, aware-UTC,
+# idempotency key, fake admin kernel
+# ---------------------------------------------------------------------------
+
+
+def test_call_phase_wire_state_parity() -> None:
+    """Round 20 drift test: every CallPhase has an explicit wire-state
+    mapping in CALL_PHASE_WIRE_STATES, and the doc's
+    event.call_state_changed state vocabulary equals the mapping's
+    non-None values."""
+    assert set(CALL_PHASE_WIRE_STATES.keys()) == set(CallPhase)
+    doc = API_CONTRACT_MD.read_text(encoding="utf-8")
+    row = next(line for line in doc.splitlines() if "`event.call_state_changed`" in line)
+    state_seg = re.search(r"`state`:([^;(]+)", row)
+    assert state_seg is not None
+    doc_states = set(re.findall(r"`([a-z_]+)`", state_seg.group(1)))
+    mapped = {v for v in CALL_PHASE_WIRE_STATES.values() if v is not None}
+    assert doc_states == mapped
+
+
+def test_provider_command_union_roundtrip() -> None:
+    """Round 20: all five ProviderCommand variants serialize through
+    TypeAdapter(ProviderCommand) and carry PII-safely."""
+    adapter = TypeAdapter(ProviderCommand)
+    commands: list[ProviderCommand] = [
+        ProviderDialCommand(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            lease_id=LeaseId("l-1"),
+            number=RedactedString(_RAW_NUMBER),
+        ),
+        ProviderAnswerCommand(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            call_token=CallToken("tok-1"),
+        ),
+        ProviderHangupCommand(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            lease_id=LeaseId("l-1"),
+        ),
+        ProviderSendDtmfCommand(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            lease_id=LeaseId("l-1"),
+            digits="123*#",
+        ),
+        ProviderRevokeCommand(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            reason="admin_revoke",
+        ),
+    ]
+    for cmd in commands:
+        dumped = cmd.model_dump()
+        validated = adapter.validate_python(dumped)
+        assert validated == cmd
+
+    # The dial command's masked dump never leaks the dialed number.
+    dial = commands[0]
+    assert isinstance(dial, ProviderDialCommand)
+    safe = dial.safe_dump()
+    assert _RAW_NUMBER not in repr(safe)
+    assert safe["number"] == "+373****45"
+    # ...but the wire dump does carry it (provider needs the target).
+    assert _RAW_NUMBER in dial.model_dump_json()
+
+
+def test_ensure_aware_utc() -> None:
+    """Round 20: the runtime helper rejects naive input and non-
+    datetimes, and normalizes aware non-UTC input to UTC."""
+    naive = datetime(2026, 11, 14, 12, 0, 0)
+    with pytest.raises(ValueError):
+        ensure_aware_utc(naive)
+    with pytest.raises(TypeError):
+        ensure_aware_utc("2026-11-14T12:00:00Z")  # type: ignore[arg-type]
+    plus2 = datetime(2026, 11, 14, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    assert ensure_aware_utc(plus2) == datetime(2026, 11, 14, 12, 0, 0, tzinfo=timezone.utc)
+    assert ensure_aware_utc(plus2).tzinfo is timezone.utc
+
+
+def test_dtmf_pattern() -> None:
+    """Round 20: DTMF_PATTERN bounds digits to the legal alphabet and
+    MAX_DTMF_DIGITS length."""
+    assert DTMF_PATTERN.fullmatch("123*#ABCD,wW")
+    assert not DTMF_PATTERN.fullmatch("")
+    assert not DTMF_PATTERN.fullmatch("x")
+    assert not DTMF_PATTERN.fullmatch("1" * (MAX_DTMF_DIGITS + 1))
+
+
+def test_queue_ticket_idempotency_key() -> None:
+    """Round 20: idempotency_key scopes the acquire retry-dedup."""
+    ticket = QueueTicket(
+        ticket_id=TicketId("t-1"),
+        seq=1,
+        session_id=SessionId("s-1"),
+        intent=Intent.DIAL_OUT,
+        enqueued_at=NOW_UTC,
+        idempotency_key="idem-1",
+    )
+    assert ticket.idempotency_key == "idem-1"
+    assert (
+        QueueTicket(
+            ticket_id=TicketId("t-2"),
+            seq=2,
+            session_id=SessionId("s-1"),
+            intent=Intent.DIAL_OUT,
+            enqueued_at=NOW_UTC,
+        ).idempotency_key
+        is None
+    )
+
+
+class _FakeLineAdminKernel(LineAdminKernel):
+    """Minimal admin-kernel stub exercising all four privileged
+    methods (round 20 spec: the admin surface must be drivable
+    independently of the agent surface)."""
+
+    async def approve_claim(self, claim_id: str) -> LineAssignment:
+        return _assignment()
+
+    async def reject_claim(self, claim_id: str, reason: str | None = None) -> None:
+        return None
+
+    async def revoke_assignment(
+        self, assignment_id: contract.AssignmentId, reason: str | None = None
+    ) -> None:
+        return None
+
+    async def configure_line(
+        self,
+        line_id: LineId,
+        *,
+        fallback_policy: FallbackPolicy | None = None,
+        accept_window_sec: float | None = None,
+        allowed_number_types: frozenset[str] | None = None,
+        claimable: bool | None = None,
+    ) -> LineAssignment:
+        return _assignment()
+
+
+async def test_line_admin_kernel_all_methods() -> None:
+    kernel = _FakeLineAdminKernel()
+    granted = await kernel.approve_claim("claim-1")
+    assert isinstance(granted, LineAssignment)
+    await kernel.reject_claim("claim-2", reason="not claimable")
+    await kernel.revoke_assignment(contract.AssignmentId("asg-1"), reason="admin")
+    updated = await kernel.configure_line(
+        LineId("line-main"), claimable=False, accept_window_sec=10.0
+    )
+    assert isinstance(updated, LineAssignment)
