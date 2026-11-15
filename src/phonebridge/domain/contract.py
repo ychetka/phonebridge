@@ -444,7 +444,7 @@ def _check_agent_id(value: str) -> str:
     itself obeys the same hygiene as any external id (at most
     ``_ID_MAX_LEN`` chars, no ``:``)."""
     if is_system_agent_id(value):
-        suffix = value[len(SYSTEM_AGENT_PREFIX):]
+        suffix = value[len(SYSTEM_AGENT_PREFIX) :]
         if not suffix.strip():
             raise ValueError(
                 f"system agent id must carry a non-empty suffix after {SYSTEM_AGENT_PREFIX!r}"
