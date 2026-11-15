@@ -841,14 +841,17 @@ control-TCP. A QUIC/multiplexed-streams unification is a V2 track.
   IMMEDIATELY (no pacing) through a bounded ring of **100 frames
   (2 s), drop-OLDEST** — a slow reader hears the newest audio, not
   a growing backlog of stale speech.
-- **Uplink `0x02` is consumed, never bridged:** a
-  provider-originated `0x02` (provider's own DTMF path) is
-  consumed by the MediaRouter and MUST NEVER be forwarded to the
-  agent. There is NO reverse `0x02` command frame: agent-side DTMF
-  travels exclusively via `call.send_dtmf`, and the LineProvider
-  substitutes the tones into the uplink stream locally — the agent
-  cannot (and must not be able to) inject `0x02` into the uplink
-  media socket.
+- **`0x02` is bidirectional and consumed at the router, never
+  bridged:** both roles may send `0x02` on the uplink media socket.
+  An agent-originated `0x02` (the in-band `clear_uplink_buffer`/
+  `flush_audio_out` barge-in flush) drains the router's 1500-frame
+  uplink ring and is consumed there; a provider-originated `0x02`
+  (provider's own post-DTMF path) is likewise consumed by the
+  MediaRouter and MUST NEVER be forwarded to the agent — there is
+  no `0x02` travelling toward the agent on downlink. Agent-side
+  DTMF itself travels exclusively via `call.send_dtmf`, and the
+  LineProvider substitutes the tones into the uplink stream
+  locally.
 
 ## §7. Events and universal fan-out
 
