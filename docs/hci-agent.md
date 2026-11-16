@@ -151,6 +151,17 @@ The two ladders stay independent: the agent-side `missed_limit`
 detects transport death faster than the kernel ladder escalates it,
 and the kernel ladder remains authoritative for health events.
 
+**Sibling liveness (round 29, review-1 B9).** The mapping above
+depends on the feeder↔provider IPC being alive — a dead feeder
+that cannot report leaves the provider pinging `reachable` over a
+dead tunnel. The line-bundle supervisor therefore watches BOTH
+children and the IPC channel itself: feeder process death, or
+loss of the bundle-local IPC, is surfaced by the LineProvider as
+a `dongle_lost` teardown fact (immediate, no orphan grace — the
+same consequence class as tunnel/USB death it feeds into). The
+provider owns no independent "feeder is healthy" timer; supervisor
+observation is the liveness contract.
+
 **The control channel is strictly lossless.** HCI assumes event and
 ACL delivery with zero loss; a single dropped event (e.g.
 `Synchronous Connection Complete 0x2c`, `Disconnect Complete 0x05`,
@@ -165,6 +176,14 @@ live in the vhci experiment. Therefore:
   session error**: emit `STATUS state=DEGRADED detail=CTRL_DESYNC`,
   close the session, and reset/re-attach the line adapter. Silent
   continuation is forbidden.
+- A connection drop MID-PAYLOAD of a length-valid frame is the same
+  class of transport failure (round 29, review-1 B13): the partial
+  frame is discarded wholesale — no partially received HCI command
+  or event is ever written to `/dev/vhci` or forwarded to the
+  dongle — and the session dies via the same
+  `STATUS{CTRL_DESYNC}`/disconnect path. "Half a frame" never
+  reaches either side: the reassembled-unit boundary is the full
+  length-prefixed frame.
 - No control frame is ever intentionally dropped; backpressure is the
   only flow control.
 - Implementation note (CODING_HAZARDS rule 7): although `len` admits
@@ -271,6 +290,18 @@ endpoint:
   resampling is implemented or planned for V1.
 
 ### vhci feeder — SCO handle gate and MTU alignment (round 25)
+
+**Attach serialization (round 29, review-1 B4).** `/dev/vhci` is a
+single device node that mints `hciN` indices globally in `init_net`
+— two feeders attaching concurrently (parallel line-bundle starts
+or restarts) can cross their line↔hciN mapping before either reads
+its assigned index back. The feeder MUST therefore hold a per-host
+exclusive lock — `flock` on a lock file such as
+`/run/phonebridge/vhci.lock` — across the ENTIRE attach sequence:
+`open("/dev/vhci")` through hci-index discovery. The lock file
+lives under the same `/run/phonebridge/` state dir the provider
+state file uses (design §5.4); it is held only for the attach
+critical section, never for the feeder's lifetime.
 
 **MTU alignment.** `hci_vhci` carries no `btusb` USB quirks: the
 SCO buffer geometry a real dongle negotiates over USB descriptors

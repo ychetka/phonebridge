@@ -147,7 +147,15 @@ Production deployment is a **single Docker container**
   12): a `vhci-feeder` + shim/audio-forwarder + `LineProvider`
   process, supervised independently so a dead line never takes the
   gateway or other lines down; BlueZ, PipeWire and dbus-daemon are
-  shared, hardened with watchdogs and fast restart,
+  shared, hardened with watchdogs and fast restart — **sibling
+  liveness (round 29, review-1 B9):** the bundle supervisor watches
+  BOTH the `vhci-feeder` and the `LineProvider` children, and the
+  feeder↔provider bundle-local IPC is itself supervised — feeder
+  death, or loss of that IPC channel, is reported by the
+  LineProvider as `dongle_lost` (immediate teardown, NO orphan
+  grace — the same consequence class as tunnel/USB death), so a
+  dead feeder can never leave its provider happily pinging
+  `reachable` while the control tunnel is already gone,
 - BlueZ + PipeWire + dbus-daemon inside the container,
 - **no USB dongles passed through** (round 12, replaces the earlier
   `--device` model): every adapter inside the container is a kernel
@@ -163,6 +171,20 @@ network namespace `init_net` (`bt_sock_create` → `EAFNOSUPPORT`), and
 container therefore runs with **`--network=host`** and an explicit
 `/dev/vhci` device pass-through — the image is packaging for the
 fragile `BlueZ`/`oFono`/`PipeWire` ABI, not a network boundary.
+
+**`/dev/vhci` attach serialization (round 29, review-1 B4):**
+`/dev/vhci` is a single device node that mints `hciN` indices
+globally in `init_net`, so an `open("/dev/vhci")` + hci-index
+discovery performed concurrently by two per-line `vhci-feeder`
+processes is a race — two feeders starting (or restarting)
+together can cross their line↔hciN mapping before either reads
+its assigned index back. Every `vhci-feeder` MUST therefore hold a
+per-host exclusive lock — a `flock` on a lock file such as
+`/run/phonebridge/vhci.lock` — across the ENTIRE attach sequence:
+`open("/dev/vhci")` through index discovery. Parallel line-bundle
+starts/restarts serialize on the file, so the mapping is
+deterministic no matter how many bundles the supervisor launches
+at once.
 
 Canonical deployment profile — **dedicated telephony host/VPS**
 (recommended, ratified round 25):
@@ -604,7 +626,18 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   agent-side `call.release{assignment_id}` path included —
   serializes these rare writes under an `asyncio.Lock` through the
   SAME write-through path: first the kernel call, then the returned
-  immutable `LineAssignment` snapshot is committed to SQLite
+  immutable `LineAssignment` snapshot is committed to SQLite.
+  **Admin mutations serialize globally (round 29, review-1 B15):**
+  ALL admin mutation calls — `configure_line` (including its
+  cross-line forward-chain cycle/depth revalidation of every line
+  whose stored chain passes through the changed one),
+  `remove_line`, `assign_line`, `revoke_assignment`, claim
+  approve/reject — serialize through the kernel's single-writer
+  mutation path, so the multi-line chain check and the mutation it
+  guards execute atomically: two concurrent `configure_line` calls
+  on different lines of one chain can never each pass the check in
+  isolation and combine into a cycle — the lock covers the
+  revalidation, not only the row write
   (`upsert` by `line_id`). `revoke_assignment` returns the new
   post-revert snapshot (rotated `assignment_id`, `None` for a
   provider-binding id). The kernel stays I/O-free; a crash between
@@ -767,6 +800,21 @@ only - `event.fallback_triggered` is THE delivery channel (round
 cannot carry, so the earlier "or `event.incoming_call`" hedge is
 removed.
 
+**Worker dies mid-forward (round 29, review-1 B8).** The instant the
+worker's `call.accept` burns the `fallback_call_token`, the inbound
+ring becomes an ORDINARY `CallLease` owned by the
+`system:fallback_worker` session — no special fallback liveness
+path exists or is needed. If the worker process dies, or its
+session socket drops, between that accept and the bridged dial
+completing on the target line, the generic dead-man switch
+(§5.4) applies verbatim: `drop_session` ends the worker's accepted
+lease — the still-ringing/answered inbound call is hung up through
+the same compensation path as any agent-initiated teardown — and
+any target-line lease the worker already minted dies with the same
+session. The caller on the source line is never left
+unaccounted-for: its physical call ends exactly like a normal
+agent-initiated hangup.
+
 ### §5.4 Lease teardown and orphan handling
 
 - Dead-man switch: a dead/disconnected agent loses its CallLease and
@@ -804,7 +852,21 @@ removed.
   preserved unreconciled when absent — the snapshot is
   authoritative only for `dialing`-or-later leases, so an undialed
   `ACQUIRED` grant survives an empty snapshot). A `provider.register`
-  on an already-live binding is `INVALID_STATE`.
+  on an already-live binding is `INVALID_STATE`. The supersede is
+  DETERMINISTIC (round 29, review-1 B2): `provider.reregister`
+  always replaces the current live binding — REACHABLE, DEGRADED,
+  or a binding minted moments earlier by a racing reregister —
+  sequential last-writer-wins, never first-come-holds. A reregister
+  arrives on a NEW control connection (one socket carries at most
+  one live `assignment_id` for its lifetime, api-contract B12), so
+  the adapter MUST close the superseded control socket after
+  answering the superseding reregister; any `provider.*` fact still
+  in flight on the old socket (`ping`, `call_state`,
+  `capability_update`, `audio_ready`, `reattach_media`) carries a
+  superseded `assignment_id`, resolves through the closed
+  `_closed_assignments` ring, and is rejected `STALE_TOKEN` — a
+  racing TCP FIN in flight never lets stale facts land on the
+  successor binding.
 - **Dead-binding cleanup at the mutation (round 28):** commands
   queued for a binding that dies or is superseded are handled
   INSIDE the killing/replacing mutation — entries for leases that
@@ -822,7 +884,10 @@ removed.
   the agent's lease still waits, TWO rules apply: (a) the provider
   MUST keep a small process-restart state file
   (`/run/phonebridge/<line_id>.json`, atomic write on every call
-  mint/transition) mapping
+  mint/transition — write to a temp file in the SAME directory,
+  `fsync`, then `rename` over the target; a same-filesystem rename
+  is atomic, so a crash mid-write leaves either the old or the new
+  JSON, never a torn file — round 29, review-1 B14) mapping
   `lease_id` → D-Bus object path, so a restart re-binds ids exactly
   — the file survives a provider-process restart only: `/run` is
   tmpfs (round 27), so a container/host reboot legitimately finds
@@ -1063,7 +1128,13 @@ control-TCP. A QUIC/multiplexed-streams unification is a V2 track.
   clock (round 28 — see §6.4): the provider-emitted flush carries
   the `timestamp_ms` of the last agent `0x01` frame the
   LineProvider consumed before the DTMF mute, so the router drops
-  exactly the frames the provider never heard.
+  exactly the frames the provider never heard. Discard scope
+  (round 29, review-1 B7): the drop applies to queued uplink frames
+  with `timestamp_ms` ≤ the watermark that have NOT yet been
+  delivered to the LineProvider socket — frames still inside the
+  router's egress ring; a frame already written to the provider is
+  unrecoverable by design, and a buffered frame stamped above the
+  watermark survives the flush.
 
 ## §7. Events and universal fan-out
 
@@ -1088,7 +1159,14 @@ Three primitives only - no broker in v1:
    (round 28 — DNS rebinding: a hostname that resolved publicly at
    config save can re-resolve to a private address by delivery
    time, so the config-time check alone is insufficient; the
-   connect path pins and validates the actual peer address). The
+   connect path pins and validates the actual peer address).
+   **Pinning is the atomic part (round 29, review-1 B10):** the
+   guard MUST pin the connection to the resolved+validated IP at
+   connect time — the TCP/TLS connect targets the CHECKED address
+   with `Host`/SNI still naming the original hostname; a second
+   resolution between the check and `connect()` is FORBIDDEN, so
+   there is no resolve-check-connect window for a short-TTL
+   DNS-rebind TOCTOU to slip through. The
    gateway itself
    binds only loopback/wg0; a webhook is the one daemon-originated
    egress an operator can point anywhere.

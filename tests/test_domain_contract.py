@@ -10,7 +10,7 @@ import inspect
 import json
 import pickle
 import re
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, get_args
@@ -37,7 +37,9 @@ from phonebridge.domain.contract import (
     MAX_ENDPOINT_LEN,
     MAX_FORWARD_HOPS,
     MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_IDEMPOTENCY_KEYS_PER_SESSION,
     MAX_LEASES_PER_SESSION,
+    MAX_LINES_TOTAL,
     MAX_PENDING_CLAIMS_PER_AGENT,
     MAX_PENDING_CLAIMS_TOTAL,
     MAX_PROFILE_LEN,
@@ -54,6 +56,7 @@ from phonebridge.domain.contract import (
     MEDIA_PAIR_TTL_SEC,
     OUTBOX_SOFT_CAP,
     PROVIDER_COMMAND_WIRE_NAMES,
+    SNAPSHOT_RECONCILED_PHASES,
     SYSTEM_AGENT_PREFIX,
     SYSTEM_FALLBACK_WORKER,
     AcceptResult,
@@ -418,6 +421,35 @@ def test_redacted_string_short_values_masked(_gwt: object) -> None:
         assert str(RedactedString(raw)) == masked
         visible = len(masked) - masked.count("*")
         assert visible <= len(raw) // 2
+
+
+def test_redacted_string_hash_eq_consistency() -> None:
+    """Round 29 (SA_quant_review_1 slice-C item 2): the
+    ``__hash__``/``__eq__`` contract - equal raw values compare
+    equal AND hash equal (``__hash__`` derives from the raw value,
+    not the masked projection), different raw values compare and
+    hash different, and dict/set membership resolves through
+    ``__eq__``."""
+    first = RedactedString("secret-alpha")
+    same = RedactedString("secret-alpha")
+    other = RedactedString("secret-beta")
+    assert first == same
+    assert hash(first) == hash(same)
+    assert first != other
+    # Hash is raw-derived (not masked): two distinct raw values
+    # must not collide for these pinned inputs.
+    assert hash(first) != hash(other)
+    # Membership follows __eq__: a fresh instance with the same raw
+    # value hits the same dict key / set element.
+    table = {first: "v"}
+    assert table[same] == "v"
+    assert other not in table
+    assert {first, same} == {same}
+    # A raw str can never stand in for a secret - not on lookup,
+    # not in a set, in either comparison direction.
+    assert "secret-alpha" not in table
+    assert first != "secret-alpha"
+    assert "secret-alpha" not in {first}
 
 
 # ---------------------------------------------------------------------------
@@ -1429,8 +1461,21 @@ def test_call_phase_wire_state_parity() -> None:
     """Round 20 drift test: every CallPhase has an explicit wire-state
     mapping in CALL_PHASE_WIRE_STATES, and the doc's
     event.call_state_changed state vocabulary equals the mapping's
-    non-None values."""
+    non-None values. Round 29 (SA_quant_review_1 slice-C item 3):
+    the full mapping is pinned verbatim - which phases are
+    kernel-internal (``None``) and which emit a concrete wire
+    string, so a swapped pair can no longer hide behind set
+    equality."""
     assert set(CALL_PHASE_WIRE_STATES.keys()) == set(CallPhase)
+    assert CALL_PHASE_WIRE_STATES == {
+        CallPhase.ACQUIRED: None,  # pre-dial grant - never emitted
+        CallPhase.DIALING: "dialing",
+        CallPhase.RINGING: None,  # surfaces as event.incoming_call
+        CallPhase.ALERTING: "alerting",
+        CallPhase.ACTIVE: "active",
+        CallPhase.TERMINATING: None,  # transient teardown leg
+        CallPhase.ENDED: "disconnected",
+    }
     doc = API_CONTRACT_MD.read_text(encoding="utf-8")
     row = next(line for line in doc.splitlines() if "`event.call_state_changed`" in line)
     state_seg = re.search(r"`state`:([^;(]+)", row)
@@ -1471,6 +1516,12 @@ def test_call_phase_forward_matrix() -> None:
     # The alerting-less answer is the finding's case: DIALING may
     # advance straight to ACTIVE.
     assert CallPhase.ACTIVE in CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.DIALING]
+    # ACTIVE -> ENDED is a legal terminal transition (round 29,
+    # SA_quant_review_1 slice-C item 1): the matrix pins the edge;
+    # the event ``reason`` that accompanies the teardown is pinned
+    # by test_call_end_reason_wired_into_events /
+    # test_call_state_changed_reason_scoping, not by this matrix.
+    assert CallPhase.ENDED in CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.ACTIVE]
 
 
 def test_provider_command_union_roundtrip() -> None:
@@ -2056,30 +2107,51 @@ def test_media_allocator_port_lifecycle() -> None:
     calls: list[str] = []
 
     class FakeAllocator:
+        """Contract-conforming fake (round 29, SA_quant_review_1
+        slice-C items 8/9): it tracks the live pairs so the test can
+        pin per-role reissue selectivity and the never-allocated
+        rejection, not just the call sequence."""
+
+        def __init__(self) -> None:
+            self._live: dict[str, MediaCredentials] = {}
+
         def allocate(
             self, lease_id: LeaseId, line_id: LineId, session_id: SessionId | None = None
         ) -> MediaCredentials:
             calls.append(f"allocate:{lease_id}:{session_id}")
-            return MediaCredentials(
+            creds = MediaCredentials(
                 agent_media_endpoint="unix:///run/phonebridge/media.sock",
                 provider_media_endpoint="wss://media.internal/provider",
                 agent_media_token=MediaToken(RedactedString("a-tok")),
                 provider_media_token=MediaToken(RedactedString("p-tok")),
             )
+            self._live[str(lease_id)] = creds
+            return creds
 
         def reissue(self, lease_id: LeaseId, role: contract.MediaRole) -> MediaCredentials:
             # Round 28 (review-18 item 2): the per-role reissue -
             # only the addressed half's credentials are replaced.
             calls.append(f"reissue:{lease_id}:{role}")
-            return MediaCredentials(
-                agent_media_endpoint="unix:///run/phonebridge/media.sock",
-                provider_media_endpoint="wss://media.internal/provider",
-                agent_media_token=MediaToken(RedactedString("a-tok-2")),
-                provider_media_token=MediaToken(RedactedString("p-tok-2")),
-            )
+            if str(lease_id) not in self._live:
+                # Contract violation guard (round 29, item 8): a
+                # revoked or never-allocated lease MUST NOT mint
+                # credentials - the fake rejects like a real port.
+                raise LookupError(f"no live media pair for {lease_id}")
+            old = self._live[str(lease_id)]
+            if role == "agent":
+                creds = old.model_copy(
+                    update={"agent_media_token": MediaToken(RedactedString("a-tok-2"))}
+                )
+            else:
+                creds = old.model_copy(
+                    update={"provider_media_token": MediaToken(RedactedString("p-tok-2"))}
+                )
+            self._live[str(lease_id)] = creds
+            return creds
 
         def revoke(self, lease_id: LeaseId) -> None:
             calls.append(f"revoke:{lease_id}")
+            self._live.pop(str(lease_id), None)
 
     allocator: contract.MediaAllocator = FakeAllocator()
     creds = allocator.allocate(LeaseId("l-1"), LineId("line-main"))
@@ -2087,20 +2159,37 @@ def test_media_allocator_port_lifecycle() -> None:
     # Round 25 (item 6): session_id selects the agent-side endpoint.
     remote = allocator.allocate(LeaseId("l-2"), LineId("line-main"), session_id=SessionId("sess-9"))
     assert remote.agent_media_endpoint == "unix:///run/phonebridge/media.sock"
-    # Round 28 (review-18 item 2): reissue addresses one role of a
-    # live pair.
+    # Round 28 (review-18 item 2; selectivity pinned round 29,
+    # SA_quant_review_1 slice-C item 9): reissue addresses one role
+    # of a live pair - the returned pair view carries the NEW
+    # provider token and the ORIGINAL agent token verbatim.
     reissued = allocator.reissue(LeaseId("l-1"), "provider")
     assert isinstance(reissued, MediaCredentials)
+    assert reissued.provider_media_token != creds.provider_media_token
+    assert reissued.provider_media_token.expose() == "p-tok-2"
+    assert reissued.agent_media_token == creds.agent_media_token
+    assert reissued.agent_media_token.expose() == "a-tok"
+    assert reissued.agent_media_endpoint == creds.agent_media_endpoint
+    # Round 29 (SA_quant_review_1 slice-C item 8): reissue on a
+    # never-allocated lease is a contract violation - it MUST NOT
+    # silently mint credentials on a pair that does not exist.
+    with pytest.raises(LookupError):
+        allocator.reissue(LeaseId("never-allocated"), "provider")
     allocator.revoke(LeaseId("l-1"))
     allocator.revoke(LeaseId("l-1"))  # idempotent - safe to call twice
     allocator.revoke(LeaseId("never-allocated"))  # unknown lease: no-op
+    # A revoked pair is dead too - reissue must not resurrect it.
+    with pytest.raises(LookupError):
+        allocator.reissue(LeaseId("l-1"), "agent")
     assert calls == [
         "allocate:l-1:None",
         "allocate:l-2:sess-9",
         "reissue:l-1:provider",
+        "reissue:never-allocated:provider",
         "revoke:l-1",
         "revoke:l-1",
         "revoke:never-allocated",
+        "reissue:l-1:agent",
     ]
 
 
@@ -4047,13 +4136,21 @@ def test_provider_active_call_correlators_xor() -> None:
     external = ProviderActiveCall(state=ProviderCallState.DIALING)
     assert external.call_token is None
     assert external.lease_id is None
-    # Deliberately unchecked: correlator<->state coherence - a
-    # token-carrying ACTIVE element is legal because the snapshot
-    # may describe a ring the air side answered before line.answer.
-    ProviderActiveCall(
+    # Documented leniency, pinned explicitly (round 29,
+    # SA_quant_review_1 slice-C item 10): correlator<->state
+    # coherence is DELIBERATELY NOT model-checked (round 27,
+    # review-17 item 11) - a token-carrying ACTIVE element is legal
+    # because the snapshot may describe a ring the air side already
+    # answered before ``line.answer`` landed. This assert makes the
+    # open contract item visible: a future coherence validator
+    # would flip it red and must be a deliberate contract decision,
+    # not a silent tightening.
+    mixed = ProviderActiveCall(
         call_token=CallToken(RedactedString("ring-token")),
         state=ProviderCallState.ACTIVE,
     )
+    assert mixed.call_token is not None
+    assert mixed.lease_id is None
 
 
 def test_call_lease_audio_ready_received_flag() -> None:
@@ -4458,3 +4555,208 @@ def test_round28_bounds_constants_exported() -> None:
     assert MAX_TOKEN_LEN == 256
     assert MAX_ENDPOINT_LEN == 512
     assert MAX_CALLER_ID_LEN == 64
+
+
+def test_round29_bounds_constants_exported() -> None:
+    """Round 29 (SA_quant_review_1 slice-A item 10, slice-B item 6):
+    the new bound constants are public so adapters and tests can
+    pin the same numbers."""
+    for name in (
+        "MAX_IDEMPOTENCY_KEYS_PER_SESSION",
+        "MAX_LINES_TOTAL",
+        "SNAPSHOT_RECONCILED_PHASES",
+    ):
+        assert name in contract.__all__
+    assert MAX_IDEMPOTENCY_KEYS_PER_SESSION == 256
+    assert MAX_LINES_TOTAL == 256
+
+
+def test_snapshot_reconciled_phases() -> None:
+    """Round 29 (SA_quant_review_1 slice-A item 7): the formal
+    "dialing-or-later" set for ``state_snapshot`` reconciliation is
+    pinned verbatim - ``RINGING`` is excluded because an
+    ``ACQUIRED -> RINGING`` preemption grant was never dialed, and
+    ``ACQUIRED``/``ENDED`` can never be reconciled against a
+    provider-side call view."""
+    assert SNAPSHOT_RECONCILED_PHASES == frozenset(
+        {
+            CallPhase.DIALING,
+            CallPhase.ALERTING,
+            CallPhase.ACTIVE,
+            CallPhase.TERMINATING,
+        }
+    )
+    for excluded in (CallPhase.ACQUIRED, CallPhase.RINGING, CallPhase.ENDED):
+        assert excluded not in SNAPSHOT_RECONCILED_PHASES
+
+
+def test_clamp_provider_stamp() -> None:
+    """Round 29 (SA_quant_review_1 slice-A item 4): the canonical
+    advisory-stamp clamp - a stamp deeper than MAX_CLOCK_SKEW_SEC
+    into the FUTURE normalizes to ``now``; a stamp inside the skew
+    window and every PAST stamp returns verbatim; naive inputs are
+    rejected per ``ensure_aware_utc``."""
+    far_future = NOW_UTC + timedelta(seconds=MAX_CLOCK_SKEW_SEC + 0.5)
+    assert contract._clamp_provider_stamp(far_future, NOW_UTC) == NOW_UTC
+    # The rule is strictly-greater: exactly MAX_CLOCK_SKEW_SEC out
+    # is still a verbatim dedupe key.
+    at_boundary = NOW_UTC + timedelta(seconds=MAX_CLOCK_SKEW_SEC)
+    assert contract._clamp_provider_stamp(at_boundary, NOW_UTC) == at_boundary
+    within = NOW_UTC + timedelta(seconds=MAX_CLOCK_SKEW_SEC - 1)
+    assert contract._clamp_provider_stamp(within, NOW_UTC) == within
+    past = NOW_UTC - timedelta(hours=3)
+    assert contract._clamp_provider_stamp(past, NOW_UTC) == past
+    # Non-UTC aware input normalizes to UTC per ensure_aware_utc.
+    plus3 = timezone(timedelta(hours=3))
+    foreign = datetime(2026, 11, 13, 15, 0, 30, tzinfo=plus3)  # 12:00:30Z
+    assert contract._clamp_provider_stamp(foreign, NOW_UTC) == NOW_UTC + timedelta(seconds=30)
+    # Naive stamps and naive `now` are rejected - rule 6 fail-closed.
+    with pytest.raises(ValueError, match="naive"):
+        contract._clamp_provider_stamp(datetime(2026, 11, 13, 12, 0, 0), NOW_UTC)
+    with pytest.raises(ValueError, match="naive"):
+        contract._clamp_provider_stamp(NOW_UTC, datetime(2026, 11, 13, 12, 0, 0))
+
+
+def test_provider_binding_heartbeat_interval_ms_upper_bound() -> None:
+    """Round 29 (SA_quant_review_1 slice-A item 8):
+    ``heartbeat_interval_ms`` carries ``le=86_400_000`` - the exact
+    millisecond counterpart of ``heartbeat_interval_sec <= 86400``
+    so a hydrated binding cannot carry a cadence the config model
+    would reject."""
+    assert _binding(heartbeat_interval_ms=86_400_000).heartbeat_interval_ms == 86_400_000
+    with pytest.raises(ValidationError):
+        _binding(heartbeat_interval_ms=86_400_001)
+    # The converter can never stamp beyond the field bound.
+    assert heartbeat_interval_ms_from_sec(86400.0) == 86_400_000
+
+
+def test_checked_id_length_boundaries() -> None:
+    """Round 29 (SA_quant_review_1 slice-C item 11): every
+    checked-id carrier accepts exactly its maximum length and
+    rejects max+1 - the off-by-one is pinned per carrier, not just
+    on ``line_id``."""
+    at_max = "a" * contract._ID_MAX_LEN
+    over = "a" * (contract._ID_MAX_LEN + 1)
+
+    def line_summary(raw: str) -> LineSummary:
+        return LineSummary(
+            line_id=LineId(raw),
+            caps=(),
+            state=LineState.FREE,
+            liveness=LivenessState.UNBOUND,
+        )
+
+    def lease(raw: str) -> CallLease:
+        return CallLease(
+            lease_id=LeaseId(raw),
+            line_id=LineId("line-main"),
+            owner_agent_id="agent-1",
+            session_id=SessionId("sess-1"),
+            intent=Intent.DIAL_OUT,
+            created_at=NOW_UTC,
+        )
+
+    def ticket_session(raw: str) -> QueueTicket:
+        return QueueTicket(
+            ticket_id=TicketId("t-1"),
+            seq=1,
+            session_id=SessionId(raw),
+            intent=Intent.DIAL_OUT,
+            enqueued_at=NOW_UTC,
+        )
+
+    def claim(raw: str) -> PendingClaim:
+        return PendingClaim(
+            claim_id=ClaimId(raw),
+            line_id=LineId("line-main"),
+            requester_agent_id="agent-1",
+            session_id=SessionId("sess-1"),
+            created_at=NOW_UTC,
+        )
+
+    carriers: tuple[Callable[[str], str], ...] = (
+        lambda raw: line_summary(raw).line_id,
+        lambda raw: lease(raw).lease_id,
+        lambda raw: ticket_session(raw).session_id,
+        lambda raw: _ticket(raw, 1).ticket_id,
+        lambda raw: claim(raw).claim_id,
+        lambda raw: _assignment(assignment_id=contract.AssignmentId(raw)).assignment_id,
+        lambda raw: RecordAndTelegramFallback(channel=raw).channel,
+        lambda raw: AnswerAndAnnounceFallback(announcement_ref=raw).announcement_ref,
+        lambda raw: AgentAudience(agent_id=raw).agent_id,
+    )
+    for carrier in carriers:
+        assert len(carrier(at_max)) == contract._ID_MAX_LEN
+        with pytest.raises(ValidationError):
+            carrier(over)
+
+    # Token carriers ride MAX_TOKEN_LEN (256), not _ID_MAX_LEN.
+    tok_max = "t" * MAX_TOKEN_LEN
+    tok_over = "t" * (MAX_TOKEN_LEN + 1)
+    event = IncomingCallEvent(
+        line_id=LineId("line-main"),
+        call_token=CallToken(RedactedString(tok_max)),
+        caller_id=RedactedString(_RAW_NUMBER),
+        expires_at=NOW_UTC,
+    )
+    assert len(event.call_token) == MAX_TOKEN_LEN
+    with pytest.raises(ValidationError):
+        IncomingCallEvent(
+            line_id=LineId("line-main"),
+            call_token=CallToken(RedactedString(tok_over)),
+            caller_id=RedactedString(_RAW_NUMBER),
+            expires_at=NOW_UTC,
+        )
+    # Caller-number carriers ride MAX_CALLER_ID_LEN (64).
+    assert len(RedactedString("c" * MAX_CALLER_ID_LEN)) == MAX_CALLER_ID_LEN
+    assert (
+        IncomingCallEvent(
+            line_id=LineId("line-main"),
+            call_token=CallToken(RedactedString("tok")),
+            caller_id=RedactedString("c" * MAX_CALLER_ID_LEN),
+            expires_at=NOW_UTC,
+        ).caller_id
+        is not None
+    )
+    with pytest.raises(ValidationError):
+        IncomingCallEvent(
+            line_id=LineId("line-main"),
+            call_token=CallToken(RedactedString("tok")),
+            caller_id=RedactedString("c" * (MAX_CALLER_ID_LEN + 1)),
+            expires_at=NOW_UTC,
+        )
+
+
+def test_aggregate_limit_consistency() -> None:
+    """Round 29 (SA_quant_review_1 slice-C item 6): pin the actual
+    relationship among the aggregate caps. Deliberately NOT a
+    product invariant: the per-session caps bound ONE session's
+    occupancy while the global caps bound aggregate occupancy, so
+    the global caps are ALWAYS the binding constraint (per-session
+    x max-sessions would overshoot each global bound). No
+    ``MAX_LEASES_TOTAL`` exists by design - live leases are bounded
+    implicitly by sessions x ``MAX_LEASES_PER_SESSION``."""
+    assert MAX_TICKETS_PER_SESSION * MAX_SESSIONS_TOTAL > MAX_QUEUE_TICKETS_TOTAL
+    assert MAX_QUEUE_TICKETS_TOTAL == 1024
+    assert MAX_TICKETS_PER_SESSION * MAX_SESSIONS_TOTAL == 16 * 512 == 8192
+    # The dedup-table bound joins the same "no global cap" family:
+    # idempotency keys are session-scoped, so the per-session cap
+    # alone bounds each table and totals follow the session caps.
+    assert MAX_IDEMPOTENCY_KEYS_PER_SESSION * MAX_SESSIONS_TOTAL > 0
+    assert "MAX_LEASES_TOTAL" not in contract.__all__
+
+
+def test_tick_backwards_now_hard_invariant() -> None:
+    """Round 29 (SA_quant_review_1 slice-A item 11): the
+    tick-monotonicity clause is a hard invariant - the contract
+    docstring MUST pin ``MUST`` + ``INVALID_ARGUMENT`` (hardened
+    from the earlier "MAY reject ... INVALID_STATE"), and the spec
+    requirement carries the same verdict. Doc-parity test: the
+    abstract ABC cannot be driven directly."""
+    doc = LineManager.tick.__doc__ or ""
+    assert "MUST" in doc
+    assert "INVALID_ARGUMENT" in doc
+    assert "non-decreasing" in doc
+    spec = (REPO_ROOT / "docs" / "specs" / "line-manager.md").read_text(encoding="utf-8")
+    assert "MUST reject a backwards `now` with" in spec
+    assert "INVALID_ARGUMENT" in spec
