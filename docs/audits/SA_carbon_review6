@@ -1,0 +1,196 @@
+Ниже представлено полное архитектурное и кодовое ревью репозитория **`phonebridge` (v0.0.8)** с проверкой соответствия `docs/CODING_HAZARDS.md`, `docs/REVIEW_HAZARDS.md` и процессу `controller-manager/development-cycle.md`.
+
+---
+
+### 1. Context, Assumptions & Honest Gate Reporting
+
+* **Статус проекта:** Завершено проектирование (Rounds 1–16, включая живые проверки на железе и end-to-end эксперимент с `vhci`), настроен тулинг (`pyproject.toml`, `ruff.toml`, `uv.lock`) и зафиксирован доменный контракт `src/phonebridge/domain/contract.py` с контрактными тестами. Реализация сервисного кода (Milestones M1–M5) ещё не начата.
+* **Честный статус гейтов (`REVIEW_HAZARDS.md` — Honest gate reporting):**
+  * **Анализ в данном ревью:** статический аудит исходных текстов и спецификаций (без выполнения команд `pytest` / `mypy` / `ruff` в терминале ревьюера).
+  * **Уровень принуждения гейтов в самом репо:** `ruff check .` и `mypy src tests` (в режиме `strict = true` + `pydantic.mypy`) интегрированы прямо в pytest-сьют (`tests/test_tooling_baseline.py`), то есть исполняются при каждом прогоне `pytest -m "not e2e"`. Правила `CODING_HAZARDS.md`, `REVIEW_HAZARDS.md` и `controller-manager/*` работают на уровне **prompt/process** (за исключением инвариантов, явно закодированных в типах `contract.py` и drift-тестах). CI-воркфлоу `.github/workflows/` в предоставленный срез файлов не включены.
+* **Применимость правил `CODING_HAZARDS.md`:**
+  * Правила **1, 2, 3, 4, 6, 7, 8, 9, 10, 11** применимы напрямую и проверены ниже.
+  * **Rule 5 (Exact financial arithmetic):** к текущему стеку и домену **неприменимо**, так как система не оперирует деньгами, тарификацией или финансовыми величинами (фиксируем явно согласно требованию шапки `CODING_HAZARDS.md`).
+
+---
+
+### 2. High-Level Architecture (Высокоуровневая архитектура)
+
+Переход в Rounds 12–13 на архитектуру **Unified `hci-agent` + Kernel `vhci`** кардинально улучшил систему. Вынос захвата USB-донглов в легковесный агент на базе `libusb` (с отвязкой `btusb`) и подача HCI-трафика в виртуальные адаптеры `/dev/vhci` внутри единого изолированного контейнера решили сразу три хронические проблемы Linux-телефонии:
+1. Контейнеру больше не нужен хрупкий USB passthrough (`--device /dev/bus/usb/...`), который ломается при перенумерации портов.
+2. Хостовый `bluetoothd` полностью изолирован и свободен для периферии самого сервера.
+3. Локальный донгл на хосте и удалённый донгл на Raspberry Pi в другой стране обслуживаются **абсолютно идентичным стеком** внутри контейнера.
+
+```mermaid
+graph LR
+    subgraph "AI Agents (Clients)"
+        AG1[Secretary / Campaign Agents]
+    end
+
+    subgraph "phonebridge-gateway (Isolated Docker Container)"
+        subgraph "Gateway Process"
+            API[APICallService<br/>UDS / WSS :7002 / MCP]
+            MGR[Manager Surface<br/>WSS 127.0.0.1:7001]
+            LM[LineManager Kernel<br/>Assignments, Leases, FIFO]
+            MR[MediaRouter<br/>648B Binary PCM, 500-frame cap]
+            EB[EventBus<br/>Socket / HMAC Webhook / Exec]
+            FW[FallbackWorker<br/>Internal System Agent]
+        end
+
+        subgraph "Shared System Daemons"
+            BZ[bluetoothd + oFono-shim + D-Bus]
+            PW[PipeWire + Virtual Endpoints<br/>node.autoconnect=false]
+            VHCI["/dev/vhci (hci0..hciN)"]
+        end
+
+        subgraph "Per-Line Bundle xN (supervisord)"
+            VF[vhci-feeder<br/>ctrl_seq + SCO handle gate]
+            LP[LineProvider + Audio Pump]
+        end
+
+        AG1 <-->|JSON-RPC 2.0| API
+        AG1 <-->|Binary PCM| MR
+        FW <-->|Agent API| API
+        API & MGR <--> LM
+        LP <-->|JSON-RPC 127.0.0.1| MGR
+        LP <-->|Binary PCM 127.0.0.1| MR
+        LP <--> BZ & PW
+        VF <--> VHCI
+        VHCI <--> BZ & PW
+    end
+
+    subgraph "Dongle Host (Local Host or Remote RPi)"
+        HA[hci-agent<br/>libusb, btusb detached]
+        USB[USB BT Dongle<br/>Matched by BDADDR]
+        PH[Paired Phone]
+        HA <--> USB <-->|HFP / mSBC| PH
+    end
+
+    HA ===>|"Tunnel (WireGuard / mTLS)<br/>control-TCP + media-UDP"| VF
+```
+
+**Сильные архитектурные решения:**
+* **Два ортогональных автомата (`LineAssignment` vs `CallLease`):** Долгоживущее владение линией не зависит от обрывов сокета, тогда как активный звонок защищён dead-man switch (`drop_session`).
+* **Изоляция ядра (`ADR-01 FallbackWorker`):** Ядро исполняет только `no_pickup` и `reject`, а запись голосовых сообщений, бриджинг линий и походы в Telegram API вынесены во внутренний агент.
+* **Защита аудио-графа (§6.4):** Статическое правило `node.autoconnect=false` в WirePlumber + виртуальные ноды `phonebridge_uplink/downlink_<line_id>` предотвращают аппаратную эхо-петлю, выявленную на живых тестах.
+
+---
+
+### 3. Data Storage & Modeling (Хранение данных и доменная модель)
+
+* **Персистентность:** Обязательные тома `/var/lib/bluetooth` (ключи спаривания BlueZ) и `/var/lib/phonebridge` (SQLite для ключей, `LineAssignment`, настроек линий и аудиозаписей) делают контейнер реально переносимым между хостами (ADR-03).
+* **Доменная модель (`src/phonebridge/domain/contract.py`):**
+  * Временные метки защищены типом `AwareDatetime` с принудительной нормализацией к UTC (**Rule 6**).
+  * Защита от утечки PII и секретов (**Rule 10**) реализована через `RedactedString` (маскирует `__str__`, `__repr__`, `__format__`) и `ContractModel(hide_input_in_errors=True, extra="forbid")` с методом `safe_dump()`.
+  * Строгая валидация номеров (`E.164` + обязательный `country` ISO alpha-2 + учёт композитного типа `FIXED_LINE_OR_MOBILE` для NANP) отсекает невалидные вызовы до обращения к шине D-Bus.
+
+---
+
+### 4. Communication & APIs (Протоколы и граничные случаи)
+
+В целом оба протокола (`docs/api-contract.md` и `docs/hci-agent.md`) проработаны глубоко, но есть **два протокольных нюанса на стыке сокетов**, которые важно учесть при реализации M3 и M4:
+
+1. **Uplink UDP NAT/Port Discovery в `hci-agent` (`docs/hci-agent.md` §2):**
+   * Агент открывает TCP-соединение для `control` и шлёт UDP-дейтаграммы для `media` (порт `7301` в контейнере). Поскольку UDP не устанавливает соединения, `vhci-feeder` внутри контейнера **не узнает исходный `(IP, ephemeral_port)` агента для отправки ответного (uplink) звука**, пока от агента не придёт хотя бы один UDP-пакет.
+   * Если при исходящем/входящем звонке агент в контейнере начнёт говорить раньше, чем прилетит первый валидный SCO-пакет от донгла (или если NAT/firewall протухнет между звонками), обратный путь UDP не будет привязан.
+   * *Рекомендация для M4:* После успешного `HELLO_ACK` в TCP-канале `hci-agent` должен сразу отправлять короткий пустой UDP-пакет привязки/keepalive (например, `kind=0x04 MEDIA_PING` раз в 15–20 с), аутентифицированный по IP пира туннеля (`wg0` `/32` на линию) или токену сессии.
+2. **Фрейминг бинарного медиа-протокола поверх локального UDS (`docs/api-contract.md`, Binary media protocol):**
+   * В спеке указано: `unix:///run/phonebridge/media.sock` локально или `wss://gw:7003/media` удалённо; 1-й фрейм — TEXT JSON, далее — BINARY 648 байт (либо 8 байт без payload для флагов `0x02`/`0x03`).
+   * Голый `AF_UNIX` `SOCK_STREAM` — это байтовый поток без границ сообщений и без признака TEXT/BINARY (если прилетит 8-байтный `flush` `0x02`, парсер фиксированных 648-байтных чанков склеит его со следующим аудио-пакетом и собьёт выравнивание потока!).
+   * *Рекомендация для M3:* Гонять поверх локального Unix-сокета тот же самый протокол WebSocket (`websockets.unix_serve` / `websockets.unix_connect`, который уже есть в зависимости `websockets>=14`), либо префиксировать каждый пакет на сыром UDS длиной. Использование WebSocket поверх UDS даст 100% единый код для локальных и удалённых пиров.
+
+---
+
+### 5. Scalability, Reliability & Security (Надёжность и безопасность)
+
+* **Изоляция отказов:** Падение одного `hci-agent` или зависание туннеля уничтожает только соответствующий виртуальный адаптер `vhci`, не затрагивая ядро хоста и соседние телефонные линии.
+* **Контроль целостности HCI:** Потеря любого пакета в `control-TCP` (`ctrl_seq` gap) или мусорная длина `> MAX_CTRL_FRAME_LEN (4096)` трактуются как фатальная ошибка сессии с принудительным пересозданием адаптера — это исключает «тихую смерть» Bluetooth-стека.
+* **Безопасность в `WireGuard` профиле (`docs/hci-agent.md` §3–4):** В примере конфига агента указано `allowed_ips: ["10.99.0.0/24"]`. Важно при реализации серверного генератора конфигов следить, чтобы **на стороне контейнера (сервера)** каждому пиру выдавался строго `AllowedIPs = 10.99.0.X/32` (и отключён IP forwarding между пирами внутри контейнера), чтобы скомпрометированный RPi одной линии не мог слать UDP-пакеты в порт соседней линии.
+
+---
+
+### 6. Детальный список находок (Prioritized Findings)
+
+Ниже перечислены конкретные несоответствия в коде, тестах и спеках с точными цитатами и привязкой к правилам согласно `docs/REVIEW_HAZARDS.md`.
+
+#### 🟡 Finding 1 — Неполное покрытие новых методов и моделей в `test_domain_contract.py`
+* **Правило:** `REVIEW_HAZARDS.md` (*Verify AC_MAPPING*) / `development-cycle.md` §7.
+* **Файл и строки:** `phonebridge/tests/test_domain_contract.py`, строки 515–536 и 588–598:
+  ```python
+  async def test_line_manager_async_surface() -> None:
+      """Non-e2e async exercise: EVERY abstract method is awaitable and
+      returns its contracted result type (all 18 methods)."""
+      assert set(LineManager.__abstractmethods__) == {
+          ...
+          "ingest_audio_ready",
+          "decide_fallback",
+          "drop_session",
+          "tick",
+      }
+      mgr = _FakeLineManager()
+      ...
+      decision = await mgr.decide_fallback(LineId("line-main"), CallToken("tok-3"))
+      assert isinstance(decision, FallbackDecision)
+
+      # --- lifecycle hook ---
+      await mgr.tick(NOW_UTC)
+  ```
+* **Суть:** Докстринг заявляет вызов всех 18 абстрактных методов `LineManager`, но `await mgr.ingest_audio_ready(...)` и `await mgr.drop_session(...)` в теле теста ни разу не вызываются. Кроме того, 4 новые модели событий (`AudioReadyEvent`, `FallbackTriggeredEvent`, `LineStateChangedEvent`, `MissedCallEvent`), поле `FallbackDecision.fallback_call_token` и дефолт `LineAssignment.allowed_number_types` (`"FIXED_LINE_OR_MOBILE"`) в файле тестов не импортированы и не проверены ни одним ассертом.
+
+#### 🟡 Finding 2 — Отсутствие `QueueUpdatedEvent` и контекста сессии в `QueueReadyEvent`
+* **Правило:** Полнота контракта (`development-cycle.md` §3 «КОНТРАКТ» — исполнитель M1 читает `contract.py` read-only) + `CODING_HAZARDS.md` Rule 9 (маршрутизация строго владельцу сессии).
+* **Файл и строки:** `phonebridge/src/phonebridge/domain/contract.py`, строки 224–239 и 529–538:
+  ```python
+  class EventName(str, Enum):
+      INCOMING_CALL = "incoming_call"
+      CALL_STATE_CHANGED = "call_state_changed"
+      QUEUE_READY = "queue_ready"
+      ASSIGNMENT_REVOKED = "assignment_revoked"
+      AUDIO_READY = "audio_ready"
+      FALLBACK_TRIGGERED = "fallback_triggered"
+      LINE_STATE_CHANGED = "line_state_changed"
+      MISSED_CALL = "missed_call"
+  ```
+  ```python
+  class QueueReadyEvent(ContractModel):
+      ticket_id: TicketId
+      lease_id: LeaseId
+      line_id: LineId
+      expires_at: AwareDatetime
+  ```
+* **Суть:**
+  1. В `docs/api-contract.md` (строка 168) заявлено обязательное событие `event.queue_updated {session_id, ticket_id, position}` при продвижении очереди. В `EventName` и моделях `contract.py` этого события нет — ядру `LineManager` в M1 нечем эмитить пересчёт позиций очереди при отмене или дисконнекте впереди стоящих тикетов.
+  2. В `QueueReadyEvent` отсутствуют `session_id: SessionId` и `intent: Intent` (хотя wire-событие `event.line_acquired` требует `{session_id, line_id, lease_id, intent}`), что вынудит транспортный адаптер в M2 дублировать у себя стейт тикетов ради маршрутизации события в нужный сокет.
+
+#### 🟢 Finding 3 — Защита `_mask_for_log` для коллекций `set` / `frozenset`
+* **Правило:** `CODING_HAZARDS.md` Rule 10 (*No secrets or PII*).
+* **Файл и строки:** `phonebridge/src/phonebridge/domain/contract.py`, строки 328–336:
+  ```python
+  def _mask_for_log(value: Any) -> Any:
+      """Recursively replace RedactedString with its masked string form."""
+      if isinstance(value, RedactedString):
+          return str(value)
+      if isinstance(value, dict):
+          return {k: _mask_for_log(v) for k, v in value.items()}
+      if isinstance(value, (list, tuple)):
+          return [_mask_for_log(v) for v in value]
+      return value
+  ```
+* **Суть:** Если в будущем в любую наследницу `ContractModel` добавят поле типа `set[RedactedString]` или `frozenset[RedactedString]` (по аналогии с `frozenset` в `allowed_number_types`), `safe_dump()` не сконвертирует элементы в замаскированные строки `str` (хотя их `repr()` останется маскированным, передача в внешний JSON-логгер может вытащить сырой `str`-буфер). Замена `(list, tuple)` на `(list, tuple, set, frozenset)` полностью закроет этот вектор.
+
+#### 🟢 Finding 4 — Мелкий дрейф версий и статусов в документации
+* **Правило:** `development-cycle.md` §3 (`version_drift`) / гигиена документации.
+* **Файлы и строки:**
+  1. `phonebridge/pyproject.toml` (строка 7: `version = "0.0.8"`) vs `phonebridge/CHANGELOG.md` (строка 3: `## [0.0.6] - 2026-11-13`). Если `0.0.7`–`0.0.8` ещё не выпущены через `repo_release.sh` и лежат в `.changes/`, это штатно; иначе — дрейф `CHANGELOG.md`.
+  2. `phonebridge/docs/phone-bridge-service-design.md`, §12 п.3 (строки 620–624): вопрос `vhci end-to-end feasibility` всё ещё помечен как открытый (`must be proven by the dedicated experiment`), хотя в таблице решений этого же файла (`round 13`, строка 61) зафиксировано: `One-dongle end-to-end experiment PASSED (issue #29)`.
+  3. `phonebridge/docs/api-contract.md` (строка 3): шапка указывает `rounds 1-12`, хотя документ уже содержит решения `round 14` и `round 15`.
+
+---
+
+### 7. Ключевые архитектурные рекомендации перед стартом M1–M4 (ADRs)
+
+1. **ADR-M1 (Тестируемость событий `LineManager`):** Поскольку методы `LineManager` (`tick`, `drop_session`, `ingest_call_state`, `ingest_audio_ready`) по подписанному контракту возвращают `None`, в конструкторе `InMemoryLineManager` (M1) передавать типизированный колбэк/очередь `on_event: Callable[[EventEnvelope[Any]], None]`, чтобы unit-тесты M1 проверяли эмиссию всех доменных событий без изменения абстрактного интерфейса `LineManager`.
+2. **ADR-M3 (Единый WebSocket-фрейминг на Media Socket):** Для локального `unix:///run/phonebridge/media.sock` использовать **WebSocket поверх Unix Domain Socket** (`websockets.unix_serve`), а не сырой потоковый сокет. Это сохранит границы сообщений для 8-байтных фреймов `flush`/`keepalive` (`0x02`/`0x03`) и 648-байтных PCM-фреймов (`0x01`) без написания отдельного парсера длины.
+3. **ADR-M4 (UDP Endpoint Binding & `/32` Peer Isolation для `hci-agent`):** В `hci-agent` добавить периодический пустой UDP-пакет (`MEDIA_PING`) сразу после `HELLO_ACK`, чтобы `vhci-feeder` мгновенно запоминал обратный порт агента до начала звонка, а на стороне WireGuard в контейнере строго изолировать пиры маской `/32` (`AllowedIPs`) со сверкой `source_ip <-> line_id`.
+
+**Итоговый вердикт:** Проект спроектирован на очень высоком инженерном уровне. Закройте **Finding 1** и **Finding 2** перед финальным `signed_off` доменного контракта — и кодовая база полностью готова к автономной реализации Milestones M1–M5.

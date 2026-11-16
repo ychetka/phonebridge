@@ -1,0 +1,167 @@
+# Реестр архитектурных дефектов phonebridge v0.0.21 (аудит Phase-0, полный перечень)
+
+## Blocker
+
+1. **Невыполнимая обязанность адаптера при fail-closed drop из outbox** — `src/phonebridge/domain/contract.py:3759-3765, 4044-4055, 4476-4481`; `docs/api-contract.md:209`. Контракт требует, чтобы дропнутые `line.dial`/`line.answer` оборачивались `ingest_call_state(DISCONNECTED, NETWORK_ERROR)` со стороны адаптера, но `drain_provider_commands()` — метод ядра, который возвращает только «выжившие» команды; адаптер никак не может узнать, что команда была дропнута (нет ни списка дропнутых, ни сигнала). Требование неисполняемо в текущей формулировке — либо дропает ядро (тогда адаптер слеп), либо адаптер (тогда ядро не знает жив ли биндинг).
+
+2. **`assignment_id` достаётся агенту единожды и только через одноразовое событие** — `contract.py:4216-4225, 4242-4249`; `docs/api-contract.md:224, 238-239, 275`; `docs/specs/line-manager.md:102-112`. `event.assignment_granted` — единственный канал доставки `assignment_id`, он маршрутизируется по `AgentAudience` (только живые сессии). Если у владельца нет ни одной живой сессии в момент гранта (а `admin.assign_line` предназначен именно для «пре-назначения до подключения»), событие теряется навсегда; агент не имеет ни read-пути (`call.get_lines` не возвращает `assignment_id`), ни механизма ре-доставки (в отличие от пере-отправки `incoming_call`). Линия становится нерелизабельной для владельца — только админ может её снять.
+
+3. **Wire-админ-операции без kernel-поверхности** — `docs/api-contract.md:554-561`; `contract.py:4177-4481` (весь `LineAdminKernel`). `admin.list_leases`, `admin.list_tickets`, `admin.list_lines`, `admin.remove_line` задекларированы на проводе как «non-kernel admin operations routed to owning subsystem», но `CallLease`/`QueueTicket` живут только в kernel-state, и никакой метод интерфейса не может их вернуть; `admin.remove_line` вообще не определён ни по состоянию (что с живыми lease/очередью/биндингом), ни по persistence (строка `lines` в SQLite). Контракт обещает операции, которые ни одна подсистема не способна исполнить.
+
+4. **Провайдерский медиа-сокет умер при живом контрольном канале — пути восстановления нет** — `docs/api-contract.md:205, 448-450`; `contract.py:3745-3757, 3653-3671`. `call.reattach_media` существует только для агентской роли; `line.reattach_media` привязан к `provider.reregister` (т.е. к обрыву control-сокета). Провайдерский media-сокет — отдельный TCP/WS, его падение не вызывает reregister; нет ни ingress-факта «мой media-сокет умер», ни инициативной перевыдачи креденшелов. Лиз остаётся жив с мёртвым аудиоканалом до `MEDIA_PAIR_TTL`-таймаута или бессрочно (таймаут применяется к неустановленным парам, а к разорванной established-паре контракт не предписывает реакцию kernel вообще).
+
+5. **Двойная власть времени: `Clock` порт и `tick(now)` никак не согласованы** — `contract.py:3260-3300` (`Clock`/`MediaAllocator` порты), `3944-3988` (`tick`). Kernel получает инжектированный `Clock` («используется внутри мутаций» для штамповки `expires_at`, `last_seen_at` и т.д.) и одновременно обязан исполнять все дедлайны через параметр `now` в `tick()`. Два независимых источника времени могут расходиться (adapter-driven `now` vs kernel-internal `Clock()`) — спека не определяет, кто из них эталон для вычисления `ring.expires_at`, `orphan_deadline_at`, grant TTL. Реализация, штампующая через `Clock()` и сравнивающая с `tick(now)` от другого источника, получает необнаружимый дрейф всех дедлайнов.
+
+## Major
+
+6. **Broadcast-события сливают активность чужих эксклюзивных линий вопреки приватному фильтру** — `docs/api-contract.md:236-237, 266-271`; `docs/specs/line-manager.md:149-156`; `contract.py:2830-2920`. `call.get_lines` целиком скрывает чужие EXCLUSIVE-линии, но `event.line_state_changed` и `event.line_health_changed` — broadcast и несут `line_id` этих же линий: любой агент в пуле видит BUSY/FREE-ритм и здоровье приватной линии (метаданные «когда владелец звонит/принимает звонки» — прямая утечка, которую фильтр листинга пытался закрыть).
+
+7. **Редакция `reason` для broadcast-копии не закреплена в модели** — `contract.py:2841-2920` (`EventEnvelope` валидирует только пару name→payload и name→audience-scope); `docs/specs/line-manager.md:149-156`. Правило «broadcast-копия имеет `reason:null`, реальный `reason` — только owner-copy» существует только в докстрингах; ничто не мешает мятнуть `LineStateChangedEvent{reason=external_call}` под `BroadcastAudience`. Тот же класс дыры, что round-26 item 1 чинил на уровне аудитории — но payload-уровень остался декларативным.
+
+8. **`UNBOUND→REACHABLE` невозможно представить в `event.line_health_changed`** — `contract.py:3025-3065` (`ProviderLiveness` отвергает UNBOUND), `docs/api-contract.md:237`. Первичный `provider.register` (и привязка после полного детacha) — это переход `unbound→reachable`, но `unbound` запрещён как endpoint события, а `LineHealthChangedEvent` требует `old_state != new_state`. Подписчики не получают ни одного события о появлении провайдера — факт виден только поллингом `call.get_lines`.
+
+9. **`LineSummary`-инвариант делает легальные переходные состояния невыразимыми** — `contract.py` (модель `LineSummary`, валидатор `caps`↔`liveness`↔`state`, ~1950-2050). `state=BUSY`/`RINGING_LOCKED` вместе с `liveness=UNBOUND` не конструируется, но именно так выглядит линия в окне teardown: binding помер (`UNREACHABLE`/removed → `unbound` на листинге), а lease ещё в `BUSY`, или `ring_drain_ttl` держит `RINGING_LOCKED` после смерти провайдера. Kernel в эти моменты либо не может построить `LineSummary` (исключение), либо вынужден лгать о состоянии.
+
+10. **Асимметрия ре-доставки живого ринга: только владелец эксклюзивной линии** — `docs/api-contract.md:215`; `docs/phone-bridge-service-design.md:652-658`. Пере-отправка `event.incoming_call` с тем же `call_token` определена только для owner; на SHARED_POOL реконнектящаяся `receive_inbound`-сессия кольца не видит, хотя токен ещё жив и юридически принимаем её же `call.accept`. Входящий звонок на пул-линии без единой живой сессии в момент кольца обречён на `accept_window` expiry, даже если агент подключился через 100 мс.
+
+11. **`ProviderActiveCall` допускает оба коррелятора одновременно** — `contract.py` (~2990-3020). `ProviderCallStateUpdate` жёстко валидирует XOR `call_token`/`lease_id`, а `state_snapshot`-элемент (та же пара идентификаторов, тот же семантический конфликт) — нет. Snapshot-элемент с обоими полями неоднозначен и нигде не разрешён спекой.
+
+12. **Ёмкость outbox и tombstone-колец не заданы контрактом** — `contract.py:3991-4000` (комментарий «bounded», ни одной константы), `3554-3558` (`_closed_assignments` «bounded ring», число 1024 только в прозе). Все лимиты (`MAX_*`) экспортированы как константы, а размер outbox'а, soft/hard-cap и размеры `_closed_leases`/`_closed_assignments` — нет: «бесконечно»-проверка невозможна ни тестом, ни код-ревью.
+
+13. **`send_dtmf` допускает ALERTING без `audio_ready`, но тонам нечем уйти в эфир** — `contract.py:3638-3650`; `docs/api-contract.md:222`. In-band тоны синтезирует LineProvider в `phonebridge_uplink` — до поднятия SCO (о чём и рапортует `audio_ready`) PCM уходит в никуда. Гейт `ALERTING` без требования `audio_ready` прямо допускает проглатывание тонов тем самым «0.3-0.6 s SCO-up gap», закрыть который и призвана спека.
+
+14. **`system:*` идентичность легальна на уровне модели владельца линии** — `contract.py` `_check_agent_id`/`_CheckedAgentId` (~1080-1130) vs `assign_line` 4190-4225. Модель принимает `system:*` для `LineAssignment.owner_agent_id`; запрет существует только в докстринге `assign_line`. Гидратация из SQLite (`initial_lines`) проходит через конструктор модели и может создать строку владельца-системной-роли, которую потом никто не может освободить (у системной роли нет сессий для `call.release`).
+
+15. **Противоречие по SSP auto-confirm между документами** — `docs/hci-agent.md:441-447` («в окне близлежащее враждебное устройство может спариться») vs `docs/api-contract.md:547-553` («auto-accept ТОЛЬКО для `paired_phone_mac`»). Угроза, описанная в hci-agent.md, невозможна при ограничении по MAC — один из документов описывает другую модель безопасности; неизвестно, какое поведение должно быть реализовано.
+
+16. **vhci-feeder слушает только на wg0-IP — host-local hci-agent без WireGuard лишён endpoint'а** — `docs/hci-agent.md:428-432`; `docs/phone-bridge-service-design.md:165-185, 1071-1075`. §2.1 требует, чтобы донгл на той же машине обслуживался host-side hci-agent «точно как удалённый Pi», но §6 hci-agent.md запрещает биндинг на `0.0.0.0`/loopback — только на IP туннельного интерфейса. Для co-located агента ни один из профилей (`wireguard` для loopback-хоста не описан, `direct_mtls` подразумевает внешний endpoint) не даёт канонического маршрута.
+
+17. **Отображение агентских heartbeat/STATUS на `ProviderLiveness` не определено** — `docs/hci-agent.md:45-49, 72-74, 119-122`; `contract.py:3792-3819`. vhci-feeder (отдельный процесс) держит control-TCP heartbeat и `STATUS{DONGLE_DEAD}`, но `provider.ping` обязан слать LineProvider — иной процесс того же bundle. Канал «feeder → LineProvider → `note_provider_liveness`» и преобразование `DONGLE_DEAD`/`CTRL_DESYNC` в liveness-факты нигде не специфицировано; две независимые лестницы (agent `missed_limit` vs binding `heartbeat_degraded/down_after`) не сведены.
+
+18. **`dongle_lost` — per-call update с последствиями уровня binding** — `contract.py` `ProviderCallStateUpdate` (~3068-3149); `docs/api-contract.md:195`; `docs/phone-bridge-service-design.md:249-257`. Причина `dongle_lost` несётся внутри одиночного `call_state{disconnected}` на одну линию/звонок, но по спеке означает «tunnel/USB death → immediate teardown, no grace» для всей привязки. Нигде не определено, обязан ли kernel на таком факте переводить binding в `UNREACHABLE` и рвать остальные leases/очередь, или это «просто причина одного звонка» — две разные семантики.
+
+19. **Граница обхода форвард-цепочки и гидратированные циклы** — `contract.py:4394-4424`; `docs/specs/line-manager.md:158-169`; `docs/api-contract.md:524-533`. Поведение при достижении 8-хопового предела на НЕ-циклической цепочке не определено («reject» или «accept» — спека описывает цель обнаружения цикла, но исход для длинной валидной цепочки неясен). Дополнительно: проверка цикла — только в `configure_line`; строка `lines.fallback_policy_json` из SQLite гидратируется через конструктор модели, который умеет лишь self-loop — транзитивный цикл в БД необнаружим.
+
+20. **`state_snapshot` внутри `provider.ping` без семантики** — `docs/api-contract.md:193`; `contract.py` `ProviderLiveness` (~3025-3065). Модель принимает `state_snapshot` на любом ping'е, но спека описывает реконсиляцию только для `provider.reregister`; поведение kernel при snapshot в ping (re-bind? игнор? конфликт с живым состоянием?) не определено.
+
+21. **`reregister` после истечения orphan-grace / `UNREACHABLE` не классифицирован** — `contract.py:3712-3766`; `docs/api-contract.md:192`. Определены: `register` на живом биндинге → `INVALID_STATE`; `reregister` в окне grace → idempotent preserve. Случай «binding UNREACHABLE, приходит reregister» — это новый register (и что делать с его `state_snapshot`, ведь leases уже убиты) или отвергнутый reregister — спека молчит.
+
+22. **Дедуп `idempotency_key` не имеет времени жизни** — `contract.py:3444-3498`; `docs/api-contract.md:216`. Записи `(session_id, idempotency_key)` dedup-таблицы не имеют ни TTL, ни правила удаления: повтор acquire с тем же ключом после смерти сессии — неопределён; хранение бессрочно либо сборка не определена; идемпотентность через перезапуск сессии тем же ключом — граница не прописана.
+
+23. **`SESSION_NOT_FOUND` не имеет owner в error-taxonomy** — `docs/api-contract.md:118`; `contract.py` (`PhonebridgeError`, ~101-118). Все kernel-методы принимают `session_id`, но ни один докстринг не называет ошибку для «сессия неизвестна» — `SESSION_NOT_FOUND` существует только в таблице кодов, без указания, где граница adapter/kernel и кто её эмитит; kernel-сигнатуры формально допускают и `OWNER_MISMATCH`, и `SESSION_NOT_FOUND`.
+
+24. **`voicemail_ref` — поле без производителя** — `contract.py` `MissedCallEvent` (~2700-2740); `docs/api-contract.md:234`. Поле присутствует в модели и на проводе, но ни одна политика/подсистема не определена как источник значения: `record_and_telegram` постит в Telegram без выдачи ссылки назад, carrier voicemail не имеет идентификатора — мёртвый контрактный член.
+
+25. **`ProviderCapabilityUpdate.profile=None` семантически неоднозначно** — `contract.py` (~2950-2990); `docs/api-contract.md:194`. «Заменяет caps/profile» — не сказано, `profile` отсутствует = «оставить» или «очистить»; в отличие от `clear_idle_revoke_after`-шаблона tombstone-флаг не предусмотрен.
+
+26. **Провайдерская `provider_media_endpoint` дублируется на двух уровнях** — `docs/api-contract.md:191` (register-ack `provider_media_endpoint?` «static socket address»), `99`, `205` (per-lease `provider_media_endpoint` внутри `line.dial`/`line.answer`/`MediaCredentials`). Два значения с одним именем — статический listener и per-lease endpoint — без определения, какое действует при расхождении; kernel-модель имеет только per-lease поле.
+
+27. **Правило «no unbounded fields» соблюдено неравномерно** — `contract.py`: `ProviderBinding.profile` (~1767) без `MAX_PROFILE_LEN` при ограниченных `ProviderRegistration.profile`/`ProviderCapabilityUpdate.profile`/`LineSummary.profile`; `agent.register_intent{profile?}` и `call.acquire{profile?}` — внешние параметры без bound и без определённой семантики вообще (`docs/api-contract.md:215-216`; `contract.py:3384, 3430`); свободные строки `ErrorData.detail`, `reject_claim.reason`, `ProviderRevokeCommand.reason` (2244), `AssignmentRevokedEvent.reason`, `ClaimResolvedEvent.reason`, `FallbackDecision.reason` — неограничены и попадают на провод/логи.
+
+28. **Вычисление «missed-ping count» не определено** — `contract.py:3793-3819, 3944-3988`; `docs/specs/line-manager.md:196-219`. `tick` обязан сравнивать счётчик пропущенных пингов с `heartbeat_*_after`, но `ProviderBinding` хранит лишь `last_seen_at`/`connected_at` — ни счётчика, ни правила допуска (допускается ли пинг на `interval*1.5`? jitter tolerance?) — реализация вынуждена выводить count из деления по интервалу с неопределённой граничной семантикой.
+
+29. **`tick()` содержит лазейку «may no-op if they own internal timers»** — `contract.py:3977-3978`. Единственный таймерный вход по контракту и одновременно разрешение реализации его игнорировать, владея «внутренними таймерами» — прямо противоречит «tick is the ONLY timer entry point» и снимает обязательства по deterministic-часам, единому `ensure_aware_utc`-гейту и тестовой инъекции времени.
+
+30. **«Перед старым media deadline» — неопределённый дедлайн в `line.reattach_media`** — `docs/api-contract.md:205`. «The provider MUST re-run media.auth with the new token before its old media deadline» — старый media socket уже умер, `MEDIA_PAIR_TTL` применяется к неустановленным парам; дедлайн для preserved-lease (30 s от выдачи? другое?) не задан.
+
+31. **Граница «binding id authenticates» — bearer-secret, утекающий в admin-listing** — `contract.py:3769-3790`; `docs/api-contract.md:194`; `list_provider_bindings` `contract.py:4283-4288`. Авторизация `capability_update` — знание `assignment_id` (без токена), при этом `admin.list_provider_bindings` раздаёт все binding id; агентская сторона не имеет доступа, но любой leak лога/admin-scope token превращает capability-update в неаутентифицированный write. Граница доверия не описана.
+
+32. **`ProviderRegistration.token` поступает в kernel-модель при проверке уровнем адаптера** — `contract.py` `ProviderRegistration` (~1640-1738), `register_provider` 3712-3727. Модель регистрации обязана нести `token` как факт в kernel, но kernel не должен его хранить и проверять — единственный носитель «не сохранять» — докстринг; на уровне типов отделить «сырую регистрацию» от «дистиллированного факта» невозможно (одна и та же модель для обоих).
+
+33. **Kernel-валидация дайла сквозь английские строки ValueError** — `contract.py` `validate_e164_country` (~1100-1240). Функция кидает plain `ValueError` с текстом; kernel обязан маппить «branches → typed `ErrorReason`» по совпадению сообщения: две разные ветки («not strict E.164» и «does not parse») должны сойтись в один `INVALID_FORMAT_NOT_E164`, две разные `region`-ветки — в `COUNTRY_MISMATCH`. Хрупкий контракт по строкам — любая правка текста ломает маппинг без падения теста (тесты проверяют `ValueError`, не точную строку→код).
+
+34. **`line.revoke` после смерти биндинга: обратная связь отсутствует** — `contract.py:4292-4335`; `ProviderRevokeCommand` (~2230-2250). `revoke_assignment` по ProviderBinding-id кладёт `ProviderRevokeCommand` в outbox — но к тому моменту биндинг уже помечен `UNREACHABLE`, и та же drain-логика (item 9/26) дропнет команду для мёртвого биндинга fail-closed: админский revoke никогда не дойдёт до провайдера, а провайдер не узнает, что его прогнали — спека не разрешает противоречие между «emit line.revoke» и «dead-binding drop rule».
+
+35. **`pending claim` на несуществующую/не-claimable линию и на UNBOUND-линию** — `contract.py:3674-3685`; `docs/api-contract.md:224`. `LINE_NOT_CLAIMABLE` упоминается только для конфликта; поведение claim на `line_id`, сконфигурированной в SQLite, но никогда не зарегистрировавшей провайдера (нет `LineAssignment` — он создаётся при первом register, см. 3723-3726), не определено: `LINE_NOT_FOUND` противоречит видимости линии в `get_lines{UNBOUND}`.
+
+## Minor
+
+36. **Идентификаторы допускают пробелы, управляющие символы, краевые пробелы** — `contract.py` `_check_id`/`_checked_id` (~1030-1100): проверяются лишь непустота, `≤ MAX_ID_LEN` и отсутствие `":"`. `agent_id=" x "`, `line_id` с `\n`/`\t` — валидны; попадают в аудитории, логи, PipeWire node names, SSH/webhook-поля.
+
+37. **`heartbeat_interval_ms_from_sec` — banker's rounding вместо «nearest»** — `contract.py` (~1700-1740): `round(sec*1000)` на `0.0025s → round(2.5)=2` (Python rounds half-to-even); докстринг обещает «nearest» — на границе .5 мс штампуется на 1 мс меньше ожидаемого.
+
+38. **`_check_agent_id` разрешает `system:*` без ограничений** — см. п.14; дополнительно `is_system_agent_id` принимает `system: x` (суффикс с пробелом валиден после `strip`).
+
+39. **CHANGELOG разрыв 0.0.14 → 0.0.20** — `CHANGELOG.md:6-30`: секции `[0.0.15]`–`[0.0.19]` отсутствуют, хотя roadmap фиксирует релизы `v0.0.16`/`v0.0.18`/`v0.0.19` — фрагменты складывались в несуществующие версии; конвенция `.changes` нарушена ретроспективно.
+
+40. **Скопированная метадата в roadmap-артефактах** — `.devin/roadmap.md` items_05/07/09/13: поле `artifacts` повторяет `PR #24 (merged v0.0.5)` item_03 — ложные PR/версии в судовом журнале, что делает аудит-цепочку недостоверной.
+
+41. **`check_changes_entry.sh` принимает любой добавленный `.changes/*.md`** — `tools/check_changes_entry.sh`: имя файла без проверки frontmatter/секций засчитывается как валидный entry; пустой файл `.changes/x.md` проходит гейт.
+
+42. **`check_spec_anchors.sh` валидирует только заявленные якоря** — `tools/check_spec_anchors.sh`: поведенческое изменение спеки с фрагментом `-`/`none` не детектируется ничем; `modifies` не проверяет, что текст требования реально менялся — фрагмент может ссылаться на неизменённый якорь.
+
+43. **Нулевое исполняемое покрытие нормативной спеки** — `tests/test_domain_contract.py` (всё model-уровень), `tests/test_smoke.py` (`assert True`), `tests/test_tooling_baseline.py` (e2e вечно `pytest.skip`); все `Requirement:`-требования `docs/specs/line-manager.md:9-233` — без единого conformance-теста на менеджер/адаптер, вся M1-M5 реализация входит в фазу без исполнительного критерия соответствия замороженному контракту.
+
+44. **Разделённый `ProviderCallState` допускает `ringing` в `ingest_call_state`** — `contract.py:3068-3149`; маршрутизация `ringing→ingest_ring` описана в докстринге, но модель физически принимает `state=RINGING` в call-state ingress — адаптер может легально передать ринг не туда без единой ошибки валидации.
+
+45. **`caller_id` вне `ringing`-обновления не ограничен** — `contract.py` `ProviderCallStateUpdate`: `caller_id` допустим при любом `state`, хотя wire-смысл — только на `ringing`; подмножество полей не разделено моделью.
+
+46. **`LineTimeouts`/`LineAssignment` не имеют `profile`/`meta` — `ProviderRegistration.meta` теряется** — `contract.py` `ProviderRegistration.meta` валидируется и больше нигде не сохраняется (`ProviderBinding` не имеет `meta`) — мёртвое поле: ни на листингах, ни в админ-поверхности meta не доступно.
+
+47. **`AssignmentGrantedEvent.mode` не ограничен `EXCLUSIVE`** — `contract.py` (~2680-2700): модель принимает `AssignmentMode.SHARED_POOL`, хотя по спеке событие существует только для эксклюзивного гранта.
+
+48. **`position` в `AcquireQueued`/`QueueUpdatedEvent` без области видимости** — `contract.py` (~1880-1920); `docs/api-contract.md:288-292`: позиция — это порядок среди «eligible tickets» (per-line + pool в одном глобальном порядке), но нумерация для клиента (сквозная? per-line?) не определена; клиент не может вывести «ещё сколько ждать» из одного числа.
+
+49. **`seq` мятится «на каждый call.acquire» — граница для отказов неопределённа** — `docs/api-contract.md:294-303`: «every call» включая immediate grants; для отвергнутых (`{granted:false}` без enqueue) монетка тратится или нет — не сказано; обе реализации легальны, влияют на разрывы seq.
+
+50. **Дублирующие причины `queue_cancelled` не разграничены** — `contract.py` `QueueCancelReason` vs `claimable=False`/`approve_claim`/`assign_line` (~4216-4225, 4386-4392): билет на линии, ставшей эксклюзивной через approve_claim, подпадает и под `line_exclusive`, и под `claim_resolved` — какой эмитится, не зафиксировано.
+
+51. **Внешний вызов `decide_fallback` vs внутренний вызов из `tick` — двойной публичный контракт** — `contract.py:3901-3921`; `docs/specs/line-manager.md:60-75`: публичный метод существует только чтобы бросать `INVALID_STATE` до дедлайна; единственный легальный вызов — внутренний из `tick` — метод можно было бы сделать приватным; наличие в абстрактном интерфейсе приглашает адаптер дёргать его.
+
+52. **`ProviderRevokeCommand.reason` без границ и PII-ограничений** — `contract.py:2244`: свободная строка админа уезжает на провод провайдера без bound/sanitization.
+
+53. **`CallLease` не несёт `audio_ready`-флаг при том, что `send_dtmf` требует его** — `contract.py` `CallLease` (~1930-2000) vs 3638-3650: kernel обязан знать «audio_ready получен», но поля в lease нет — требование отдано на impl-state вне типа.
+
+54. **`idle_alert` «at most once per continuous idle period» без носителя состояния** — `contract.py` `IdleAlertEvent` (~2760-2780); `docs/api-contract.md:244`: «continuous idle period» определяется окном `idle_revoke_after`, но модель/контракт не описывает, что сбрасывает счётчик (любая операция? `last_seen_at` bump?) — «период» границ не имеет.
+
+55. **`heartbeat` двух уровней имеет несогласованные канонические дефолты** — `docs/hci-agent.md:367-369` (`interval_ms: 2000`, `missed_limit: 3`) vs `LineTimeouts.heartbeat_interval_sec` default ~5 s и `heartbeat_*_after` (contract ~1402-1485): обе лестницы «канонические», не связаны и потенциально дают двойную эскалацию с разной скоростью.
+
+56. **`/run/phonebridge/<line_id>.json` — «durable state file» на tmpfs** — `docs/phone-bridge-service-design.md:767-779`: файл назван durable, но `/run` — tmpfs, стирается рестартом контейнера; 1:1-ambiguity rule это покрывает, но слово «durable» и путь противоречивы.
+
+57. **`config_stale` флаг упомянут без носителя** — `docs/phone-bridge-service-design.md:596-601`: «marks the line `config_stale` in observability» — ни модель `LineAssignment`, ни `LineSummary` не имеют такого поля; observable-контракт не описан.
+
+58. **`LineSummary.profile` источник неоднозначен** — `contract.py` `LineSummary` (~1950-2050): у UNBOUND-линии `profile` может существовать, но ни ProviderBinding (отсутствует), ни LineAssignment (нет поля) не дают значения — поле для unbound-строки не имеет источника.
+
+59. **`media_endpoint` выбирается по «транспорту регистрации» — критерий не типизирован** — `contract.py` `MediaAllocator.allocate` (~3290-3310): «which transport the binding/session registered on» — в kernel нет понятия транспорта сессии/биндинга; адаптер обязан передать достаточно информации через `session_id` — неявный, не типизированный контракт.
+
+60. **`get_lines` для сконфигурированной, но никогда не зарегистрированной линии — неясна видимость** — `contract.py:3687-3708`, `register_provider` 3723-3726: `LineAssignment` создаётся при первом register; линия из `initial_lines` SQLite без провайдера — есть ли у неё `LineSummary{UNBOUND}` в листинге и `LINE_NOT_FOUND` или `LINE_NOT_CLAIMABLE` при claim — не определено.
+
+61. **`admin.pair_window` clamp ≤300 s исполняется нигде не типизировано** — `docs/api-contract.md:547-553`: «non-kernel admin op» — модели входа нет, clamp описан только прозой; на уровне контракта нечего валидировать.
+
+62. **`provider.ping` несёт `state` enum `ProviderLiveness.state` без `REACHABLE`-отличия от факта пинга** — `contract.py` `ProviderLiveness` (~3025-3065): REACHABLE-факт очищает orphan_deadline, но повторный REACHABLE внутри grace — также сбрасывает окно, даже если провайдер ещё не reregister'ился: ping с мёртвой сессии через старый сокет (delayed frame) может очистить дедлайн — упорядочивание только по `checked_at`, а stamp может быть легально раньше WS-обрыва.
+
+63. **`ErrorData.detail` — единственный канал человеческого текста, неограниченный и PII-фри по договорённости** — `contract.py` `ErrorData` (~110-140): размер и «no PII» только в докстринге; адаптер может прокинуть provider-side деталь как есть.
+
+64. **Spec-файл и api-contract рассинхронизированы по версии фриза** — `docs/specs/line-manager.md:3-5` («frozen at round 24») vs реальные изменения round 25/26 в том же файле (секции round 25, `MAX_FORWARD_HOPS=8` «round 26») — заголовок фриза устарел относительно содержимого.
+
+65. **Design §4.2 перечень полей `LineAssignment` устарел** — `docs/phone-bridge-service-design.md:492-494`: список не содержит `assignment_id`, `timeouts`, `allowed_number_types`, `accept_window_sec` есть, но модель богаче — документационный дрейф.
+
+66. **`ProviderLiveness.state_snapshot` на WS_DISCONNECTED/UNREACHABLE факте не запрещён** — `contract.py` (~3025-3065): snapshot осмыслен только на REACHABLE/пинг-факте, модель разрешает его на факте смерти биндинга.
+
+67. **`IncomingRingIngress` требует `assignment_id`, но повторный ринг на RINGING_LOCKED — идемпотентен; факт со stale binding-id отбрасывается молча** — `contract.py:3152-3220` + `register_provider` 3759-3765: комбинация «stale binding id drop» и «idempotent same-token» не определяет, что возвращается провайдеру для ринга на уже замещённом binding'е — `{ok:false}` или принятие по line-корреляции.
+
+68. **`0x02` flush не описан на агентском направлении для `clear_uplink_buffer`** — `docs/api-contract.md:426` + `docs/phone-bridge-service-design.md:990-1000`: агентский `0x02` осмыслен только как «drain uplink ring»; но семантика, которая доходила бы до провайдера (barge-in в уже отправленном звуке), не определена — `0x02` «consumed at the router, never bridged», значит агент не может физически остановить уже ушедшее аудио — спека не говорит об этом ограничении явно у клиентов API.
+
+69. **`media.auth` TEXT-кадр с `role` — клиент самодекларирует роль; валидация пары (token,role) — единственная защита** — `docs/api-contract.md:399-414`: роль не шифруется/не подписывается; ошибка MediaRouter («agent token + role:provider») — единственная точка; спека не требует лог-маскинга `media_token` в auth-кадре — сырой TEXT-JSON с токеном может попасть в access-лог WS-сервера.
+
+70. **`agent.register_intent` повторная регистрация того же `agent_id` без вытеснения старых сессий** — `docs/api-contract.md:215`: до 32 сессий на агента, старые живут до `drop_session`; поведение при «re-register» (обновить intents существующей сессии) отсутствует — каждый reconnect плодит новую сессию с новым `session_id`, старые тикеты привязаны к мёртвым сокетам — намеренно (socket-bound), но «update intents»-операции нет.
+
+71. **`fallback_call_token` переиздание — второй токен на тот же физический ринг** — `contract.py:3901-3921`; `docs/api-contract.md:354`: исходный `call_token` «already stale», но модельного invalidation нет — исходный токен формально может быть ещё жив (TTL = accept_window, expiry == minting fallback token): окно, где два валидных токена на один ринг, зависит от точного порядка сжигания в `tick` — не прописано.
+
+72. **Отсутствие метрики/тестовой привязки для `ring_drain_ttl` vs `fallback_accept_ttl` порядка** — `docs/specs/line-manager.md:60-88`: два дедлайна на одном ринге (accept → fallback_accept → drain); переход `RINGING_LOCKED→FREE` после `fallback_accept_ttl` в `tick`-докстринге (`contract.py:3960-3964`) противоречит требованию держать `RINGING_LOCKED` до drain-окончания в той же спеке (строки 73-75, 77-88) — прямая коллизия двух нормативных текстов: `tick`-докстринг говорит «releases the line RINGING_LOCKED → FREE», spec — «does NOT return to FREE while the physical call still rings».
+
+73. **`MAX_SESSIONS_PER_AGENT` не ограничивает глобальное число сессий** — `contract.py` (~330-380): 32 сессии на `agent_id`, но число agent_id не ограничено ничем — суммарное число сессий/билетов упирается только в `MAX_QUEUE_TICKETS_TOTAL`, а session-state (intent-set, ring re-delivery, socket bookkeeping) растёт линейно по атакующему множеству ключей.
+
+74. **`test_error_codes_match_contract_doc` парсит markdown таблицей regex** — `tests/test_domain_contract.py` (~430-470): дропнет любую строку таблицы кодов, но не ловит добавление кода в enum без обновления таблицы в обратную сторону (двунаправленность заявлена, одно направление слабо — regex `^\| \`([A-Z_]+)\` \|` пропустит курсив/жирный вариант).
+
+75. **Отсутствует модель `SessionId`→`agent_id` в kernel-API** — `contract.py` `register_intent` 3326-3350 возвращает `SessionId`, но kernel хранит маппинг вне типизированного объекта; `drop_session` получает только `SessionId`, ошибка «session unknown» не типизирована (связано с п.23).
+
+76. **`ProviderBinding` не несёт `line_id`-валидации против `LivenessState` при hydrate** — `contract.py` (~1739-1826): `orphan_deadline_at` валиден только при WS_DISCONNECTED — ок; но `state=REACHABLE` + `orphan_deadline_at` модель отвергнет, а гидратация внутрь kernel-state после сбоя (записанный dead-line) не предусмотрена — memory-only, ок; впрочем рестарт kernel зануляет orphan-deadlines — спека говорит «memory-only» — согласовано, но подтверждения что агент-провайдерская WS-сессия не переживает kernel-restart нет (single-process kernel — restart убивает сокеты — ок по факту, но не зафиксировано).
+
+77. **`MAX_CTRL_FRAME_LEN=4096` живёт только в hci-agent.md** — `docs/hci-agent.md:140-145`: константа протокола не экспортирована нигде в коде/контракте — будущий hci-agent и feeder должны держать её синхронно вручную.
+
+78. **`LineProviderConfig.media_transport` — строковый литерал `"ws_pcm"` без enum** — `docs/api-contract.md:368`, `docs/phone-bridge-service-design.md:233`: в контракте нет соответствующего типа; любые иные значения недопустимы, но не закреплены.
+
+79. **`provider.audio_ready` до первого `line.dial`/`line.answer` невозможно отвергнуть** — `contract.py:3890-3898`: «one-shot per lease» — но до lease provider не может послать его легально (lease_id обязателен) — ок; однако после hangup/lease-end отложенный audio_ready «dropped» — спека допускает silent-drop факта о SCO, что может быть симптомом десинхронизации — нет обязательного telemetry-счётчика (в отличие от `SCO_*` серии).
+
+80. **Дублирующиеся `profile`-поля разной природы под одним именем** — `ProviderBinding.profile` (label провайдера) vs `agent.register_intent{profile}`/`call.acquire{profile}` (неопределённый агентский профиль) vs `LineSummary.profile` (неясный источник, п.58) — три разных сущности под одним словом без типовой дифференциации.

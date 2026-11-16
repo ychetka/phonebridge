@@ -1,0 +1,168 @@
+# Архитектурное и кодовое ревью `phonebridge` (`v0.0.15`) и план доведения до эталонного состояния
+
+## 1. Оценка текущего состояния
+
+После раундов 20 / 20b (`v0.0.13`–`0.0.15`) проект сделал качественный рывок вперёд:
+- **`RedactedString` переведён в fail-closed режим:** убрано наследование от `str`, закрыты утечки PII через C-буфер в `json.dumps` и конкатенации `+`, покрыто тестами.
+- **Введён транзакционный Outbox (`drain_events` / `drain_provider_commands`):** мутации ядра изолированы от сетевого I/O (`CODING_HAZARDS`, правило 4).
+- **Разделены пространства `ProviderBinding` и `LineAssignment`:** жизненный цикл оборудования больше не конфликтует с эксклюзивным владением линией со стороны агента.
+- **Закрыты базовые пробелы FSM и транспорта:** добавлены `CallPhase.ACQUIRED`, `CALL_PHASE_WIRE_STATES` с drift-тестом, `idempotency_key` в `acquire()`, `session_nonce` в `media-UDP` и runtime-зависимость `phonenumbers` в `pyproject.toml`/`uv.lock`.
+
+Однако глубокая сверка кода `contract.py` с документами `api-contract.md`, `hci-agent.md`, `phone-bridge-service-design.md` и спецификацией Bluetooth Core выявила **9 оставшихся проблем** (3 уровня **CRITICAL**, 4 уровня **HIGH**, 2 уровня **MEDIUM**), часть из которых была внесена при последней реализации Outbox и `SCO_STATE`. Их устранение сделает доменный контракт и архитектуру монолитно непротиворечивыми перед стартом M1.
+
+---
+
+## 2. Выявленные дефекты и архитектурные пробелы (по критичности)
+
+### CRITICAL-1. Рассинхрон `ProviderCommand` в `contract.py` с проволочным контрактом `line.*` (сломаны входящие и исходящие медиа)
+В `src/phonebridge/domain/contract.py` модели команд провайдера расходятся с таблицей `Manager → Line — line.*` в `docs/api-contract.md`:
+1. **`ProviderAnswerCommand` потерял `lease_id`, `media_endpoint` и `media_token`:** в `contract.py` у него есть только `{line_id, assignment_id, call_token}`, тогда как `line.answer` на проводе требует `{assignment_id, lease_id, call_token, media_endpoint, media_token}`. Без `lease_id` провайдер после ответа на входящий звонок вообще не знает идентификатор лиза и **не сможет** отправить `provider.audio_ready`, `provider.call_state{state: "active"}` и пройти `media.auth`.
+2. **`ProviderDialCommand` потерял `media_endpoint` и `media_token`, но получил несуществующее поле `mask_clir: bool = False`:** провайдер не получит токен для подключения к медиа-сокету при исходящем звонке, а поле `mask_clir` отсутствует во всей документации проекта (нарушение `CODING_HAZARDS`, правило 11).
+3. **Дрейф имён команд без drift-теста:** дискриминаторы названы `"dial"`, `"answer"`, `"hangup"`, `"send_dtmf"`, `"revoke_assignment"`, тогда как на проводе методы называются `line.dial`, `line.answer`, `line.hangup`, `line.send_dtmf`, `line.revoke` (не `revoke_assignment`!). В отличие от `EVENT_WIRE_NAMES`, для `ProviderCommand` нет таблицы маппинга и автоматического теста против `docs/api-contract.md`.
+
+### CRITICAL-2. Уязвимость спуфинга ролей в `media.auth` (`CODING_HAZARDS`, правило 9 — BOLA / Role Spoofing)
+Согласно `docs/api-contract.md`, при `call.dial` / `call.accept` агент получает `{lease_id, media_endpoint, media_token}`, и провайдер в `line.dial` / `line.answer` получает `{lease_id, media_endpoint, media_token}`. Оба подключаются к одному и тому же `media_endpoint` и в первом фрейме сами заявляют свою роль:
+`{"type":"media.auth","role":"agent"|"provider","lease_id":"...","media_token":"..."}`.
+- **Уязвимость:** если `media_token` один на `lease_id`, то поле `role` ничем криптографически не подтверждено. Скомпрометированный или ошибочный удалённый агент, получив `media_token`, может мгновенно открыть второй WebSocket с `"role": "provider"` быстрее локального провайдера и перехватить/подменить телефонный аудиопоток линии.
+- **Решение:** выпускать на каждый `lease_id` **два разных одноразовых токена** — `agent_media_token` (уходит агенту в `DialResult`/`AcceptResult`) и `provider_media_token` (уходит провайдеру в `ProviderDialCommand`/`ProviderAnswerCommand`). На проводе поле по-прежнему называется `media_token`, но `MediaRouter` жёстко проверяет связку `(token -> lease_id, expected_role)`.
+
+### CRITICAL-3. Механика `10 s orphan_grace` (Round 20b) не реализуема через текущий `LineManager`
+В `docs/phone-bridge-service-design.md` §5.4 прописано: при обрыве WS провайдера выставляется `ProviderBinding.orphan_deadline_at = now + 10s`, а при `provider.reregister` внутри окна его `state_snapshot` сверяется с активными звонками. Но в `contract.py`:
+1. У `LineManager` **нет входа для события обрыва WS провайдера**: `ProviderLiveness` содержит только `REACHABLE | UNREACHABLE`, где `UNREACHABLE` также означает пропуск N пингов (`DEGRADED -> DOWN`), который по тому же §5.4 обязан рвать звонки **немедленно без грейса**.
+2. В `ProviderRegistration` (и в описании `provider.reregister` в `api-contract.md`) **отсутствует поле `state_snapshot`** (оно упомянуто только у `provider.ping`). В итоге `InMemoryLineManager.register_provider()` в M1 физически не может проверить, жив ли звонок на D-Bus при перерегистрации.
+
+### HIGH-4. Отсутствие адресации получателей (`EventAudience`) в `EventEnvelope` — риск утечки PII и `call_token` (`CODING_HAZARDS`, правила 9 и 10)
+`EventEnvelope` содержит только `{name, emitted_at, payload}` и вычитывается `EventBus`-ом через `drain_events()`. При этом правила видимости у событий разные:
+- `incoming_call` несёт PII (`caller`) и секретный одноразовый `call_token` — на эксклюзивной линии его можно слать **только** владельцу линии, иначе любой подключённый агент увидит чужой номер и токен перехвата.
+- `fallback_triggered` можно слать **только** системному агенту `system:fallback_worker`.
+- `assignment_revoked` — **только** отозванному владельцу.
+- `audio_ready` и `call_state_changed` в своих payload не содержат ни `session_id`, ни `owner_agent_id` — широковещательная рассылка раскроет другим агентам чужие `lease_id` и фазы разговоров, а лезть из `EventBus` обратно во внутренние таблицы `LineManager` после завершения лиза/сессии поздно (запись уже удалена).
+- **Решение:** добавить в `EventEnvelope` обязательное поле маршрутизации `audience: EventAudience` (`BroadcastAudience | AgentAudience | SessionAudience`), формируемое внутри ядра в момент транзакции.
+
+### HIGH-5. Несоответствие Bluetooth Core Spec в описании `0x16 SCO_STATE` (`docs/hci-agent.md`)
+В `docs/hci-agent.md` (§2) допущены две ошибки, которые заведут разработчика M4 в тупик на реальном USB-донгле:
+1. Указано, что агент маппит `rx_pkt_len`/`tx_pkt_len` из HCI-события `0x2c` на `wMaxPacketSize` USB Interface 1 (*"CVSD 48/64/128-byte vs transparent mSBC"*). В реальности в событии `0x2c` поля `Rx/Tx_Packet_Length` передают эфирную длину пакета eSCO (например, `60` байт для 2-EV3 mSBC или `30` байт для HV3), `48/64/128` — это буферный HCI MTU, а дескрипторы USB Interface 1 (Core Spec Vol 4 Part B §2.1.1) имеют фиксированные `wMaxPacketSize`: `0` (alt 0), `9` (alt 1), `17` (alt 2 — стандарт для 16-бит CVSD), `25` (alt 3), `33` (alt 4), `49` (alt 5), `63` (alt 6 — стандарт для WBS/mSBC). Прямой поиск `wMaxPacketSize == rx_pkt_len` не найдёт ни одного altsetting.
+2. Для `open: false` указано заполнять `air_mode` числом `0`, хотя при `open: true` это строка `"cvsd" | "msbc"` — смешение типов в JSON-схеме без причины (должно быть `null` или опциональные поля).
+
+### HIGH-6. Опасный сценарий Bluetooth HFP: ручной звонок человека с физического телефона и `stack_restart` (`design.md` §9)
+В `design.md` §9 написано, что при обнаружении на D-Bus звонка, неизвестного ядру, он *«либо усыновляется, либо сбрасывается через Hangup»*.
+- Во-первых, формулировка «либо А, либо Б» недопустима для контракта — разные модули реализуют разное поведение.
+- Во-вторых, если человек возьмёт в руки свой физический телефон (привязанный по Bluetooth к линии секретаря) и сам наберёт номер или ответит с экрана телефона, в `org.ofono.VoiceCallManager` появится активный вызов без `lease_id`. Если `phonebridge` пошлёт ему `Hangup`, **сервис оборвёт живой личный звонок владельца телефона**.
+- **Решение:** зафиксировать детерминированное правило: неизвестный звонок в состоянии `incoming` подаётся в `ingest_ring`; неизвестный звонок в состояниях `dialing/alerting/active` переводит линию в занятое внешним вызовом состояние (без выдачи агентам и без подключения PipeWire-моста, чтобы звук остался на телефоне) и **никогда не сбрасывается принудительным `Hangup`**, пока не завершится сам.
+
+### HIGH-7. Отсутствие read-методов в `LineAdminKernel` и `ClaimId` NewType
+В `LineAdminKernel` есть методы мутации `approve_claim(claim_id)`, `reject_claim(claim_id)` и `revoke_assignment(assignment_id)`, но нет ни модели `PendingClaim`, ни методов чтения (`list_pending_claims`, `list_assignments`, `list_provider_bindings`). В M2/M5 административному MCP-адаптеру будет неоткуда узнать список ожидающих заявок и действующих `assignment_id`, кроме обращения к приватным полям `InMemoryLineManager`. Кроме того, `claim_id` типизирован голым `str`, в отличие от остальных ID в таксономии.
+
+### MEDIUM-8. Мутабельность моделей `ContractModel` в in-process архитектуре и пробел `register_intent`
+1. `ContractModel` не имеет `frozen=True` и использует мутабельные `list[...]` в выходных DTO (`LineSummary.caps`, `ProviderBinding.caps`, `ErrorData.free_lines`, `AcquireRefused.free_lines`). Так как `LineManager`, `EventBus` и адаптеры живут в одном Python-процессе, случайная мутация списка/поля в одном подписчике повредит данные в ядре или у соседнего подписчика.
+2. В `agent.register_intent` не зафиксировано поведение при передаче `Intent.EXCLUSIVE_LINE` (в §4.1 осталась старая фраза про авто-резолв интентов в `LineAssignment`, хотя по Round 10d/14 эксклюзивность выдаётся только через `call.claim_exclusive` + одобрение админа).
+
+### MEDIUM-9. Локальные противоречия проволочной спеки и отсутствие швов `Clock` / `MediaTokenIssuer` для M1
+1. **Словарь `reason` в `provider.call_state` (`api-contract.md`):** объявлен *«CLOSED: `dongle_lost`, `stack_restart`, `provider_lost`»*, в котором забыты штатные причины завершения вызова (`normal`, `busy`, `no_answer`, `rejected`, `network_error`), а `provider_lost` вообще порождается самим шлюзом при молчании провайдера, а не провайдером.
+2. **Швы для M1:** чтобы `InMemoryLineManager` в M1 тестировался детерминированно без `sleep` и без сети, стоит задекларировать протоколы `Clock` (с защитой от хода времени назад в `tick(now)`) и `MediaHandshakeAllocator` (выпускающий пару `(media_endpoint, agent_media_token, provider_media_token)`).
+3. **Мелкие хвосты в `docs/`:**
+   - шапка `api-contract.md` застряла на `rounds 1-18`;
+   - в `call.accept` и `design.md` §5.2 ошибочно указан код `LINE_BUSY_INCOMING` на повторный `accept` (должен быть только `STALE_TOKEN`);
+   - в `Binary media protocol` написано *"all subsequent frames are fixed 648 B"*, и тут же — что `0x02`/`0x03` имеют 0 байт payload (то есть 8 байт);
+   - не зафиксирован единый формат времени на проводе (`server_time` vs `expires_at` vs `expires_in_ms`);
+   - в `LineProviderConfig` осталась строка `media_transport: "rtp_wss"` вместо актуального WS-PCM;
+   - `docs/architecture-unified.html` и `docs/interaction-flow.html` отстали от раундов 19–20;
+   - `controller-manager/development-cycle.md` отличается на 12 строк заголовка от `harness.md` вопреки собственному требованию `byte-identical`.
+
+---
+
+## 3. Целевая архитектура границ доменного ядра (Ideal State)
+
+```mermaid
+flowchart LR
+    subgraph Ports["Injected Pure Ports (Zero I/O)"]
+        CLK["Clock Protocol<br/>() -> AwareDatetime (monotonic UTC)"]
+        MTA["MediaAllocator Protocol<br/>(lease_id, line_id) -> MediaCredentials<br/>{endpoint, agent_token != provider_token}"]
+    end
+
+    subgraph Kernel["InMemoryLineManager (Implements LineManager + LineAdminKernel)"]
+        STATE["Private Mutable State<br/>Lines · ProviderBindings · LineAssignments<br/>CallLeases · Global-Seq Queue · PendingClaims"]
+        E_OUT["Bounded Event Outbox<br/>EventEnvelope[PayloadT] + EventAudience"]
+        C_OUT["Bounded Command Outbox<br/>ProviderCommand (1:1 with line.*)"]
+        STATE --> E_OUT
+        STATE --> C_OUT
+    end
+
+    Ports --> Kernel
+
+    E_OUT -->|"drain_events() [frozen DTOs]"| EBUS["EventBus<br/>Stateless Audience Router<br/>(Broadcast | Agent | Session)"]
+    C_OUT -->|"drain_provider_commands() [frozen DTOs]"| PADP["Manager Surface<br/>PROVIDER_COMMAND_WIRE_NAMES<br/>line.dial / answer / hangup / send_dtmf / revoke"]
+```
+
+---
+
+## 4. План устранения всех замечаний до идеального состояния (Этапы работ для AI-агента)
+
+Рекомендуется провести эти правки **одним финальным pre-M1 PR** (`v0.0.16`, `PLAN_DELTA` перед заморозкой контракта под реализацию M1), разбив работу внутри задачи на 5 атомарных шагов:
+
+### Шаг 1. Приведение `ProviderCommand`, `MediaToken` и Outbox к 100% паритету с проводом (`CRITICAL-1`, `CRITICAL-2`)
+1. В `src/phonebridge/domain/contract.py`:
+   - В `ProviderDialCommand`: удалить несуществующий `mask_clir`; добавить `media_endpoint: str` и `media_token: MediaToken` (токен роли `provider`).
+   - В `ProviderAnswerCommand`: добавить `lease_id: LeaseId`, `media_endpoint: str` и `media_token: MediaToken` (токен роли `provider`).
+   - В `ProviderRevokeCommand`: переименовать дискриминатор `command: Literal["revoke"] = "revoke"` (убрать опциональный `reason` с провода либо явно добавить `reason?` в таблицу `line.revoke` в `docs/api-contract.md`).
+   - Добавить константную таблицу `PROVIDER_COMMAND_WIRE_NAMES: dict[str, str]` (`"dial" -> "line.dial"`, `"answer" -> "line.answer"`, `"hangup" -> "line.hangup"`, `"send_dtmf" -> "line.send_dtmf"`, `"revoke" -> "line.revoke"`).
+   - Добавить модель/протокол `MediaCredentials(ContractModel)` с полями `media_endpoint: str`, `agent_media_token: MediaToken`, `provider_media_token: MediaToken` и валидатором `agent_media_token != provider_media_token`.
+2. В `docs/api-contract.md` (`Identifier taxonomy` и `Binary media protocol`):
+   - Зафиксировать выпуск двух независимых одноразовых `media_token` на каждый `lease_id` (привязанных к `(lease_id, "agent")` и `(lease_id, "provider")` соответственно), исключающих спуфинг роли при `media.auth`.
+3. В `tests/test_domain_contract.py`:
+   - Добавить drift-тест `test_provider_command_wire_parity`, парсящий таблицу `## Manager → Line — line.*` в `docs/api-contract.md` и проверяющий как имена `line.*`, так и совпадение полей каждого `ProviderCommand` с параметрами в таблице.
+
+### Шаг 2. Замыкание контракта `orphan_grace`, внешних звонков и словаря `reason` (`CRITICAL-3`, `HIGH-6`, `MEDIUM-9`)
+1. В `src/phonebridge/domain/contract.py`:
+   - Добавить модель `ProviderActiveCall(ContractModel)` (`lease_id: LeaseId | None = None`, `state: ProviderCallState`, `caller: RedactedString | None = None`) и поле `state_snapshot: tuple[ProviderActiveCall, ...] | None = None` в `ProviderRegistration`.
+   - Добавить в `LivenessState` значение `WS_DISCONNECTED = "ws_disconnected"` (включает 10-секундный `orphan_deadline_at` в отличие от `UNREACHABLE`, который означает истечение heartbeat `DEGRADED -> DOWN` и немедленный сброс лизов).
+   - Ввести типизированные перечисления причин завершения:
+     - `ProviderDisconnectReason(str, Enum)`: `NORMAL`, `BUSY`, `NO_ANSWER`, `REJECTED`, `NETWORK_ERROR`, `DONGLE_LOST`, `STACK_RESTART`.
+     - `CallEndReason(str, Enum)`: все значения выше + `AGENT_HANGUP`, `PREEMPTED_BY_INCOMING`, `GRANT_TTL_EXPIRED`, `ACCEPT_WINDOW_EXPIRED`, `AGENT_DISCONNECTED`, `PROVIDER_LOST`, `ADMIN_REVOKED`.
+   - Разрешить `ProviderCallStateUpdate` с `lease_id=None, call_token=None` для внешних ручных вызовов на физическом телефоне (переводит линию в `BUSY` с причиной `"external_call"` до прихода `DISCONNECTED`, без создания агентского лиза и без отправки `Hangup`).
+2. Синхронизировать `docs/api-contract.md` (`provider.reregister` принимает `state_snapshot?`, расширить закрытый список `reason` в `provider.call_state`) и `docs/phone-bridge-service-design.md` (§9: однозначное правило для внешних вызовов человека без сброса `Hangup`).
+
+### Шаг 3. Типизированная маршрутизация событий `EventAudience` и иммутабельность DTO (`HIGH-4`, `MEDIUM-8`)
+1. В `src/phonebridge/domain/contract.py`:
+   - Включить `frozen=True` в `ContractModel.model_config` и заменить `list[...]` на неизменяемые `tuple[..., ...]` во всех моделях контракта (`LineSummary.caps`, `ProviderBinding.caps`, `ProviderRegistration.caps`, `ErrorData.free_lines`, `AcquireRefused.free_lines` — JSON-сериализация в массивы не меняется).
+   - Определить дискриминированный union адресации `EventAudience`:
+     - `BroadcastAudience(scope: Literal["broadcast"] = "broadcast")` — для `line_state_changed` и `incoming_call` на неэксклюзивных пул-линиях;
+     - `AgentAudience(scope: Literal["agent"] = "agent", agent_id: str)` — для `incoming_call` / `missed_call` / `assignment_revoked` на эксклюзивных линиях и `fallback_triggered` (`agent_id="system:fallback_worker"`);
+     - `SessionAudience(scope: Literal["session"] = "session", session_id: SessionId)` — для `queue_ready`, `queue_updated`, `audio_ready`, `call_state_changed`.
+   - Добавить обязательное поле `audience: EventAudience` в `EventEnvelope`.
+   - Уточнить контракт `register_intent`: пустой `intents` → `INVALID_ARGUMENT`; передача `Intent.EXCLUSIVE_LINE` в `register_intent` → `INVALID_INTENT` (эксклюзивность запрашивается только через `claim_exclusive`).
+
+### Шаг 4. Завершение админского ядра `LineAdminKernel` и портов M1 (`HIGH-7`, `MEDIUM-9`)
+1. В `src/phonebridge/domain/contract.py`:
+   - Ввести `ClaimId = NewType("ClaimId", str)` и модель `PendingClaim(ContractModel)` (`claim_id: ClaimId`, `line_id: LineId`, `requester_agent_id: str`, `session_id: SessionId`, `created_at: AwareDatetime`).
+   - Использовать `ClaimId` в `ClaimResult`, `approve_claim` и `reject_claim`.
+   - Добавить в `LineAdminKernel` синхронные/асинхронные read-методы: `list_pending_claims() -> list[PendingClaim]`, `list_assignments() -> list[LineAssignment]`, `list_provider_bindings() -> list[ProviderBinding]`.
+   - Объявить `Protocol`-интерфейсы `Clock` (`def __call__(self) -> datetime: ...`) и `MediaAllocator` (`def allocate(self, lease_id: LeaseId, line_id: LineId) -> MediaCredentials: ...`), чтобы M1 `InMemoryLineManager` внедрял их через конструктор без внешних зависимостей.
+
+### Шаг 5. Выверка `docs/hci-agent.md` и полировка документации (`HIGH-5`, `MEDIUM-9`)
+1. В `docs/hci-agent.md` (§2 `0x16 SCO_STATE`):
+   - Исправить алгоритм выбора USB `bAlternateSetting` на Interface 1 в соответствии с Bluetooth Core Spec Vol 4 Part B §2.1.1 и реализацией Linux `btusb`: выбор строится по `air_mode` и числу голосовых каналов (`air_mode == "msbc"` → `altsetting 6` с `wMaxPacketSize = 63`, fallback `altsetting 1` с `9`; `air_mode == "cvsd"` 16-бит → `altsetting 2` с `wMaxPacketSize = 17`), а не прямым сравнением `wMaxPacketSize` с эфирным `rx_pkt_len`.
+   - Для `open: false` сделать поля `air_mode`, `rx_pkt_len`, `tx_pkt_len` опциональными/`null` вместо нетипизированного `0`.
+   - Уточнить, что несовпадение пира туннеля и несовпадение `session_nonce` учитываются в раздельных счётчиках телеметрии (`SCO_PEER_MISMATCH` и `SCO_SESSION_MISMATCH`).
+2. В `docs/api-contract.md`, `docs/phone-bridge-service-design.md` и `docs/*.html`:
+   - Обновить шапку `api-contract.md` до актуального раунда;
+   - Зафиксировать единый формат временных меток на проводе: все поля `*_at` и `server_time` — строки RFC 3339 / ISO-8601 в UTC (`"2026-11-15T12:00:00.000Z"`), `*_ms` — неотрицательный `int`;
+   - Убрать ошибочный `LINE_BUSY_INCOMING` из ошибок `call.accept`;
+   - Точно сформулировать длину медиа-кадров: `648 B` для `0x01` (аудио) и `8 B` для `0x02`/`0x03` (управление), любая иная длина — закрытие сокета `1002 Protocol Error`;
+   - Заменить устаревший литерал `media_transport: "rtp_wss"` на `"ws_pcm"` в `LineProviderConfig`;
+   - Актуализировать события и подписи в `docs/architecture-unified.html` и `docs/interaction-flow.html`.
+3. В секции `OPEN` (или отдельным каноническим PR харнесса) синхронизировать 12-строчный заголовок `controller-manager/development-cycle.md` и `controller-manager/harness.md`.
+
+---
+
+## 5. Критерии идеального состояния (Exit Gates перед стартом M1)
+
+После выполнения этих 5 шагов проект переходит к кодингу M1 (`InMemoryLineManager`) со следующими гарантиями:
+1. **Тройной паритет без слепых пятен (3/3 drift-теста в CI):**
+   - `ErrorCode` ↔ таблица `Error codes` в `api-contract.md`;
+   - `EVENT_WIRE_NAMES` ↔ таблица `event.*` в `api-contract.md`;
+   - `PROVIDER_COMMAND_WIRE_NAMES` + поля `ProviderCommand` ↔ таблица `line.*` в `api-contract.md`;
+   - `CALL_PHASE_WIRE_STATES` ↔ допустимые состояния `event.call_state_changed`.
+2. **Нулевая поверхность утечек и BOLA в ядре и медиа:** неизменяемые (`frozen=True`) модели, fail-closed `RedactedString`, раздельные `agent`/`provider` медиа-токены и обязательный `EventAudience` на каждом событии.
+3. **100% детерминированная тестируемость M1 без моков сети и без `sleep`:** все зависимости ядра сводятся к чистым портам `Clock` и `MediaAllocator`, а все побочные эффекты проверяются через `drain_events()` и `drain_provider_commands()`.
+4. **Зелёные нативные гейты:** `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy src tests` (`strict = true`), `uv run pytest -m "not e2e"`.

@@ -4,7 +4,8 @@
   "cyrillic_paths": [
     ".devin/agents/",
     ".windsurfrules",
-    "controller-manager/"
+    "controller-manager/",
+    "docs/audits/"
   ],
   "protected_paths": [
     ".devin/",

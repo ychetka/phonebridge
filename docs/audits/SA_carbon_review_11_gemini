@@ -1,0 +1,36 @@
+### Verdict
+
+**THE CONTRACT IS CLEAN AND READY TO FREEZE FOR M1.**
+
+All **14 findings** (2 CRITICAL, 6 HIGH, 6 MEDIUM) from the Round 21 fresh-pass review have been verified as completely and cleanly resolved in v0.0.17 (`round 22`). There are **zero remaining CRITICAL, HIGH, or MEDIUM defects** blocking `InMemoryLineManager` (M1) or downstream adapters (M2–M5).
+
+---
+
+### Verification Summary of Round 22 Fixes
+
+| Finding | Status | Verification in v0.0.17 |
+|---|---|---|
+| **CRITICAL-1** (`provider.capability_update` missing) | **CLOSED** | `ProviderCapabilityUpdate` DTO (without `token`) and `LineManager.update_provider_capabilities()` added, tested in `_FakeLineManager` and `test_ingress_payloads_validate`. |
+| **CRITICAL-2** (`CallLease` missing `session_id`) | **CLOSED** | `CallLease.session_id: SessionId` is now required; `(session_id, lease_id)` ownership, `SessionAudience` routing, and sibling-safe `drop_session` semantics are locked in and tested. |
+| **HIGH-1** (Event wire schema drift) | **CLOSED** | `caller` $\rightarrow$ `caller_id`, `expires_in_ms` $\rightarrow$ `expires_at`, `phase` $\rightarrow$ `state: WireCallState`, `ticket_id` added to `event.line_acquired`, and `test_event_wire_name_parity` now enforces bidirectional field name + optionality parity against `docs/api-contract.md`. |
+| **HIGH-2** (Preemption of undialed grants) | **CLOSED** | Explicitly specified in `LineManager.acquire` and `api-contract.md`: queue-origin grants keep `ticket_id` referenced until lease end and reissue at `position=1`; immediate `enqueue=True` grants materialize a new ticket at head delivered via `event.queue_updated`. |
+| **HIGH-3** (`release` vs `hangup` lifecycle contradiction) | **CLOSED** | Ephemeral `CallLease` auto-releases on `hangup`/`disconnected`; mid-call `release(lease_id)` is hangup-intent; durable `LineAssignment` voluntary release has its own `release_assignment(session_id, assignment_id)` method (`call.release{lease_id? XOR assignment_id?}`). |
+| **HIGH-4** (Shared-pool PII/token broadcast leak) | **CLOSED** | `BroadcastAudience` narrowed to `line_state_changed`; shared-pool `incoming_call`/`missed_call` fan out as per-session `SessionAudience` envelopes only to `Intent.RECEIVE_INBOUND` sessions; `accept()` enforces `Intent.RECEIVE_INBOUND` (with `system:fallback_worker` exemption). |
+| **HIGH-5** (`LineAdminKernel` missing `assign_line` & timeouts) | **CLOSED** | `LineAdminKernel.assign_line` added; `TimeoutConfig` patch model + `idle_revoke_after` added to `configure_line`. |
+| **HIGH-6** (`AssignmentRevokedEvent` null audience hazard) | **CLOSED** | `AssignmentRevokedEvent.owner_agent_id: str` is now required; `ProviderBinding` revocation emits `ProviderRevokeCommand` + `LineStateChangedEvent(new_state=DOWN, reason=ADMIN_REVOKED)` and never `AssignmentRevokedEvent`. |
+| **MEDIUM-1** (DTMF synthesis & `0x02` flush split) | **CLOSED** | `ProviderSendDtmfCommand` and design §6.4 pin PCM tone synthesis, uplink muting, and `0x02` emission to `LineProvider`, with `MediaRouter` draining its per-lease uplink ring on `0x02` receipt. |
+| **MEDIUM-2** (`FallbackWorker` deadlocks & delivery hedge) | **CLOSED** | `AnswerAndAnnounceFallback.announcement_ref` added (`min_length=1`); `system:fallback_worker` bypasses `LINE_EXCLUSIVE_NOT_OWNER` on `acquire`; `event.fallback_triggered` is the sole delivery channel. |
+| **MEDIUM-3** (`call_token` minting & `caller_id` on ring) | **CLOSED** | `IncomingRingIngress` drops `call_token` input; `LineManager.ingest_ring` mints and returns `call_token`; `provider.call_state` carries `caller_id?` and returns `{ok, call_token?}` on `ringing` with `RINGING_LOCKED` fallback correlation for snapshot-discovered rings. |
+| **MEDIUM-4** (`PendingClaim` bounds & socket lifecycle) | **CLOSED** | `MAX_PENDING_CLAIMS_PER_AGENT = 8` and `MAX_PENDING_CLAIMS_TOTAL = 256` defined; `drop_session` cancels pending claims for the disconnected session. |
+| **MEDIUM-5** (`ProviderRegistration.meta` bounds) | **CLOSED** | `MAX_PROVIDER_META_ENTRIES = 16`, `MAX_PROVIDER_META_KEY_LEN = 64`, `MAX_PROVIDER_META_VALUE_LEN = 256` enforced via `@field_validator("meta")` and tested. |
+| **MEDIUM-6** (Design doc §3.2, §3.3, §4.1 drift) | **CLOSED** | `docs/phone-bridge-service-design.md` is fully synchronized with `contract.py` and `docs/api-contract.md`. |
+
+---
+
+### Non-Blocking Implementation Notes for M1 (`InMemoryLineManager`)
+
+Keep these two minor details in mind while writing the M1 kernel (neither requires changing the frozen contract):
+1. **`TimeoutConfig` cross-field check:** When `configure_line` applies a `TimeoutConfig` patch against a line's effective timeouts, validate `heartbeat_down_after > heartbeat_degraded_after` against the *merged* state (raising `PhonebridgeError(ErrorCode.INVALID_ARGUMENT)` if violated), since a partial patch may update only one of the two fields.
+2. **Design §3.6 prose nit:** Line 438 of `docs/phone-bridge-service-design.md` still writes `owner_agent_id?` with a trailing `?` in the prose summary of `event.assignment_revoked` (whereas `contract.py`, `api-contract.md`, and the drift test all correctly enforce `owner_agent_id` as required).
+
+You are clear to lock `src/phonebridge/domain/contract.py` and proceed to **M1 (`InMemoryLineManager`)**.

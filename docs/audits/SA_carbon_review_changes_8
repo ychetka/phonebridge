@@ -1,0 +1,198 @@
+Ниже приведена полная, готовая к передаче автономному AI-агенту (Devin / Claude Code / Cursor / Windsurf) спецификация задач (`PLAN_DELTA` + ТЗ для `code_writer`), составленная с учётом правил вашего репозитория (`controller-manager/harness.md`, `docs/CODING_HAZARDS.md`, `docs/REVIEW_HAZARDS.md`).
+
+Скопируйте блок ниже целиком и передайте вашему агенту.
+
+---
+
+# ТЕХНИЧЕСКОЕ ЗАДАНИЕ ДЛЯ AI-АГЕНТА: Устранение архитектурных узких мест и белых пятен `phonebridge` (Round 20 Hardening)
+
+## 0. Контекст процесса и жёсткие правила репозитория (прочитать ДО правок)
+
+1. **Режим `PLAN_DELTA` (Контракт-first, `harness.md` §3):**
+   - Задача изменяет подписанный контракт `src/phonebridge/domain/contract.py` и протокольные документы `docs/api-contract.md`, `docs/hci-agent.md`, `docs/phone-bridge-service-design.md`.
+   - Если работа идёт внутри двухкомитетного цикла (`.devin/roadmap.md`), сначала оформи `PLAN_DELTA` (перечень изменений контракта и затронутых пунктов M1–M5) и получи sign-off, либо выполняй в рамках выделенного contract-пункта roadmap.
+2. **Границы файлов (`whitelist` / `may_not_edit`):**
+   - **Разрешено менять (`may_edit`):**
+     - `src/phonebridge/domain/contract.py`
+     - `tests/test_domain_contract.py`
+     - `docs/api-contract.md`
+     - `docs/hci-agent.md`
+     - `docs/phone-bridge-service-design.md`
+     - `pyproject.toml`, `uv.lock` (бамп версии по `target_version` ветки; добавление зависимостей — только через `uv`)
+     - `.changes/<slug>.md` и `docs/specs/*.md` (при наличии директории `docs/specs/` и скрипта `verify_constraints.sh`)
+   - **Запрещено менять (`may_not_edit`):**
+     - `controller-manager/*` (каноническое зеркало харнесса; найденное расхождение между `development-cycle.md` и `harness.md` зафиксируй только в секции `OPEN` отчёта, руками не правь).
+     - `CHANGELOG.md` **не редактировать вручную**, если в репозитории присутствует `repo_release.sh` / гейт фрагментов `.changes/` (в `pyproject.toml` сейчас `0.0.12`, а в `CHANGELOG.md` — `0.0.8`, так как невыпущенные изменения накапливаются во фрагментах `.changes/*.md` до запуска `repo_release.sh`). Обязательно создай валидный `.changes/<slug>.md` с секцией `## Spec impact` и синхронизируй версию в `pyproject.toml` с именем ветки `issue_<N>_v<target_version>`.
+3. **Атомарность drift-тестов:**
+   - В `tests/test_domain_contract.py` есть тесты, парсящие Markdown-таблицы в `docs/api-contract.md` (`test_error_codes_match_contract_doc`, `test_event_wire_name_parity`). Любое изменение кодов ошибок или проволочных имён событий в `contract.py` и `docs/api-contract.md` делать строго в одном коммите.
+
+---
+
+## 1. Детальный список исправлений по местам в коде и документации
+
+### Задача 1 [CRITICAL, `CODING_HAZARDS` Rule 10] — Устранить утечку сырых PII в `RedactedString`
+- **Локация:** `src/phonebridge/domain/contract.py` (`class RedactedString(str)`), `tests/test_domain_contract.py`.
+- **Суть дефекта:** `RedactedString` наследуется от встроенного `str`. В CPython стандартный `json.dumps(RedactedString("+37379012345"))` (используемый структурированными логгерами) и строковая конкатенация `"dial: " + RedactedString(...)` читают внутренний C-буфер `PyUnicodeObject` напрямую, полностью игнорируя переопределённый `__str__`. Кроме того, `ContractModel.model_dump()` (в режиме `mode="python"`) возвращает словарь с экземплярами `RedactedString`, которые проходят `isinstance(x, str)` и сериализуются через `json.dumps()` открытым текстом.
+- **Что сделать:**
+  1. Убрать базовый класс `str`: объявить `class RedactedString:` со `__slots__ = ("_value",)` и приватным атрибутом `_value: str`.
+  2. В `__init__(self, value: str | RedactedString) -> None`: принимать `str` либо уже созданный `RedactedString` (копируя `value._value`); на любой другой тип выбрасывать `TypeError`.
+  3. Сохранить методы `.expose(self) -> str` и `.to_wire(self) -> str`, возвращающие сырой `self._value`.
+  4. Реализовать `__str__`, `__repr__`, `__format__` (только через `self._mask(self._value)`), а также `__len__`, `__bool__`, `__hash__` и `__eq__` (`True` только при сравнении с другим `RedactedString` с тем же `_value`; сравнение с голым `str` должно возвращать `False`, чтобы исключить неявные проверки сырых строк).
+  5. Обновить `__get_pydantic_core_schema__`: использовать `core_schema.union_schema([core_schema.is_instance_schema(cls), core_schema.no_info_after_validator_function(cls, core_schema.str_schema())], serialization=core_schema.plain_serializer_function_ser_schema(lambda v: v.to_wire(), return_schema=core_schema.str_schema(), when_used="json"))`.
+     - Поведение после правки: `model_dump_json()` и `model_dump(mode="json")` отдают сырое значение для сокета; `safe_dump()` / `to_log_dict()` отдают маскированные строки; случайный `json.dumps(redacted)` или `"x" + redacted` падает с `TypeError` (fail-closed).
+
+---
+
+### Задача 2 [CRITICAL, `CODING_HAZARDS` Rule 4] — Добавить In-Memory Transactional Outbox в `LineManager`
+- **Локация:** `src/phonebridge/domain/contract.py` (`LineManager`, `__all__`).
+- **Суть дефекта:**
+  1. Ядро определяет 9 типов доменных событий (`EventEnvelope`), но методы `acquire`, `cancel_acquire`, `release`, `hangup`, `note_provider_liveness`, `ingest_call_state`, `ingest_audio_ready`, `drop_session`, `tick` и `LineAdminKernel.revoke_assignment` не имеют возвращаемого канала для эмиссии событий в `EventBus`.
+  2. Методы `dial`, `accept`, `hangup`, `send_dtmf`, `drop_session` (dead-man switch), `tick` (таймауты и `reject`-фоллбэк) и `revoke_assignment` обязаны инициировать отправку команд `line.*` в сторону `LineProvider`, однако `CODING_HAZARDS` Rule 4 запрещает сетевой `await` внутри критической секции мутации состояния, а этап M1 требует чистый in-memory `LineManager` без I/O.
+- **Что сделать:**
+  1. Определить 5 типизированных моделей команд провайдера (наследники `ContractModel`) в соответствии с разделом `Manager → Line — line.*` в `docs/api-contract.md`:
+     - `ProviderDialCommand`: `command: Literal["line.dial"] = "line.dial"`, `line_id: LineId`, `assignment_id: AssignmentId`, `lease_id: LeaseId`, `number: RedactedString`, `media_endpoint: str`, `media_token: MediaToken`.
+     - `ProviderAnswerCommand`: `command: Literal["line.answer"] = "line.answer"`, `line_id: LineId`, `assignment_id: AssignmentId`, `lease_id: LeaseId`, `call_token: CallToken`, `media_endpoint: str`, `media_token: MediaToken`.
+     - `ProviderHangupCommand`: `command: Literal["line.hangup"] = "line.hangup"`, `line_id: LineId`, `assignment_id: AssignmentId`, `lease_id: LeaseId`.
+     - `ProviderSendDtmfCommand`: `command: Literal["line.send_dtmf"] = "line.send_dtmf"`, `line_id: LineId`, `assignment_id: AssignmentId`, `lease_id: LeaseId`, `digits: str`.
+     - `ProviderRevokeCommand`: `command: Literal["line.revoke"] = "line.revoke"`, `line_id: LineId`, `assignment_id: AssignmentId`.
+     - Объединить их в дискриминированный union: `ProviderCommand = Annotated[ProviderDialCommand | ProviderAnswerCommand | ProviderHangupCommand | ProviderSendDtmfCommand | ProviderRevokeCommand, Field(discriminator="command")]`.
+  2. Добавить в `LineManager` два синхронных абстрактных метода вычитки Outbox:
+     - `@abstractmethod def drain_events(self) -> list[EventEnvelope[Any]]: ...` — атомарно возвращает и очищает накопленные события в порядке их возникновения.
+     - `@abstractmethod def drain_provider_commands(self) -> list[ProviderCommand]: ...` — атомарно возвращает и очищает накопленные команды `line.*` в порядке FIFO.
+  3. Зафиксировать в docstring `ingest_ring()` и `drain_events()` единое правило против дублирования: **все** события (включая `IncomingCallEvent` при `ingest_ring`) попадают в очередь `drain_events()`; возвращаемый из `ingest_ring` объект `IncomingCallEvent` является тем же экземпляром для удобства вызывающего кода, а `EventBus` обязан публиковать события исключительно из `drain_events()`.
+  4. Экспортировать все новые типы в `__all__`.
+
+---
+
+### Задача 3 [CRITICAL, Domain Modeling] — Разделить `ProviderBinding` и `LineAssignment`
+- **Локация:** `src/phonebridge/domain/contract.py`, `docs/api-contract.md`, `docs/phone-bridge-service-design.md` (§4.2).
+- **Суть дефекта:** Сейчас `LineAssignment` одновременно описывает: (а) привязку процесса `LineProvider` к шлюзу (`provider.register` → `assignment_id`, `provider.ping`, `line.revoke`) и (б) эксклюзивное владение линией AI-агентом (`approve_claim` → `LineAssignment(mode=EXCLUSIVE, owner_agent_id=...)`, `admin.revoke_assignment`). Из-за этого:
+  - Невозможно отозвать эксклюзивное право у агента через `admin.revoke_assignment`, не оборвав регистрацию самого `LineProvider`.
+  - Перерегистрация/перевыпуск `LineProvider` конфликтует с существующим эксклюзивным `LineAssignment` агента.
+- **Что сделать:**
+  1. Добавить модель `ProviderBinding(ContractModel)` в `contract.py`:
+     - Поля: `assignment_id: AssignmentId` (идентификатор сессии/канала провайдера), `line_id: LineId`, `caps: list[Intent]`, `profile: str | None = None`, `liveness: LivenessState = LivenessState.REACHABLE`, `connected_at: AwareDatetime`, `last_seen_at: AwareDatetime`, `orphan_deadline_at: AwareDatetime | None = None`.
+  2. Изменить возвращаемый тип `LineManager.register_provider(self, registration: ProviderRegistration) -> ProviderBinding` (в docstring указать, что при первой регистрации новой `line_id` ядро также инициализирует дефолтную `LineAssignment(mode=SHARED_POOL, owner_agent_id=None)`, если для линии ещё нет записи политики/владения).
+  3. Уточнить контракт `LineAdminKernel.revoke_assignment(self, assignment_id: AssignmentId, reason: str | None = None) -> None`:
+     - Если `assignment_id` принадлежит `LineAssignment` (эксклюзивный владелец-агент) — сбрасывает линию обратно в `SHARED_POOL` (`owner_agent_id=None`) и помещает в outbox `AssignmentRevokedEvent` для сессий бывшего владельца, не затрагивая `ProviderBinding`.
+     - Если `assignment_id` принадлежит `ProviderBinding` — отзывает регистрацию провайдера и помещает в outbox `ProviderRevokeCommand` (`line.revoke`), сохраняя `LineAssignment` агента-владельца (линия переходит в `DOWN`).
+  4. Отразить разделение двух областей `assignment_id` в `docs/api-contract.md` (секции `Identifier taxonomy` и `Admin surface`) и `docs/phone-bridge-service-design.md` (§4.2).
+
+---
+
+### Задача 4 [HIGH, State Machine & `CODING_HAZARDS` Rule 7] — Ввести `CallPhase.ACQUIRED`, TTL на синхронный грант и маппинг фаз на провод
+- **Локация:** `src/phonebridge/domain/contract.py`, `docs/api-contract.md`, `tests/test_domain_contract.py`.
+- **Суть дефекта:**
+  1. `CallLease.phase` по умолчанию равен `CallPhase.DIALING` сразу после `acquire()`. Ядро не может отличить «линия выдана, но `call.dial` ещё не вызван» (где разрешён первый `dial()` и разрешено вытеснение входящим звонком `preempted_by_incoming` по Round 19) от «звонок уже набирается на телефоне» (где повторный `dial()` запрещён, а входящий звонок не должен вытеснять активный набор).
+  2. Отложенный грант из очереди (`QueueReadyEvent`) имеет `expires_at` (`grant_ttl`), а синхронный грант `AcquireGranted` — не имеет! Подключённый агент может вызвать `call.acquire` и удерживать линию вечно, не вызывая `call.dial` (нарушение Rule 7).
+  3. В `CallPhase` есть внутренние фазы (`acquired`, `ringing`, `terminating`, `ended`), а в проволочном `event.call_state_changed.state` допустимы только `dialing | alerting | active | disconnected`. В коде нет канонической таблицы отображения и теста на отсутствие рассинхрона.
+- **Что сделать:**
+  1. Добавить `ACQUIRED = "acquired"` в `CallPhase`. В `CallLease` установить дефолт `phase: CallPhase = CallPhase.ACQUIRED` и добавить поле `grant_expires_at: AwareDatetime | None = None`.
+  2. Добавить поле `expires_at: AwareDatetime` в `AcquireGranted`. В `docs/api-contract.md` обновить возвращаемое значение `call.acquire` (`{granted: true, line_id, lease_id, expires_at}`) и payload `event.line_acquired` (`{session_id, line_id, lease_id, intent, expires_at}`), указав, что если агент не вызовет `call.dial` до `expires_at`, `tick(now)` отзывает лиз с `event.call_state_changed{state: "disconnected", reason: "grant_ttl_expired"}` и передаёт линию следующему билету в очереди.
+  3. Добавить в `contract.py` тип `WireCallState = Literal["dialing", "alerting", "active", "disconnected"]` и константу `CALL_PHASE_WIRE_STATES: dict[CallPhase, WireCallState | None]`:
+     - `ACQUIRED -> None`, `RINGING -> None`, `TERMINATING -> None`,
+     - `DIALING -> "dialing"`, `ALERTING -> "alerting"`, `ACTIVE -> "active"`, `ENDED -> "disconnected"`.
+
+---
+
+### Задача 5 [HIGH, API & Error Codes] — Исправить идемпотентность `acquire()` для мульти-звонковых агентов и убрать перегрузку `STALE_TOKEN`
+- **Локация:** `src/phonebridge/domain/contract.py`, `docs/api-contract.md`.
+- **Суть дефекта:**
+  1. Один агент держит одно соединение (`session_id`). Для `outbound_campaign`-агента, запускающего 2+ параллельных звонка, вызовы `acquire(session_id, Intent.DIAL_OUT, enqueue=True)` имеют идентичные параметры. Текущее требование docstring *"identical retry while queued returns the SAME ticket"* склеит независимые звонки в один билет.
+  2. Из-за отсутствия кодов состояния/ресурсов в `ErrorCode` ошибки фазы звонка (повторный `dial`, `send_dtmf` без активного вызова) и переполнение очереди (`QUEUE_FULL`) маскировались под `STALE_TOKEN`.
+- **Что сделать:**
+  1. Добавить опциональный keyword-параметр `idempotency_key: str | None = None` в `LineManager.acquire(...)` и поле `idempotency_key: str | None = None` в `QueueTicket` (а также `idempotency_key?` в описание `call.acquire` в `docs/api-contract.md`). Уточнить: дедупликация ретраев срабатывает **только** при совпадении непустого `(session_id, idempotency_key)`; вызовы без `idempotency_key` создают отдельные билеты/гранты (в пределах пер-сессионного лимита).
+  2. Синхронно добавить в таблицу `## Error codes` (`docs/api-contract.md`) и в enum `ErrorCode` (`contract.py`) три кода:
+     - `INVALID_STATE` — операция недопустима в текущей фазе звонка/линии (повторный `dial`, `send_dtmf` вне `ACTIVE`, `approve_claim` уже закрытой заявки).
+     - `INVALID_ARGUMENT` — невалидные входные параметры вне номера набора (например, невалидная строка `digits` в `send_dtmf`, пустой набор `intents`).
+     - `RESOURCE_EXHAUSTED` — превышен лимит очереди или пер-сессионный лимит билетов/лизов.
+  3. Добавить в `ErrorReason` подкоды: `GRANT_TTL_EXPIRED`, `SESSION_LIMIT_EXCEEDED`, `CLAIM_NOT_FOUND`, `INVALID_DTMF`. Обновить docstrings в `contract.py`, заменив некорректные отсылки к `STALE_TOKEN` на `INVALID_STATE` / `INVALID_ARGUMENT` / `RESOURCE_EXHAUSTED`.
+
+---
+
+### Задача 6 [HIGH, Hardware Protocol] — Защитить `media-UDP` через `session_nonce` и уточнить `0x16 SCO_STATE` для USB `altsetting`
+- **Локация:** `docs/hci-agent.md` (§2 `Control channel — TCP`, `Media channel — UDP`).
+- **Суть дефекта:**
+  1. UDP-датаграммы (`0x03 SCO`, `0x04 MEDIA_PING`) не несут привязки к текущей TCP-сессии управления. После ресета по `CTRL_DESYNC` опоздавшие UDP-пакеты старой сессии попадают в новую сессию, а `MEDIA_PING` при смене NAT-порта не подтверждает знание текущей сессии.
+  2. Команда `0x16 SCO_STATE {open: bool, packet_len}` недостаточна для выбора USB `bAlternateSetting` на Interface 1: согласно Bluetooth Core Spec Vol 4 Part B §2.1.1 выбор altsetting (1..6) зависит от режима кодирования воздуха (`CVSD` vs прозрачный `mSBC`) и длины RX/TX пакетов.
+- **Что сделать в `docs/hci-agent.md`:**
+  1. В `0x11 HELLO_ACK` добавить поле `session_nonce` (`uint32`, криптостойкое случайное число на время жизни TCP-сессии).
+  2. Обновить заголовок `Media channel — UDP` до 11 байт: `uint8 kind · uint32 BE session_nonce · uint16 BE media_seq · uint32 BE ts_ms · payload`. Указать, что `vhci-feeder` отбрасывает датаграммы с чужим `session_nonce` (счётчик телеметрии `SCO_SESSION_MISMATCH`) и обновляет обратный адрес uplink по `0x04 MEDIA_PING` только при совпадении и туннельного пира, и `session_nonce`.
+  3. Обновить payload `0x16 SCO_STATE` на `{open: bool, air_mode: "cvsd" | "msbc_transparent", rx_pkt_len: uint16, tx_pkt_len: uint16}` (извлекается `vhci-feeder`-ом из события `Synchronous Connection Complete 0x2c`, поле `Air_Mode`: `0x03` → `"msbc_transparent"`, иначе `"cvsd"`; при `open: false` длины равны `0`). Описать выбор минимального подходящего `bAlternateSetting` по дескрипторам USB Interface 1 донгла.
+
+---
+
+### Задача 7 [HIGH, Media & Audio Plane] — Ограничения DTMF, подавление речи при синтезе DTMF и приоритетный `0x02 flush`
+- **Локация:** `src/phonebridge/domain/contract.py`, `docs/api-contract.md`, `docs/phone-bridge-service-design.md` (§5.5, §6.4).
+- **Суть дефекта:**
+  1. Поскольку `SendTones` в PipeWire сломан и DTMF синтезируется in-band в uplink PCM, аддитивное смешивание тонов с идущей речью TTS агента вызывает клиппинг `int16` и срывает детекцию Goertzel на стороне IVR. Кроме того, длина строки `digits` в `send_dtmf` не ограничена (риск забивания очереди тонов на минуты, Rule 7).
+  2. В `MediaRouter` кольцевой буфер вмещает ~500 фреймов (10 с). Если агент сбросил пачку TTS на 5 секунд вперёд и человек перебил его (barge-in), обычный in-band кадр `0x02 flush`, вставший в хвост очереди, сработает только через 5 секунд.
+- **Что сделать:**
+  1. В `contract.py` добавить константы `MAX_DTMF_DIGITS: int = 32` и `DTMF_PATTERN: re.Pattern[str] = re.compile(r"^[0-9A-D*#,wW]{1,32}$")` (экспортировать в `__all__`, сослаться в docstring `LineManager.send_dtmf`: нарушение → `INVALID_ARGUMENT` + `ErrorReason.INVALID_DTMF`).
+  2. В `docs/api-contract.md` (`call.send_dtmf`) и `docs/phone-bridge-service-design.md` (§6.4) зафиксировать: на время воспроизведения очереди синтезированных DTMF-тонов (например, 70 мс тон + 50 мс пауза, `,`/`w` = 500 мс паузы) `LineProvider` **замещает (приглушает / mute)** входящий агентский PCM-аудиопоток, а не суммирует их.
+  3. В `docs/api-contract.md` (`Binary media protocol` п. 2–3) зафиксировать приоритетную семантику `0x02 flush`: при получении фрейма с флагом `0x02` `MediaRouter` **немедленно очищает** все буферизованные `0x01` аудиофреймы данного направления для `lease_id` и ставит `0x02` в голову отправки провайдеру, чтобы `LineProvider` сбросил свой локальный буфер PipeWire на ближайшем 20-мс тике.
+
+---
+
+### Задача 8 [MEDIUM, Resilience] — Устранить противоречие между немедленным `hangup` и `10 s orphan_grace`
+- **Локация:** `docs/phone-bridge-service-design.md` (§2.2, §5.4), `docs/api-contract.md` (`provider.reregister`).
+- **Суть дефекта:** В §2.2 одновременно сказано *"In-flight call on provider drop = treated as hangup"* и тут же *"orphaned agent leases get a 10 s grace window to re-bind"*. Если звонок сразу сброшен как `hangup`, перепривязывать через 10 с уже нечего.
+- **Что сделать:** Чётко развести два уровня отказа в обоих документах:
+  1. **Обрыв WS-соединения контейнерного процесса `LineProvider` (при живых `vhci`, `bluetoothd` и звонке на телефоне):** линия переходит в `DEGRADED`, активный `CallLease` переходит в 10-секундное окно `orphan_grace` (`ProviderBinding.orphan_deadline_at = now + 10s`). Если `provider.reregister` приходит в пределах 10 с и его `state_snapshot` подтверждает живой звонок на D-Bus, лиз бесшовно перепривязывается; если 10 с истекли в `tick(now)` или звонка на шине уже нет — лиз завершается (`ENDED`, `reason="provider_lost"`).
+  2. **Падение туннеля / USB на `hci-agent`:** `vhci-feeder` закрывает `/dev/vhci` → `bluetoothd` и PipeWire мгновенно удаляют адаптер и звонок → `LineProvider` штатно шлёт `provider.call_state{state: "disconnected", reason: "dongle_lost"}` → звонок завершается немедленно без 10-секундного ожидания.
+
+---
+
+### Задача 9 [MEDIUM, Container & Runtime Hygiene] — Развести `system` / `session` D-Bus в контейнере и защитить `tick(now)` в рантайме
+- **Локация:** `src/phonebridge/domain/contract.py`, `docs/phone-bridge-service-design.md` (§2.1, §9, §10).
+- **Суть дефекта:**
+  1. `bluetoothd` работает на **system D-Bus**, тогда как `PipeWire` + `WirePlumber` (`org.pipewire.Telephony`) требуют **session D-Bus** и `XDG_RUNTIME_DIR`. Без явной фиксации двух шин и разделения UID в контейнере либо `PipeWire` запускается от `root`, либо `LineProvider` получает `ServiceUnknown`. Кроме того, рестарт общего `pipewire`/`bluetoothd` может оставить зависшие лизы в `LineManager`.
+  2. В `LineManager.tick(self, now: AwareDatetime)` аннотация `AwareDatetime` не проверяется Pydantic-ом при обычном вызове метода в Python (`CODING_HAZARDS` Rule 6).
+- **Что сделать:**
+  1. В `contract.py` переименовать `_require_aware_utc` в публичную функцию `ensure_aware_utc(value: datetime) -> datetime` (с проверкой `isinstance(value, datetime)`), экспортировать в `__all__` и обязать в docstring `LineManager.tick(now)` вызывать `now = ensure_aware_utc(now)` первой строкой любой реализации.
+  2. В `docs/phone-bridge-service-design.md` (§2.1 и §9) зафиксировать:
+     - Границу привилегий внутри контейнера: доступ к `/dev/vhci` и `CAP_NET_ADMIN` имеют только туннель и процессы `vhci-feeder`; `bluetoothd` работает на `system` D-Bus; `pipewire`, `wireplumber`, `LineProvider ×N` и `gateway` работают под непривилегированным пользователем `phonebridge` с общим `XDG_RUNTIME_DIR` и выделенным `session` D-Bus (с D-Bus-политикой на доступ UID `phonebridge` к `org.bluez` на `system` шине).
+     - Протокол сверки при рестарте общих демонов: при переподключении к D-Bus или смене владельца имени `org.pipewire.Telephony` / `org.bluez` каждый `LineProvider` обязан выполнить полную сверку через `GetCalls()` и отправить `provider.call_state{state: "disconnected", reason: "stack_restart"}` для всех исчезнувших звонков.
+
+---
+
+### Задача 10 [MEDIUM, Dependencies & Roadmap] — Зафиксировать зависимость `phonenumbers` для M1
+- **Локация:** `docs/phone-bridge-service-design.md` (§13 M1) и (опционально, если разрешено скоупом текущего PR) `pyproject.toml` + `uv.lock`.
+- **Суть дефекта:** Контракт `LineManager.dial(number, country)` и описание M1 требуют валидацию E.164 и типа номера через библиотеку `phonenumbers` уже на этапе M1 (*"pure Python, no I/O"*), но `phonenumbers` отсутствует в `pyproject.toml` и `uv.lock`.
+- **Что сделать:**
+  - Проверить наличие пакета `phonenumbers` в реестре PyPI (`CODING_HAZARDS` Rule 11) и добавить `"phonenumbers>=8.13,<9"` через нативный `uv add "phonenumbers>=8.13,<9"` (чтобы `uv.lock` обновился атомарно с корректными хэшами), **либо** — если текущий PR строго ограничен файлами контракта без смены `uv.lock` — явно прописать добавление `phonenumbers` первым шагом M1 в `docs/phone-bridge-service-design.md` §13 и отразить выбор в секции `DECISIONS` отчёта.
+
+---
+
+## 2. Обязательные тесты в `tests/test_domain_contract.py`
+
+Обновить существующие тесты под новые сигнатуры и добавить проверки (сохраняя конвенцию `ITEM-03.GWT-*` там, где применимо):
+
+1. **Тест защиты `RedactedString` от `json.dumps` и конкатенации (`ITEM-03.GWT-2`):**
+   - `assert not isinstance(RedactedString("+37379012345"), str)`
+   - `pytest.raises(TypeError)` на `json.dumps(RedactedString("+37379012345"))` и `json.dumps(event.model_dump())`.
+   - `pytest.raises(TypeError)` на `"+373" + RedactedString("+37379012345")` и `RedactedString("+37379012345") != "+37379012345"`.
+   - Повторная валидация модели с уже созданным экземпляром `RedactedString` (`IncomingCallEvent(caller=RedactedString(...), ...)`) проходит без ошибок и под `mypy --strict`.
+2. **Drift-тест `test_call_phase_wire_state_parity`:**
+   - Проверяет, что `set(CALL_PHASE_WIRE_STATES.keys()) == set(CallPhase)`.
+   - Парсит строку `event.call_state_changed` в `docs/api-contract.md` и сверяет множество ненулевых значений `CALL_PHASE_WIRE_STATES.values()` с задокументированными проволочными состояниями `{"dialing", "alerting", "active", "disconnected"}`.
+3. **Drift-тест `test_error_codes_match_contract_doc` (`ITEM-03.GWT-3`):**
+   - Должен оставаться зелёным с новыми кодами `INVALID_STATE`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`.
+4. **Тесты Outbox, `ProviderBinding`, `AcquireGranted.expires_at`, `DTMF_PATTERN`, `ensure_aware_utc` и `LineAdminKernel`:**
+   - Проверка сериализации всех 5 вариантов `ProviderCommand` через `TypeAdapter(ProviderCommand)` (и маскирования `number` в `ProviderDialCommand.safe_dump()`).
+   - Обновление `_FakeLineManager` (20 абстрактных методов, включая `drain_events`, `drain_provider_commands`, возврат `ProviderBinding` из `register_provider`, `idempotency_key` в `acquire`, `expires_at` в `AcquireGranted`).
+   - Добавление `_FakeLineAdminKernel(LineAdminKernel)` с полным async-прогоном всех 4 методов (`approve_claim`, `reject_claim`, `revoke_assignment`, `configure_line`).
+   - Проверка `ensure_aware_utc` (отклонение naive `datetime` с `ValueError`, отклонение не-`datetime` с `TypeError`, нормализация `+02:00` к `timezone.utc`).
+   - Проверка `DTMF_PATTERN` (принимает `"123*#ABCD,wW"`, отвергает `""`, `"x"`, `"1" * 33`).
+
+---
+
+## 3. Критерии приёмки и гейты перед отчётом (`Definition of Done`)
+
+Агент обязан лично выполнить в терминале и привести литеральные коды возврата в секции `GATES` отчёта:
+1. `uv run ruff check .` → exit `0`
+2. `uv run ruff format --check .` → exit `0`
+3. `uv run mypy src tests` → exit `0` (режим `strict = true` с плагином `pydantic.mypy`)
+4. `uv run pytest -m "not e2e"` → exit `0` (включая все `[ITEM-02.GWT-*]` и `[ITEM-03.GWT-*]`)
+5. Если в репозитории есть `./scripts/verify_constraints.sh` (или CI-скрипт проверки `.changes/` и якорей `docs/specs/`) — прогнать его до exit `0`.
+6. Проверить `git status` и `git diff --stat` на отсутствие правок за пределами `may_edit` (особенно в `controller-manager/`).

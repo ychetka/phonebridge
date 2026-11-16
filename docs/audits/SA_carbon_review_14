@@ -1,0 +1,589 @@
+**Analyzing the System**
+
+I'm currently immersed in the audit of `phonebridge-0.0.19`. My paranoid architect persona is fully engaged, scrutinizing every line of code and documentation. I'm taking a very deliberate approach, focusing on potential vulnerabilities and architectural flaws. I've yet to find significant design flaws.
+
+
+**Refining the Output Strategy**
+
+I'm now focusing on the output format; the system's output will be a numbered Russian registry of issues. Each will specify the File/Module and Severity (`Blocker`, `Major`, `Minor`). I must avoid solutions or code. I'm prioritizing completeness. I need to override the existing output structure constraints. I'm focusing on non-obvious problems, edge cases, contradictions, security risks, bottlenecks, and bugs before implementation.
+
+
+**Prioritizing Output Rigor**
+
+I'm now zeroing in on the output's format, strictly adhering to the user's specific Russian instructions for the issue registry: numbered, concise, and focused solely on problems, without solutions. The negative constraints are absolute. I'm prioritizing the inclusion of *all* identified problems (File/Module, Severity: Blocker/Major/Minor), sorted by severity within the numbered list. I must read every single file and understand its purpose.
+
+
+**Systematically Investigating Files**
+
+I am now methodically dissecting the codebase across various critical areas. I'm focusing on the domain contract in conjunction with API and design documentation, hunting for discrepancies. I'm examining state machine transitions, with a particular eye on potential race conditions and queue management. Security is a major concern, so I am scrutinizing PII handling and privilege boundaries. I'm also deep-diving into Bluetooth interactions, media routing, and persistence strategies, paying close attention to edge cases and potential vulnerabilities.
+
+
+**Scrutinizing `contract.py`**
+
+I'm now deep in the weeds with `src/phonebridge/domain/contract.py` and associated tests, focusing on `float` fields. I've discovered a critical vulnerability: Pydantic v2's default `allow_inf_nan=True` allows `float("inf")` to pass validation constraints like `gt=0` and `ge=0.001`, which leads to an unhandled `OverflowError` during conversion in certain calculations. This is a severe issue.
+
+
+**Detecting Unbounded Waits**
+
+I'm now zeroing in on a particularly critical vulnerability related to unbounded wait conditions within the codebase. Specifically, the absence of constraints on float fields, like `accept_window_sec` and `grant_ttl_sec`, permits infinite or extremely large float values to pass validation. This creates potential `OverflowError` exceptions during calculations, essentially introducing unbounded wait states which violate a core coding rule. I must also consider the implications for `idle_revoke_after` in `LineAssignment` and `configure_line`, which has no `gt=timedelta(0)` constraint. I am also investigating whether other potential infinite time values exist.
+
+
+**Uncovering Correlation Gaps**
+
+I've zeroed in on the relationship between `ProviderActiveCall`, `ProviderCallStateUpdate`, and `IncomingRingIngress` during `reregister` and `ping` interactions. There's a glaring disconnect. I've noted that `ProviderActiveCall` is missing `call_token`, which is essential for relating incoming calls to the gateway. This will cause problems down the road. It seems I must hunt down where `call_token` is. I'm now going to explore potential implications.
+
+
+**Unveiling the Disconnect**
+
+I'm now fully focused on the race condition with the Secretary Agent and the Provider's state updates. My primary concern is the `call_token` disconnect. The system sends `event.incoming_call` and wakes the Secretary Agent with the `call_token`, but the Provider's `state_snapshot`, in the event of a disconnect or `ping`, *doesn't* include this critical `call_token`. This disconnect leads to a critical vulnerability: the gateway might misidentify a new incoming call as the old ringing call.
+
+
+**Pinpointing a Critical Hole**
+
+I'm now zeroing in on a race condition involving the Secretary Agent and the Provider's state updates. A `+373...` caller, using `call.accept("tok-1")`, will answer `+999...`, the boss, instead, OR never get a missed call event. I'm also examining `provider.reregister` and the missing `call_token`, which is a serious vulnerability. The gateway might misidentify calls.
+
+
+**Tracing the Critical Flaw**
+
+I'm now tracing the `call_token` flow. If the WebSocket drops *after* the ringing state but *before* the answer/hangup event, the Provider lacks the necessary mapping to the D-Bus call object. This means the gateway will send a `line.answer{..., call_token}` or `line.hangup{assignment_id, call_token}` to the Provider, who *never* received the `call_token`! I must find how the mapping is established, and how that can fail.
+
+
+
+**Analyzing Ring Ingress**
+
+I'm now zeroing in on a critical edge case: the idempotency of `ingest_ring` in relation to caller swaps and call churn. The system may have a major vulnerability as there is a race condition. If Caller A's disconnect message is lost, and Caller B calls immediately, `ingest_ring` might mis-associate the calls due to missing `call_token`.
+
+
+**Tracing External Call**
+
+I am now tracing the `external_call` state machine, focusing on gaps between `contract.py`, `api-contract.md`, and `design.md`. I am primarily concerned about the scenarios where a physical phone dial-out occurs. I have identified a critical gap: When a call is already in progress, the system can transition to "dialing" without a `lease_id` or `call_token`, potentially leading to state inconsistencies. I must check this thoroughly.
+
+
+
+**Investigating Lease Overwrites**
+
+I'm now deep-diving into the `external_call` state machine and lease overwrites. I've found that when a physical handset dials an outbound call while a call lease is active, the system's behavior is undefined. Specifically, it's unclear if the `external_call` overwrites the existing lease, potentially leaving the agent's lease active, leading to significant state inconsistencies. I must check this thoroughly.
+
+
+**Uncovering Lease Conflicts**
+
+I'm now investigating potential lease conflicts during external calls. If a handset call disconnects without a `lease_id` or `call_token`, the system could prematurely free a line. This can lead to serious state inconsistencies. I'm focusing on the interaction between `provider.call_state` and `LineSummary` during `external_call` and `call.acquire` for exclusive lines.
+
+
+**Examining Race Conditions**
+
+I'm now deeply concerned about race conditions during external call operations. Specifically, what happens if `revoke_assignment(provider_binding_id)` is called while an `external_call` is active, or when `WS_DISCONNECTED` expires during an active `external_call`? The `orphan_deadline_at` is only documented for leases! If the provider WS drops during `external_call`, does `register_provider` correctly reset the state? This critical interaction is not specified anywhere, and is now top priority.
+
+\n\n
+**Investigating Compensation Flows**
+
+I'm now focusing on a critical race condition involving `line.dial` and `line.answer`, particularly regarding compensation. If the provider's reply to `line.dial` is not `accepted: true`, the adapter MUST compensate. This is where the vulnerabilities lie. I'm scrutinizing `contract.py:1244-1252`, paying close attention to the bounded deadline and compensation logic with `ingest_call_state`. The code may not guarantee that the lease ends atomically, leading to a state inconsistency.
+
+
+**Tracing Timeout Implications**
+
+I'm now tracing the implications of a 2-second timeout during a dial operation. If the provider is slow to respond, the adapter only reports a disconnected state and does not send a hangup command. This can result in the phone going live while the gateway remains unaware, creating a state inconsistency. I must verify this thoroughly.
+
+
+**Verifying Line State**
+
+I'm now tracing a critical state inconsistency related to a 2-second dial timeout. The phone might stay connected while the gateway believes the line is free, leading to a "ghost call" and potential conflict. The adapter sends a fabricated call state, `ALERTING`/`ACTIVE`, for an already-ended lease. This might occur in an `ingest_call_state` call. I'm focusing on the `contract.py` lease transitions.
+
+
+**Detecting Timing Issues**
+
+I'm now investigating a critical issue: what observed timestamps the adapter puts on fabricated `ProviderCallStateUpdate` events after RPC timeouts.  I'm focusing on the implications of potential clock skew and out-of-order messages in `ingest_call_state` and `note_provider_liveness`. It appears a deduplication bug may allow the phone to live while the gateway remains unaware. I must investigate how `contract.py:1399-1405` handles stale updates.
+
+
+**Pinpointing Observation Inconsistencies**
+
+I'm now focused on the missing `observed_at` field in `provider.call_state`, `provider.ping`, and `provider.register`. The API lacks timestamps on the wire, so the gateway adapter has to stamp it on arrival. I'm investigating how this impacts state transitions and message order, and I'm looking at potential problems with clock skew and deduplication.
+
+
+**Unveiling Clock Skew Risks**
+
+I'm now focused on deduping and clock skew. It appears if `observed_at <= last_observed_at`, a `DISCONNECTED` event may be dropped, leaving an active lease. The API has no timestamps, which is also a problem. I must investigate how the adapter's timestamping impacts state transitions and message ordering to detect possible bugs and other issues. I must also check the API contract.
+
+
+**Clarifying Profile Enforcement**
+
+I'm now investigating a discrepancy between the design documentation and the code regarding the `profile` field in `LineAssignment`. The design implies `profile` exists for display/config, but `LineAssignment` lacks this field. However, `acquire` and `register_intent` use `profile` as a parameter. I must uncover what the `profile` parameter does. I'm focusing on where the code contradicts the design, and what the impact is.
+
+
+**Examining `AcquireRefused`**
+
+I'm now zeroing in on a critical inconsistency in `call.acquire`'s refusal. While `api-contract.md` states `free_lines` should be provided in `AcquireRefused`, I've identified a discrepancy in `contract.py`. The code's behavior doesn't align with the documentation on `free_lines`, making its non-empty state unexplained and possibly erroneous. The code has a problem.
+
+
+**Clarifying Line State**
+
+I'm now investigating a crucial conflict during line acquisition, particularly when a specific `line_id` is busy, but other lines are free. I'm focusing on the behavior of `contract.py:1148`. It is unclear why `AcquireRefused(free_lines=...)` is returned for a BUSY line, but a `PhonebridgeError` with no `free_lines` is raised for a `RINGING_LOCKED` line. I'm scrutinizing `enqueue=True` scenarios with `RINGING_LOCKED` lines for potential state inconsistencies.
+
+
+**Analyzing Line States**
+
+I'm now investigating a critical race condition with ring ingress and outbound call acquisition, specifically with a `RINGING_LOCKED` line. I'm scrutinizing how the system handles `call.acquire` when `enqueue=True` during an inbound call. The expected behavior with pool and exclusive lines is unclear, potentially leading to call queuing or outright failure due to conflicting line states. I'm focusing on the interaction between `contract.py` and the API contract.
+
+
+**Examining `idempotency_key` Lifecycle**
+
+I'm now investigating a critical vulnerability: the lack of `idempotency_key` on `CallLease` creates an exploitable parameter-mismatch issue. The system could be tricked into returning different behavior on retries. I'm focusing on the case where a granted `call.acquire` loses its response. Re-issuing the call with the same `idempotency_key` might lead to inconsistent states, since the initial grant, if successful, does not persist this key. I will check the documentation.
+
+
+**Investigating Ticket Idempotency**
+
+I'm now fully immersed in examining idempotency keys, critical to reliable line acquisition. A single-line scenario shows that retry idempotency is fragile in a single-line scenario: the return of `AcquireRefused` (or `AcquireQueued`) upon immediate retry *breaks* idempotency. I need to also consider what happens when a queued ticket transitions to acquired, just before the retry. I will investigate.
+
+
+**Examining Session Limits**
+
+I'm now investigating potential deadlock scenarios within the queue system and session limits. I'm focusing on scenarios where `event.queue_updated` interacts with `MAX_PENDING_CLAIMS_PER_AGENT` limits. It's unclear how the system handles the interaction of queue events, ticket retention, and per-session limits. I must verify this thoroughly.
+
+
+**Detecting Limit Implications**
+
+I'm now investigating a critical issue related to session limits and queuing. I'm concerned about the lack of defined bounds for `OUTBOX_SOFT_CAP` and other session limits in `contract.py` or the documentation. This could result in deadlock scenarios or unexpected session behavior, particularly concerning the behavior of the `FallbackWorker` and how it interacts with queue events and session limits.
+
+
+**Investigating Fallback Inconsistencies**
+
+I'm now investigating a critical issue with the `FallbackWorker` and how it interacts with the standard agent API. I'm focusing on the implementation of `forward_via_line` and its ability to handle simultaneous inbound fallbacks when constrained by session limits. The default `accept_window_sec` seems insufficient to deal with carrier PSTN/GSM timeout. I'm concerned about operational impossibilities.
+
+
+**Addressing Fallback Timing**
+
+I'm now fully focused on a race condition and timing inconsistencies related to fallback scenarios. The system might mishandle concurrent inbound fallbacks due to insufficient `accept_window_sec`, and the caller on `line-a` might be abruptly disconnected. I am concerned with whether `call.accept` on `line-a` or `call.acquire` on `line-b` is first. This seems like a critical vulnerability.
+
+
+**Uncovering Inbound Fallbacks**
+
+I'm now zeroing in on a critical vulnerability in fallback mechanisms. `configure_line` fails to validate the existence or capabilities of the forwarding line (`line-b`), potentially enabling calls to be forwarded to a non-existent or incapable line. Further, the system may lack checks to ensure a line with `Intent.DIAL_OUT` capability (required for forwarding) isn't revoked by a `provider.capability_update`.
+\n\n
+
+
+**Investigating Deadlocks**
+
+I'm now investigating a critical deadlock condition. If the `FallbackTriggeredEvent` fails to trigger a fallback worker because it's disconnected, the system will hold the line in a `RINGING_LOCKED` state for an extended duration. I'm focusing on the `tick(now)` function to check how it will respond in such a scenario, and I am also investigating the impact of a dead worker in relation to the event bus.
+
+
+**Tracing Fallback Logic**
+
+I'm now tracing the intricacies of fallback decisions, focusing on the interactions between `tick(now)` and `decide_fallback`. It seems that calling `decide_fallback` with an expired `call_token` results in `INVALID_STATE`, but `tick(now)` will handle the fallback internally. The logic seems very complex. I'm investigating how this dual mechanism ensures consistency.
+
+
+**Tracing Queue Fairness**
+
+I'm now tracing the potential fairness issues within the queue, specifically the interaction between immediate grants and queued tickets. I'm scrutinizing scenarios where an immediate grant, due to an exclusive line becoming available, could potentially break the global monotonic sequence, thereby affecting the fairness for other queued calls. I'm focusing on how `preempted_by_incoming` and `grant_ttl_expired` impact this fairness.
+
+
+
+**Examining Queue Precedence**
+
+I am now focused on a contradiction between queue mechanics. A new ticket with `enqueue:true` and an immediate grant, `preempted_by_incoming`, is placed at position 1. This violates the global monotonic sequence, with potentially critical consequences for fairness. I'm investigating how this ordering is defined.
+
+
+**Clarifying Queue Mechanics**
+
+I'm now investigating a critical issue: the behavior of `event.queue_updated{position: 1}` after a grant triggered by preemption. This update conflicts with the sequential guarantees and fairness, violating the FIFO ordering. I've found that the documented `position: 1` is not always accurate; the actual queue position can deviate.
+
+
+**Examining Queue Mechanics**
+
+I'm now investigating the issue with `position` in `event.queue_updated` after a grant from preemption, which affects FIFO ordering. The `position` value after preemption is not always accurate; the actual queue position can deviate, which may affect the global ordering. The global position needs further definition.
+
+
+**Examining Grant Invalidation**
+
+I'm now investigating a critical vulnerability: the lack of invalidation for pending grants. If a `DIAL_OUT` capable line, like `line-A`, is revoked or disabled while a ticket is queued, the grant is *not* revoked. This might cause queued tickets to remain in the FIFO queue indefinitely. I need to determine the lifecycle of all queued tickets.
+
+
+**Detecting Persistent Inconsistencies**
+
+I'm now focused on the persistent state of queued tickets, specifically regarding grants. I am concerned with whether all newly ineligible tickets are canceled upon revocation, because it is unclear. I also need to verify that `LineAdminKernel` properly handles the `assign_line` scenario where a line is busy. I need to know how state transitions function.
+
+
+**Tracing Claim Integrity**
+
+I am now investigating the behavior of `approve_claim` and `configure_line` with exclusive lines. My primary concern is what occurs when multiple agents simultaneously claim the same line or when the moderator configures the line while claims are pending. This may lead to unexpected states or concurrency issues. Specifically, I'm examining how the system handles `claimable=False` during pending claims.
+
+
+**Examining Revocation Persistence**
+
+I'm now zeroing in on a critical vulnerability in `configure_line`'s persistence: `LineAssignment.idle_revoke_after` can be *set* but *not* disabled. Once configured with a `timedelta`, it cannot be reset to `None` without a restart, leading to an unwanted permanent idle revocation. The patch logic in `contract.py:1569-1570` allows only non-None values, making this field effectively "sticky".
+
+
+**Detecting Phantom State**
+
+I'm now investigating the phantom `LineState.RESERVED`, which has no transitions in the code or documentation, and that the exclusive line remains `FREE` in the design document and contract. I have found this is a critical state vulnerability. This invalid state makes the code contradictory. I'm investigating how this critical state affects the overall code, since it appears to be undocumented and contradictory.
+
+
+**Uncovering Reserved State**
+
+I'm now zeroing in on an unhandled state, `RESERVED`, within the `ingest_ring` process. The glare matrix in `contract.py:1379-1396` ignores `RESERVED` entirely. Moreover, the state transition logic in `ingest_ring` doesn't account for `DEGRADED`, despite its mention in the API contract. I am now examining how these undocumented states affect state transitions.
+
+
+**Focusing on Security Risks**
+
+I'm now putting on my Security Architect persona. I'm focusing on security vulnerabilities and potential PII exposure within the system. I'm scrutinizing `RedactedString`, and the `CODING_HAZARDS.md` file. I am also investigating potential gaps within the system. I must check `hci-agent` and all code related to network communication.
+
+
+**Unveiling Timing Side-Channel**
+
+I'm now fully focused on the PII exposure with `RedactedString`. The masking logic leaks significant information for short phone numbers, like Niue and Tokelau, where more than 50% of subscriber data remains visible in plaintext logs. I must verify all lengths. I'm also examining the implications of this leak combined with timestamping, which makes identity narrowing easy.
+
+
+**Investigating Sensitive Information**
+
+I'm now deeply concerned about PII exposure, particularly the timing side channel via `RedactedString` and potentially sensitive phone meta-data within the system. I have found `ProviderRegistration.meta` stores PII without redaction, creating a severe vulnerability. I am now checking all the source code for other such exposures.
+
+
+**Examining Sensitive Logs**
+
+I'm now investigating a critical PII leak through unredacted data within system logs. I discovered the `meta` field within `ProviderRegistration` is logged in plaintext through `safe_dump()`, exposing potentially sensitive information. I'm checking the source for additional unmasked data to identify further vulnerabilities. I am now also going to investigate `hci-agent` and all other D-Bus code.
+
+
+**Detecting Network Namespace Exposure**
+
+I'm now investigating a critical network namespace exposure. The `vhci` device, unlike standard network interfaces, is *not* isolated to the container. It's bound to `init_net` in the host kernel. This contradicts the design intent outlined in `design.md` and `hci-agent.md`, creating a significant security vulnerability.
+
+
+**Verifying Container Isolation**
+
+I am now verifying the critical network namespace isolation breach: `vhci` devices created within the container are not properly isolated, contradicting design documentation. I've found a critical vulnerability; `AF_BLUETOOTH` sockets fail when creating the standard isolated Docker network (default). I will now confirm the host's `bluetoothd` can see and potentially take control of container-created `vhci` devices, creating a serious security risk.
+
+
+**Unveiling Privilege Boundaries**
+
+I'm now zeroing in on a critical privilege escalation vulnerability. The architecture, as documented in `design.md` section 9, involves shared user ID, `XDG_RUNTIME_DIR`, and D-Bus session. My main concern is that these shared resources grant extensive access to the `org.bluez` service, posing a severe security risk. The architecture is flawed.
+
+
+**Assessing Privilege Boundaries**
+
+I'm now fully immersed in the system's privilege boundaries. I'm focusing on the significant security risks associated with the shared user ID (`phonebridge`). My concern is the lack of isolation between the `gateway` and critical components like `LineProvider`, PipeWire, and SQLite. RCE vulnerabilities could lead to D-Bus control, audio eavesdropping, and database access. The architecture seems inherently flawed.
+
+
+**Tracing Adapter Pairing**
+
+I'm now tracing the adapter pairing process to understand how it bypasses admin restrictions. I must examine the logic of the adapter and determine how this bypass might work.
+
+
+**Dissecting Network Protocols**
+
+I'm now tracing the adapter pairing process in the network protocol documents. I have found an unprivileged `vhci-feeder` CANNOT query `wg show wg0`, because it lacks `CAP_NET_ADMIN`. This contrasts with `hci-agent.md`. Also, the `allowed_ips` configuration (`/24`) for the agent host exposes an entire subnet.
+
+
+**Analyzing Media Channel Vulnerabilities**
+
+I'm now investigating the security of the UDP media channel, specifically `session_nonce` and `direct_mtls`. I'm concerned about the lack of replay protection with the 32-bit nonce, and how multiple lines interact with these channels over the WAN, requiring **20 public TCP+UDP ports** on a firewall/NAT. I must verify this thoroughly.
+
+
+**Verifying Security Protocols**
+
+I'm now investigating a crucial security vulnerability: the lack of robust checks for tunnel peers. The system's reliance on fixed IPs within WireGuard tunnels, or a lack of DTLS re-handshake in `direct_mtls` scenarios, opens a door for replay attacks and man-in-the-middle exploits. A malicious actor could spoof or duplicate packets, bypassing the expected "mTLS-bound identity" validation.
+
+
+**Investigating Packet Integrity**
+
+I'm now investigating a critical vulnerability: the absence of replay protection with the `media_seq` in `MEDIA_PING`, which creates a significant risk for the media channel. A delayed packet from an old NAT port can hijack the uplink destination. This is serious.
+
+\n\n
+
+**Uncovering Control Channel Issues**
+
+I'm now investigating the Control Channel TCP framing outlined in `hci-agent.md`. I've identified a vulnerability: the absence of a minimum length check (`MIN_CTRL_FRAME_LEN`) for the TCP frame header, where `len` could be less than the required 4 bytes. This might lead to underflow issues. I'm focusing on HCI ACL packet sizes.
+
+
+**Investigating TCP Deadlock**
+
+I'm now investigating a critical deadlock condition. The `0x12 HEARTBEAT` from the agent may only be inbound, potentially causing liveness issues with the control channel and potentially triggering a `CTRL_DESYNC` event, requiring an active outbound link check. The system may never recover.
+
+
+**Detecting Deadlock Risks**
+
+I'm now investigating a critical deadlock vulnerability within the Heartbeat mechanism. The agent expects heartbeats but the container only acknowledges `HELLO_ACK`. The absence of `HEARTBEAT_ACK` and the one-way nature of heartbeats could lead to undetected dead tunnels, causing liveness issues with the control channel. I must check this thoroughly.
+
+
+**Investigating Connection Handles**
+
+I'm now investigating a protocol bug and reviewing HCI connection handle management, specifically with Bluetooth. My current concern is the handling of both ACL and SCO handles, specifically with the `vhci-feeder` daemon. I'm focusing on HCI SCO handle management.
+
+
+**Examining Handle Disconnects**
+
+I'm now zeroing in on HCI connection handles, specifically the potential for improper SCO handle management in `vhci-feeder`. I must ensure that `Disconnect Complete` events are properly checked to only close the SCO gate if the disconnected handle is the intended SCO handle. I am also investigating error handling, such as control session drops and dongle resets.
+
+
+**Tracing Bluetooth Integration**
+
+I'm now tracing the Bluetooth integration, specifically `vhci` and media handling. I'm focusing on the discrepancy where the system interprets Transparent eSCO as "msbc" without explicitly knowing about mSBC encoding on the HCI SCO interface, as this is undocumented in `hci-agent.md`. I'm concerned about the accuracy of the `SCO_STATE` mapping and implications for proper air mode setting.
+
+
+**Analyzing USB Bluetooth**
+
+I'm now fully immersed in the USB Bluetooth specification to address concerns about HCI SCO packet sizes and the implications of transparent eSCO. Specifically, I'm verifying the system's assumptions about mSBC encoding on the HCI SCO interface. My main focus is on the discrepancy between the theoretical packet sizes and actual data transfer rates in different alt settings, with a focus on determining the implications for proper air mode setting.
+
+
+**Verifying Audio Encoding**
+
+I'm now deep-diving into the USB Bluetooth specification, focusing on audio encoding and transmission. I've discovered a critical vulnerability. The system assumes a particular `altsetting` (6) for eSCO, but most dongles use other settings (1 or 2). This discrepancy could cause issues.
+
+
+
+**Refining Audio Handling**
+
+I'm now zeroing in on a critical audio vulnerability. I've found an HCI SCO payload discrepancy. In CVSD mode, the system erroneously uses `0x55` for silence, causing a massive DC pop. Linear PCM silence should be `0x00`. I must verify this thoroughly for all `air_mode` settings.
+
+
+**Refining Audio Encoding**
+
+I'm now fully immersed in the USB Bluetooth specification, and I am zeroing in on an audio vulnerability. I've found an HCI SCO payload discrepancy. In CVSD mode, silence is not correctly handled. I must also verify the `H2` header rewrite and examine Linux kernel `vhci` and `PipeWire` fragmentation. This is an enormous vulnerability.
+
+
+**Investigating Payload Fragmentation**
+
+I'm now investigating a critical audio vulnerability and focusing on USB dongle `sco_mtu` values. Discrepancies exist between expected and actual packet sizes. This is due to kernel fragmentation and `hci-agent`'s payload rewriting. I must verify `sco_mtu` to prevent corrupted audio. I will investigate all alt settings.
+
+
+**Examining Binary Protocol**
+
+I'm now investigating a critical issue: media framing and in-band DTMF events within the media binary protocol. A race condition and possible stale-audio bug exists between design documents and the API contract regarding the `Flush` command. This requires thorough examination.
+
+
+**Tracing DTMF Implementation**
+
+I'm now fully immersed in the media framing with a focus on in-band DTMF events within the media binary protocol, specifically addressing potential race conditions and a stale-audio bug. I must clarify how the `Flush` command works. I'm scrutinizing `api-contract.md:201`, `contract.py:884-896`, and their combined implications, to verify the agent's actions during and after DTMF transmission and audio.
+
+
+**Examining DTMF Transmission**
+
+I'm now investigating a critical race condition. The media router has no awareness of DTMF; the system is vulnerable when there's concurrent TTS. A `call.send_dtmf` command might return, but not send `flush`. This results in lost TTS audio during and after DTMF.
+
+
+
+**Addressing DTMF Concurrency**
+
+I am now deep in the weeds with DTMF concurrency. The adapter calls `await send_dtmf("1")`, gets `{ok}`, and immediately begins speaking, while the line provider is STILL playing `"1"`. The adapter then sends `0x02` which FLUSHES and deletes the rest. There is NO event to tell the agent when DTMF has finished, so repeated calls may cause issues.
+
+
+**Addressing Media Security**
+
+I am now focused on a critical security flaw in the media authorization process. Specifically, there are no defined limits on the size or connection duration for the pre-authorization WebSocket connection. This creates a risk for resource exhaustion through denial-of-service attacks. I must verify this thoroughly.
+
+
+**Tracing Media Recovery**
+
+I'm now investigating a critical vulnerability: the lack of a reconnectable media token when the LineProvider restarts or reconnects within the `orphan_grace_sec` window. The `provider.reregister` lacks a reconnectable media token, so the system can't re-establish the media stream after `provider.reregister`. This disconnects and drops all calls. I must examine all source code.
+
+
+**Detecting Reconnect Vulnerabilities**
+
+I'm now investigating a major blocker. A disconnected `LineProvider` lacks a media token, so the `MediaRouter` can't re-authenticate. This leaves calls permanently deaf and mute, a critical vulnerability. Additionally, I'm examining the `seq` in the header, since overflows or flushes cause significant jumps in the `seq`, leading to false-positive packet loss on loopback. I am also investigating hazards with event buses and webhooks.
+
+
+**Assessing Webhook Hazards**
+
+I'm now investigating a critical denial-of-service vulnerability and PII exposure via webhooks. I'm scrutinizing webhook configurations via `c_admin` MCP and examining HTTP timeout and retry policies for various event types, particularly focusing on the `caller_id` and `call_token` within `event.incoming_call`. The lack of specified timeouts and retry limits introduces significant risks.
+
+
+**Examining Critical Vulnerabilities**
+
+I'm now investigating a critical denial-of-service vulnerability and PII exposure through the use of webhooks. There appears to be a problem where webhook configurations are configured via `c_admin` MCP. I am scrutinizing HTTP timeout and retry policies, particularly focusing on `caller_id` and `call_token` within `event.incoming_call`. The lack of specified limits introduces significant risks. Additionally, I am going to examine the persistence of dropped files.
+
+
+**Unveiling Code Injection Risks**
+
+I'm now fully focused on a critical code injection vulnerability within the gateway container. The `execve` call with arbitrary user-controlled arguments, such as `argv[0]` to any interpreter, poses a significant remote code execution (RCE) risk. Additionally, the lack of defined limits for child processes and proper signal handling, particularly the incorrect use of `os.killpg`, violates core coding hazard principles. This design leads to potential process leaks.
+
+
+
+**Investigating Inconsistent States**
+
+I'm now zeroing in on a critical inconsistency. If events are dropped without disconnecting the session, the agent's state machine desynchronizes permanently. Specifically, this applies to `event.call_state_changed{state: "disconnected"}` or `event.line_acquired`. I'm concerned about the per-session queue cap and any overflow policy within the `EventBus`.
+
+
+**Uncovering Data Inconsistencies**
+
+I'm now investigating critical data inconsistencies due to potential SQLite failures after kernel mutations. I've noted scenarios such as `SQLITE_FULL`, `SQLITE_IOERR`, and `SQLITE_BUSY` corrupt in-memory states, especially in `AssignmentId` and `AssignmentRevokedEvent`. The kernel in memory says `owner = None (SHARED_POOL)`, while SQLite on disk STILL says `owner = "agent-1" (EXCLUSIVE)`. No rollback occurs in `InMemoryLineManager`!
+
+
+
+**Examining State Persistency**
+
+My focus is now on the implications of the missing `last_seen_at` field in SQLite's `line_assignments` table, as documented in design.md §4.5. This impacts idle revocation timers. A restarted gateway silently resets `last_seen_at`, preventing the offline owner's `event.idle_alert` from triggering across restarts. Persisting `last_seen_at` on every line operation creates SQLite write issues. I need to verify all state.
+
+
+**Unveiling Line Lifecycle**
+
+I am now focused on a critical line lifecycle gap in `LineAdminKernel`. Specifically, I must investigate how new lines are added or decommissioned at runtime, as provisioning is currently limited to boot. I am examining methods like `assign_line` and `configure_line` for runtime addition/removal. The source code does not say! This is a severe vulnerability.
+
+
+**Clarifying Lifecycle Gaps**
+
+I'm now investigating a critical line lifecycle gap in `LineAdminKernel`, specifically, how new lines are added/removed at runtime. I'm focusing on `assign_line` and `configure_line` for runtime additions/removals. Provisioning is limited to boot; the source code is silent. This represents a severe vulnerability.
+
+
+**Investigating Inconsistent Intents**
+
+I'm now investigating a critical intent inconsistency within `call.acquire`'s handling of line capabilities. I've noted a discrepancy regarding how the system handles `INVALID_INTENT` when a line's `caps` are initially empty versus when a provider is unreachable. The documentation's intent conflicts with the code's behavior, leading to potential misinterpretations by the agent about line capabilities. This represents a potentially critical issue.
+
+
+**Addressing Pairing Ambiguity**
+
+I'm now zeroing in on a critical Bluetooth adapter ambiguity. The system's reliance on connected state and the optional `paired_phone_mac` within `design.md` creates a non-deterministic state. If multiple phones pair and auto-connect, the absence of a deterministic error on `len(connected_devices)` greater than 1 makes resolution impossible, leading to ambiguous pairing.
+
+
+**Tracing Node Discrepancies**
+
+I'm now zeroing in on a critical vulnerability. I must understand how PipeWire/WirePlumber normalizes node names, specifically the replacement of colons with underscores in Bluetooth MAC addresses. The naive string interpolation `f"bluez_input.{phone_mac}"` fails, so the current code does not work. This requires a new design to be created.
+
+\n\n
+
+**Uncovering Physical Call Flaws**
+
+I'm now investigating a critical vulnerability in Multiparty/3-Way/Hold call operations. A physical handset can cause a race condition, by placing `external_call` on `held` and dialing a second one. `LineProvider` emits `provider.call_state` without a `lease_id` and `call_token` when Call 1 ends, causing the gateway to mark the line as `FREE` while Call 2 is still `active` on the handset.
+
+\n\n
+**Examining Pairing Race**
+
+I'm now fully focused on a critical race condition regarding the `admin.pair_window`. The persistence and potential race condition described in `hci-agent.md` and `api-contract.md` are a significant risk. I am examining and testing this process.
+
+
+**Probing Potential Bluetooth Issues**
+
+I'm now zeroing in on a critical Bluetooth auto-pairing flaw: the system may allow rogue devices during the `admin.pair_window` due to non-deterministic behavior. I must investigate how the admin verifies and purges rogue pairings, given the absence of dedicated API methods for unpairing and listing paired devices. I am also investigating Bluetooth auto-pairing to verify if any other devices can pair without the admin's knowledge.
+
+
+
+**Validating Error Types**
+
+I'm now investigating a crucial error type vulnerability related to E.164 validation. The `validate_e164_country` function directly raises generic `ValueError` exceptions with plain-text error messages, which are not strongly-typed and are not mapped to specific error codes. This includes the use of `_ISO_ALPHA2_PATTERN`, which validates, but accepts invalid, two-letter country codes like "ZZ" or "XX," leading to unpredictable results down the line.
+
+
+**Refining Validation Logic**
+
+I am now focused on an error type vulnerability within E.164 validation. The current `validate_e164_country` uses a broad `ValueError` and accepts invalid ISO 3166-1 alpha-2 codes. I've noted a misclassification issue and must verify that the error type `COUNTRY_MISMATCH` is reported instead of `UNKNOWN_COUNTRY_CODE`.
+
+
+**Validating Code Behavior**
+
+I'm now investigating a crucial error handling vulnerability stemming from incorrect exception type handling within the codebase. The current implementation of exception checking uses string matching to identify error types, which is a fragile approach. I must verify if there are any `NewTypes` with zero validation constraints and other failures.
+
+
+**Addressing Configuration Corruption**
+
+I'm now investigating critical parsing flaws in wire formats, specifically the `:` delimiter. The code mishandles colon-delimited `line_id` values. The problem manifests in `ForwardViaLineFallback` and PipeWire node naming, potentially corrupting configuration. Also, the handling of an empty string, `owner_agent_id=""`, is invalid.
+
+
+**Investigating Configuration Flaws**
+
+I'm now zeroing in on a critical configuration vulnerability. I've noted that empty `media_token` and `media_endpoint` values can pass validation, as can an empty `channel` in `RecordAndTelegramFallback`, which contrasts with the required `min_length=1` in `AnswerAndAnnounceFallback.announcement_ref`. I must verify all lengths.
+
+
+**Tracing Redaction Inconsistencies**
+
+I'm now investigating potential PII exposure and formatting inconsistencies with `RedactedString`. `model_dump()` keeps the instances intact in Python, but in some scenarios, masked data is used, leading to inconsistent outputs. I am focusing on what may happen if a `ContractModel` subclass has other types, and I need to determine if there are potential serialization errors.
+
+
+
+**Validating Envelope Pitfalls**
+
+I'm now zeroing in on a critical vulnerability within the `EventEnvelope`'s generic payload. I've uncovered that the system lacks validation tying the `name` to `payload` or `audience`. This flaw allows the creation of inconsistent event envelopes, such as an `IDLE_ALERT` event with an incorrect payload or audience.
+
+
+**Addressing Event Inconsistencies**
+
+I am now investigating critical vulnerabilities relating to EventEnvelope consistency and authorization. The system leaks PII via broadcast events, specifically `INCOMING_CALL`, potentially exposing sensitive data. Furthermore, the `EventEnvelope` lacks validation between `name`, `payload`, and `audience`. Specifically, I must investigate how `fallback_call_token` may escalate privileges.
+
+\n\n
+
+**Fixing the Test Suite**
+
+I'm now zeroing in on a critical failure in the testing suite. The tests within `tests/test_tooling_baseline.py`, specifically around line 33, fail. The code does not correctly find the binary with the system call. I will verify how these are called.
+
+
+**Fixing Tooling Issues**
+
+I'm now zeroing in on a critical tooling vulnerability, specifically related to the testing suite within the build. The current integration strategy using subprocesses for `mypy` and `ruff` within `pytest` introduces a performance bottleneck and potential race conditions. I've noted that `pytest` spawns duplicate subprocesses, slowing down the tests.
+
+
+**Examining Documentation Gaps**
+
+I'm now zeroing in on a critical documentation error within `docs/api-contract.md`. I've found that the listed events on lines 162 and 191 in the `provider.call_state` table are inconsistent, as the backtick is incorrectly placed. This documentation flaw could lead to misinterpretations regarding event channels.
+
+
+**Detecting Documentation Flaws**
+
+I'm now investigating a critical documentation flaw within `docs/api-contract.md`. I've found multiple backtick errors within the documentation for `event.call_state_changed`, which lead to parsing issues. The lack of complete specs in `docs/specs/` is problematic. I must also check for inconsistent event coverage across the repository.
+
+
+**Verifying Protocol Implementations**
+
+I'm now zeroing in on a critical protocol implementation issue. I must clarify `gateway.md`, `admin.md`, and the missing state. The system has inconsistent dependencies in `pyproject.toml` and potentially a flawed Python version (which impacts the types in `tick()`).
+
+
+**Refining Architecture Review**
+
+I'm now investigating a key architectural flaw: `agent.register_intent` combines agent ID and token, which risks trusted agent ID spoofing. I must ensure the transport adapter verifies that the agent ID matches the token's subject ID to prevent unauthorized access and potential security breaches. This is critical.
+
+
+**Tracing Intent Integrity**
+
+I am now investigating a critical vulnerability: the absence of proper authentication within `agent.register_intent`, which could lead to agent impersonation. I'm focusing on scenarios where the `subject_id` within the token doesn't match the reported `agent_id` or `system:fallback_worker` is exploited. I will also check the API contract.
+
+
+**Detecting Protocol Timeouts**
+
+I'm now investigating a critical timeout vulnerability within agent heartbeats and line availability. The system's reliance on 2-hour TCP keepalives and a lack of explicit WebSocket ping/pong mechanisms within the agent interface (`:7002/agent`) results in long, undetected line unavailability when an agent silently disconnects. The `provider.register`/`reregister` distinction also has potential bugs.
+
+\n\n
+**Examining Call Registration**
+
+I'm now investigating a critical registration bug within the `api-contract.md:149-155` and `contract.py:1299-1325` interactions. The API clearly defines two distinct registration methods, yet the implementation seems to merge them, potentially causing confusion. I will examine `provider.register` vs `provider.reregister`, and any binding-ID rotation bugs.
+
+
+**Examining Orphaned Leases**
+
+I'm now fully focused on a critical orphan-lease vulnerability, triggered by a `LineProvider` crash and restart within the `orphan_grace_sec` window. The `provider.register` method's interaction with orphaned `CallLease` instances is undefined. Specifically, when `state_snapshot=None`, it's unclear if the system correctly tears down these orphaned leases or preserves them as zombie entries. This is a top priority.
+
+
+**Investigating Lease Failures**
+
+I'm now investigating a critical race condition. A crashed `LineProvider` causes undefined `CallLease` behavior. With `state_snapshot=None`, will the system tear down orphaned leases or preserve them? The code must handle orphaned states.
+
+
+
+**Tracing Race Conditions**
+
+I'm now zeroing in on a race condition involving the WebSocket reconnect. If `reregister` preserves the same `ProviderBinding.assignment_id`, the late `on_close` from Socket #1 could mark Socket #2 as `WS_DISCONNECTED`, because they have the exact same `assignment_id`. The critical interactions are documented in the specification.
+
+\n\n
+
+I'm now immersed in tracing a critical sequence, specifically the `accept_window_sec` in relation to the caller hanging up during a `FallbackTriggered` window, as described in design.md §5.3 and contract.py. If the timeout expires and a fallback is triggered, the worker mints a new `fallback_call_token` that the line provider never learns. The resulting race has severe implications.
+
+
+**Tracing Fallback State**
+
+I'm now tracing a critical state inconsistency related to a caller hanging up during a fallback. The `LineProvider` might report a "disconnected" state with a stale `call_token` while the `FallbackWorker` is attempting to accept the fallback call with a new `call_token`. I must investigate which `call_token` the kernel uses in `ProviderAnswerCommand`.
+
+
+**Tracing Call Disconnects**
+
+I'm now deeply concerned with a significant issue: a missed event due to worker fallback failure. When `accept_window_sec` expires on a worker-policy line, I see either a double `MissedCallEvent` or none at all, depending on whether the system correctly handles token reconciliation in `ProviderAnswerCommand` and `ProviderCallStateUpdate`. This has serious consequences for missed call notifications.
+
+
+**Verifying Voicemail Lifecycle**
+
+I'm now fully immersed in the `MissedCallEvent` and the mysterious `voicemail_ref`. There's a glaring disconnect. I've uncovered that the `FallbackWorker` utilizes the standard agent API. However, the `LineManager` emits a `MissedCallEvent` *before* the fallback is answered. This means `voicemail_ref` is *never* populated. I must verify where and how this state can be set. This is critical.
+
+
+**Examining Voicemail Mismatch**
+
+I'm now fully immersed in the "voicemail\_ref" lifecycle with a focus on `MissedCallEvent`. My concerns center around the fact that there's no way the system can set this state. The `FallbackWorker` utilizes the standard agent API, but it never sets the `voicemail_ref` in `MissedCallEvent`!
+
+
+**Investigating Call State**
+
+I'm now tracing event propagation with `line.call_state_changed`, which is asynchronously pushed to the session. I must focus on the Model Context Protocol and the impact of MCP clients not natively consuming arbitrary JSON-RPC server notifications like event updates for line acquisition, incoming calls, and audio readiness. I need to understand how these updates are handled.
+
+
+

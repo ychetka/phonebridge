@@ -1,0 +1,78 @@
+Ниже представлено ревью актуального среза (`phonebridge` v0.0.8, включая обновлённый `src/phonebridge/domain/contract.py`, тесты `tests/*`, `ruff.toml`, `uv.lock` и спецификацию харнесса `controller-manager/*`).
+
+*(Статический анализ выполнен по тексту файлов среза; локальный запуск `pytest`/`mypy`/`ruff` не производился.)*
+
+---
+
+### 1. Проверка закрытия замечаний прошлых раундов (Rounds 15–16)
+
+Все архитектурные и контрактные замечания из предыдущего ревью **закрыты качественно**:
+* **`src/phonebridge/domain/contract.py`:**
+  * В `LineManager.dial()` добавлен обязательный параметр `country: str`.
+  * В `LineAssignment` добавлен `allowed_number_types` с включением композитного типа `"FIXED_LINE_OR_MOBILE"` (отличная деталь: без него `phonenumbers` отвергал бы обычные мобильные номера США/Канады в зоне NANP `+1`).
+  * В `RedactedString.__get_pydantic_core_schema__` прописан явный JSON-сериализатор (`when_used="json"`), гарантирующий вывод `.to_wire()` в сокет и маскирование во всех остальных режимах.
+  * В `LineManager` добавлены `ingest_audio_ready()` и `drop_session()` (атомарный dead-man switch + очистка сокетных тикетов очереди по Rule 7).
+  * Расширен `EventName`, добавлены модели `AudioReadyEvent`, `FallbackTriggeredEvent`, `LineStateChangedEvent`, `MissedCallEvent`, а также поля `CallStateChangedEvent.answer_confidence` и `FallbackDecision.fallback_call_token`.
+* **Документация (`api-contract.md`, `phone-bridge-service-design.md`, `hci-agent.md`):**
+  * Зафиксирован `MAX_CTRL_FRAME_LEN = 4096` в `docs/hci-agent.md` (§2, Rule 7).
+  * Поле `answer_confidence?` добавлено в `event.call_state_changed`.
+  * Разделы §3.5, §3.6 и §13 в `phone-bridge-service-design.md` синхронизированы с Round 14 и новой топологией `hci-agent` / `vhci-feeder`.
+* **Харнесс (`controller-manager/development-cycle.md` и `harness.md`):**
+  * Тела обоих файлов после заголовка поддерживаются побайтово идентичными, как и требует заголовок `development-cycle.md`.
+
+---
+
+### 2. Находки в тестах и коде (Findings)
+
+#### 🟡 Находка 1 (Test Coverage / AC_MAPPING): Новые методы и модели Round 15 не вызываются в `tests/test_domain_contract.py`
+* **Где:** `phonebridge/tests/test_domain_contract.py`, строки 19–57, 364–393, 515–598.
+* **Суть (`REVIEW_HAZARDS.md` — Verify AC_MAPPING):**
+  1. В `test_line_manager_async_surface()` (строки 515–536) докстринг гласит:
+     `"""Non-e2e async exercise: EVERY abstract method is awaitable and returns its contracted result type (all 18 methods)."""`
+     Проверка `assert set(LineManager.__abstractmethods__) == { ... }` включает `"ingest_audio_ready"` и `"drop_session"`, и они реализованы в `_FakeLineManager` (строки 493–504), **но в теле теста (строки 539–598) вызываются только 16 методов — вызовы `await mgr.ingest_audio_ready(...)` и `await mgr.drop_session(...)` пропущены**.
+  2. Четыре новые модели событий (`AudioReadyEvent`, `FallbackTriggeredEvent`, `LineStateChangedEvent`, `MissedCallEvent`) добавлены в `contract.py`, но даже не импортированы в `tests/test_domain_contract.py` и не проверяются в `test_event_envelope_and_payloads()`.
+  3. Аналогично, дефолт `LineAssignment.allowed_number_types` (включая `"FIXED_LINE_OR_MOBILE"`) и `FallbackDecision.fallback_call_token` нигде не проверяются ассертами.
+* **Как поправить:**
+  * Дописать в конец `test_line_manager_async_surface()`:
+    ```python
+    await mgr.ingest_audio_ready(
+        LineId("line-main"), contract.AssignmentId("asg-1"), result.lease_id
+    )
+    await mgr.drop_session(session)
+    ```
+  * Добавить инстанцирование `AudioReadyEvent`, `FallbackTriggeredEvent`, `LineStateChangedEvent`, `MissedCallEvent` в `test_event_envelope_and_payloads()` и проверку `"FIXED_LINE_OR_MOBILE" in _assignment().allowed_number_types`.
+
+---
+
+#### 🟡 Находка 2 (Domain Contract vs Wire Contract): Отсутствует доменное событие для `event.queue_updated`
+* **Где:** `phonebridge/src/phonebridge/domain/contract.py` (`class EventName`, строки 224–239) vs `phonebridge/docs/api-contract.md` (раздел `APICallService → Agent — event.*`).
+* **Суть:**
+  В `docs/api-contract.md` определены 8 агентских событий `event.*`. Семь из них теперь имеют прямые эквиваленты в `contract.py`, а **`event.queue_updated {session_id, ticket_id, position}` отсутствует** в `EventName` и не имеет модели `QueueUpdatedEvent`.
+* **Почему это важно для M1:**
+  Пересчет позиций в очереди происходит внутри `LineManager` (при `cancel_acquire`, `drop_session`, истечении `grant TTL` в `tick()` или освобождении линии в `release()`). Если в `contract.py` нет `EventName.QUEUE_UPDATED` и `QueueUpdatedEvent`, то in-memory `LineManager` в M1 не сможет типизированно эмитить события продвижения очереди.
+* **Заодно в `QueueReadyEvent` (строки 529–538):**
+  На проводе событие называется `event.line_acquired {session_id, line_id, lease_id, intent}`, а в `QueueReadyEvent` сейчас поля `{ticket_id, lease_id, line_id, expires_at}` — в нем нет `session_id: SessionId` и `intent: Intent`. Если добавить `session_id` и `intent` прямо в `QueueReadyEvent`, транспортному адаптеру в M2 не придется хранить собственную таблицу маппинга `ticket_id -> (session_id, intent)` для отправки `event.line_acquired` в нужный сокет.
+
+---
+
+#### 🟢 Находка 3 (M1 Design Note): Контракт наблюдения за доменными событиями в `LineManager`
+* **Где:** `phonebridge/src/phonebridge/domain/contract.py` (`class LineManager`).
+* **Суть:**
+  В `LineManager` только `ingest_ring()` возвращает событие (`IncomingCallEvent`). Все остальные методы, порождающие события (`ingest_call_state`, `ingest_audio_ready`, `note_provider_liveness`, `release`, `hangup`, `cancel_acquire`, `drop_session`, `tick`), имеют сигнатуру `-> None`.
+* **Рекомендация для реализации M1:**
+  Так как `contract.py` после sign-off становится read-only для исполнителя M1 (`development-cycle.md` §3), в конкретной реализации `InMemoryLineManager.__init__` стоит предусмотреть передачу `event_sink: Callable[[EventEnvelope[Any]], None]` или буфера/очереди событий (`drain_events() -> list[EventEnvelope[Any]]`), чтобы в unit-тестах M1 можно было детерминированно проверять эмиссию `EventEnvelope` при вызовах `tick()`, `drop_session()` и `ingest_*()`.
+
+---
+
+#### 🟢 Находка 4 (Housekeeping): Версия `0.0.8` в `pyproject.toml` vs `[0.0.6]` в `CHANGELOG.md`
+* В `pyproject.toml` и `uv.lock` зафиксирована версия `0.0.8`, а верхняя секция в `CHANGELOG.md` — `## [0.0.6] - 2026-11-13`.
+* Если версии `0.0.7` и `0.0.8` лежат в несложенных фрагментах `.changes/<slug>.md` до вызова `repo_release.sh` (согласно `development-cycle.md` §3 «Версионирование и релизы»), то всё по процессу; если же релиз `0.0.8` уже тегируется, нужно свернуть `.changes` в `CHANGELOG.md`.
+
+---
+
+### Резюме
+
+Код и документация выглядят очень зрело, правила `CODING_HAZARDS.md` (особенно Rules 2, 4, 6, 7, 9, 10) соблюдены тщательно.
+Перед окончательным фризом (`signed_off`) контракта `src/phonebridge/domain/contract.py` рекомендую:
+1. Дополнить `tests/test_domain_contract.py` вызовами `ingest_audio_ready`/`drop_session` и проверками 4 новых моделей событий (Находка 1).
+2. При необходимости тестирования сдвигов очереди в M1 — добавить `QueueUpdatedEvent` (`EventName.QUEUE_UPDATED`) и поле `session_id` в `QueueReadyEvent` (Находка 2).

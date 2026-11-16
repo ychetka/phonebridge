@@ -1,0 +1,103 @@
+Ниже представлена экспертиза актуального среза репозитория (`rounds 11–14` + `docs/hci-agent.md` + `src/phonebridge/domain/contract.py`) по стандартам `CODING_HAZARDS.md` и `REVIEW_HAZARDS.md`.
+
+---
+
+### 1. Общая оценка (Architecture & Code Quality)
+
+Проект совершил качественный скачок от проектной документации к **живому, проверенному на железе дизайну и первому промышленному коду**:
+1. **Переход на модель `hci-agent` + `vhci` (`docs/hci-agent.md`, Rounds 12–13):** Блестящее решение. Вынос физического USB-проброса за пределы контейнера через `libusb` + `vhci` полностью снимает головную боль с пробросом `--device /dev/bus/usb` в Docker, отвязкой хостового `bluetoothd` и зависанием ядерных USB-драйверов. Протокол закален реальным экспериментом (strictly lossless control-TCP с `ctrl_seq` + реассемблинг SCO-пакетов на границе isoc буфера + SCO handle gate `≤ 4` фреймов).
+2. **Учет реального поведения стека (Round 12 Live Probes):** Документация теперь опирается на факты, а не гипотезы: зафиксированы `node.autoconnect=false` против эхо-петли WirePlumber, in-band генерация DTMF взамен сломанного `SendTones` и строгая валидация `E.164` + `country` (ISO alpha-2) через `libphonenumber`.
+3. **Качество `src/phonebridge/domain/contract.py`:**
+   * Безупречное выполнение **Rule 6 (Timezone-explicit timestamps)**: `AwareDatetime` отвергает naive-даты и нормализует всё к UTC.
+   * Образцовое выполнение **Rule 10 (No secrets or PII)**: `RedactedString` маскирует значения в `__str__`, `__repr__` и даже `__format__` (защита от `f"{s:>20}"`), `ContractModel` включает `hide_input_in_errors=True` и `extra="forbid"`, предоставляя `safe_dump()`.
+   * Чистый, детерминированный контракт `LineManager` с единственной точкой входа для времени `tick(now: AwareDatetime)`, что делает M1-тесты на 100% воспроизводимыми без `asyncio.sleep`.
+
+---
+
+### 2. Найденные несостыковки в коде `src/phonebridge/domain/contract.py` (Contract vs Code)
+
+При сверке `src/phonebridge/domain/contract.py` с обновленным `docs/api-contract.md` (Rounds 12 и 14) обнаружены **4 расхождения в сигнатурах и моделях**, которые важно поправить до того, как поверх `contract.py` будет написана реализация M1:
+
+#### 2.1. В `LineManager.dial()` пропущен обязательный параметр `country` (Round 12, issue #25)
+* **В `docs/api-contract.md`:**
+  `call.dial` принимает `{session_id, lease_id, number, country}` и валидирует пару `(number, country)` с выбросом `DIAL_REJECTED` (и подкодами `UNKNOWN_COUNTRY_CODE`, `COUNTRY_MISMATCH`, `UNSUPPORTED_NUMBER_TYPE`). При этом проверка `UNSUPPORTED_NUMBER_TYPE` зависит от `allowed_number_types` конкретной линии (`LineAssignment` / конфига линии в `LineManager`).
+* **В `src/phonebridge/domain/contract.py` (строки 602–604):**
+  ```python
+  @abstractmethod
+  async def dial(
+      self, session_id: SessionId, lease_id: LeaseId, number: RedactedString
+  ) -> DialResult:
+  ```
+* **Почему это важно:** Если `country: str` не передается в `LineManager.dial()`, либо если валидация целиком вынесена в транспортный адаптер до `LineManager`, то адаптер не сможет проверить per-line политику (`UNSUPPORTED_NUMBER_TYPE` и `LINE_POLICY_REJECT`), так как именно `LineManager` знает, к какой `line_id` привязан `lease_id` и какие типы номеров на ней разрешены.
+* **Рекомендация:** Добавить `country: str` в сигнатуру `LineManager.dial(self, session_id: SessionId, lease_id: LeaseId, number: RedactedString, country: str) -> DialResult` и добавить `allowed_number_types` (или `dial_policy`) в конфигурацию линии/ассайнмента.
+
+#### 2.2. Отсутствует метод/событие для `audio_ready` и `fallback_triggered` в `EventName` и `LineManager` (Round 14)
+* **В `docs/api-contract.md` (Round 14):**
+  * Добавлен входящий метод от провайдера `provider.audio_ready {line_id, assignment_id, lease_id}`, который порождает агентское событие `event.audio_ready {lease_id, line_id}`.
+  * Добавлено событие `event.fallback_triggered {line_id, call_token, caller_id?, policy}` для сессии `system:fallback_worker`, а также `event.line_state_changed` и `event.missed_call`.
+* **В `src/phonebridge/domain/contract.py` (строки 218–228):**
+  В `EventName` есть только 4 значения:
+  ```python
+  class EventName(str, Enum):
+      INCOMING_CALL = "incoming_call"
+      CALL_STATE_CHANGED = "call_state_changed"
+      QUEUE_READY = "queue_ready"
+      ASSIGNMENT_REVOKED = "assignment_revoked"
+  ```
+  А в `LineManager` нет метода-ингресса для `provider.audio_ready` (например, `ingest_audio_ready`), и в `FallbackDecision` не возвращается сгенерированный `fallback_call_token` для `FallbackWorker` (там лежит старый `call_token`).
+* **Рекомендация:**
+  1. Расширить `EventName` и модели событий (`AudioReadyEvent`, `FallbackTriggeredEvent`, `LineStateChangedEvent`, `MissedCallEvent`), чтобы ядро M1 могло возвращать/публиковать полный набор доменных событий.
+  2. В `FallbackDecision` добавить поле `fallback_call_token: CallToken | None = None` (заполняется, когда политика относится к классу Worker Policies, чтобы `FallbackWorker` мог вызвать `accept(fallback_call_token)`).
+  3. Добавить `ingest_audio_ready(self, line_id: LineId, assignment_id: AssignmentId, lease_id: LeaseId) -> None` в `LineManager`.
+
+#### 2.3. Отсутствует lifecycle-метод дисконнекта сессии агента в `LineManager`
+* **В спецификации (§3.4 и §5.4) и докстрингах `contract.py`:**
+  Дважды заявлено ключевое правило безопасности ресурсов (**CODING_HAZARDS Rule 7**):
+  * *"Tickets are socket-bound: a disconnected agent's tickets die with the connection."*
+  * *"Dead-man switch: a dead/disconnected agent loses its CallLease and its call is hung up."*
+* **В `src/phonebridge/domain/contract.py` (`class LineManager`):**
+  У `LineManager` есть методы `register_intent() -> SessionId`, `acquire()`, `cancel_acquire()`, `release()`, `hangup()`, но **нет метода уведомления ядра об обрыве сокета агента** (например, `drop_session(self, session_id: SessionId) -> None` или `note_session_closed(...)`).
+* **Почему это важно для M1:** Когда в M2 закроется UDS/WSS соединение агента, транспортному слою нужно будет вызвать один атомарный метод `LineManager`, который убьет все `QueueTicket` этой `session_id` и запустит dead-man switch для всех активных `CallLease` этой сессии. Без этого метода в абстрактном классе `LineManager` его придется дописывать задним числом.
+
+#### 2.4. Поведение `RedactedString` при наследовании от `str` в Pydantic JSON-сериализации (Тонкий момент Python)
+* **Где:** `src/phonebridge/domain/contract.py` (строки 260–316).
+* **Нюанс:** `RedactedString` наследуется от `str` и переопределяет `__str__`, возвращая маску (`"+373****45"`).
+  В Python стандартный `json.dumps()` для подклассов `str` берет сырой C-буфер `PyUnicodeObject` (то есть выдаст полный номер — как и задумано для wire).
+  **Однако `pydantic-core` (Rust serializer)** при вызове `.model_dump_json()` на кастомном подклассе `str`, у которого переопределен `__str__`, в зависимости от режима сериализации схемы может вызвать либо Rust-приведение `as_str()` (сырое значение), либо Python `__str__()`!
+* **Проверка:** Сейчас в `__get_pydantic_core_schema__` написано:
+  ```python
+  return core_schema.no_info_after_validator_function(cls, core_schema.str_schema())
+  ```
+  Так как `serialization` явно не задана в `core_schema`, `pydantic-core` использует дефолтный `Any` сериализатор для результата функции-валидатора, который для подкласса `str` в режиме `json` проверяет `PyUnicode` буфер, но чтобы гарантировать на 100%, что `model_dump_json()` **всегда** отдает `.to_wire()`, лучше явно указать сериализатор в схеме:
+  ```python
+  return core_schema.no_info_after_validator_function(
+      cls,
+      core_schema.str_schema(),
+      serialization=core_schema.plain_serializer_function_ser_schema(
+          lambda v: v.to_wire(),
+          return_schema=core_schema.str_schema(),
+          when_used="json",
+      ),
+  )
+  ```
+  Тогда:
+  * `model.model_dump_json()` → гарантированно вызывает `v.to_wire()` (полный номер в сокет).
+  * `model.safe_dump()` / `str(v)` / `repr(v)` / `f"{v}"` → гарантированно маскирует.
+
+---
+
+### 3. Микро-правки в документации (`CHANGELOG.md` и `docs/hci-agent.md`)
+
+1. **`CHANGELOG.md`:**
+   * Сейчас файл заканчивается версией `[0.0.2] - 2026-11-12` (до Round 10). В нем пока не записаны масштабные изменения из Rounds 11–14, добавление `docs/hci-agent.md` и появление `src/phonebridge/domain/contract.py`.
+2. **`docs/hci-agent.md` (§2, Control channel — TCP):**
+   * В описании заголовка: `uint8 kind · uint16 BE len · uint32 BE ctrl_seq · payload, where len counts ctrl_seq + payload`.
+   * *Маленький совет для реализации:* Поскольку `uint16 BE len` ограничен `65535` байтами (`ctrl_seq` = 4 байта + до `65531` байт payload), этого с огромным запасом хватает для любого HCI ACL/Event пакета (максимальный HCI ACL обычно ≤ 1024 байт) и JSON-сообщений `HELLO`/`STATUS`. Но в парсере TCP-потока стоит явно зафиксировать `MAX_CTRL_FRAME_LEN = 4096` (по **CODING_HAZARDS Rule 7**), чтобы при рассинхроне потока или мусоре в сокете аллокатор не пытался вычитать 64 КБ.
+
+---
+
+### 4. Итоговый вердикт
+
+Проект находится в **отличной инженерной форме**. Архитектура с `hci-agent` → `vhci` и тонкой нарезкой воркеров внутри единого контейнера не только элегантна, но и уже подтверждена живым прогоном (issue #29).
+
+Рекомендую внести 3 дополнения в `src/phonebridge/domain/contract.py` (`country` в `dial()`, метод закрытия сессии `drop_session(session_id)` для dead-man switch и `ingest_audio_ready` / `fallback_call_token`) — и можно переходить к написанию in-memory ядра `LineManager` (Milestone 1).
