@@ -121,6 +121,23 @@ with media. Missed N heartbeats → line health `degraded` → `down` on
 the liveness axis (`event.line_health_changed`; occupancy `LineState`
 is orthogonal — round 25).
 
+**Feeder→kernel liveness mapping (round 27).** The vhci-feeder and
+the LineProvider are sibling processes of the same line bundle; the
+feeder owns the control-channel ground truth and MUST forward it to
+the LineProvider over their bundle-local IPC so the provider can
+report it on the `provider.*` surface: a control-channel heartbeat
+miss (per `heartbeat.interval_ms`/`missed_limit`) or tunnel death
+is converted into the absence/`unreachable` side of the
+`provider.ping` cadence — the kernel's `heartbeat_degraded_after`/
+`heartbeat_down_after` ladder escalates it into
+`event.line_health_changed`; an explicit `STATUS{DONGLE_DEAD}` or a
+fatal `CTRL_DESYNC` is converted into a provider-reported
+`dongle_lost`-class teardown fact (immediate, no orphan grace —
+same consequence as `provider.call_state{reason:"dongle_lost"}`).
+The two ladders stay independent: the agent-side `missed_limit`
+detects transport death faster than the kernel ladder escalates it,
+and the kernel ladder remains authoritative for health events.
+
 **The control channel is strictly lossless.** HCI assumes event and
 ACL delivery with zero loss; a single dropped event (e.g.
 `Synchronous Connection Complete 0x2c`, `Disconnect Complete 0x05`,
@@ -425,11 +442,18 @@ every failure source, because a virtual adapter never wedges the kernel.
   leaked token alone cannot feed a line from a foreign tunnel
   peer. Rotation is an admin operation (`admin` scope) performed
   through the keys DB, not a protocol feature.
-- Feeder socket binding (round 23, capability matrix): the
-  container-side `vhci-feeder` binds its control-TCP listener and
-  media-UDP socket ONLY to the tunnel interface IP (`wg0` for the
-  `wireguard` profile) — never to `0.0.0.0` — so the line surface
-  is unreachable except through the authenticated tunnel.
+- Feeder socket binding (round 23, capability matrix; co-located
+  case round 27): the container-side `vhci-feeder` binds its
+  control-TCP listener and media-UDP socket ONLY to the tunnel
+  interface IP (`wg0` for the `wireguard` profile) — never to
+  `0.0.0.0` — so the line surface is unreachable except through the
+  authenticated tunnel. For a dongle physically co-located with the
+  container (design §2.1 requires it to be served by a host-side
+  hci-agent "exactly like a remote Pi"), the canonical tunnel
+  endpoint is the loopback address `127.0.0.1`: the feeder binds
+  its listener there and the host-local agent dials it — the same
+  authenticated-tunnel rule applies, loopback merely replaces the
+  tunnel interface IP.
 - WireGuard peer isolation (round 18): the container-side server
   config MUST pin each peer to `AllowedIPs = <peer>/32` and MUST NOT
   forward between peers — a compromised agent host must not be able
@@ -438,12 +462,15 @@ every failure source, because a virtual adapter never wedges the kernel.
   server's per-peer `/32` is the isolation boundary.
 - PII hygiene: the agent must not log dialed numbers, caller IDs, or
   HCI payloads containing them (`mask_pii` default on).
-- SSP auto-confirm caveat (round 19): `admin.pair_window` trades the
-  numeric-comparison MITM check for operability — during the open
-  window a nearby hostile device could in principle pair. Mitigation
-  is scope, not crypto: the window is short (default 60 s), bound to
-  ONE adapter, requires an admin-scope token, and the operator is
-  expected to hold the target phone at the prompt. Outside the
-  window the managed `Agent1` rejects unconditionally.
+- SSP auto-confirm caveat (round 19; MAC-scoped since round 27):
+  `admin.pair_window` trades the numeric-comparison MITM check for
+  operability — but ONLY toward the configured target: during the
+  open window the managed `Agent1` auto-confirms SSP solely for the
+  line's `paired_phone_mac`, and every other Bluetooth address —
+  including a nearby hostile device — hits the same unconditional
+  rejection as outside the window. Mitigation for the target itself
+  is scope, not crypto: the window is short (default 60 s), bound
+  to ONE adapter, requires an admin-scope token, and the operator
+  is expected to hold the target phone at the prompt.
 - The agent binds to loopback/WAN only via the tunnel profile; it does
   not expose any local listener.

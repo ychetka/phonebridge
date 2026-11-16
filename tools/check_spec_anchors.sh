@@ -21,19 +21,79 @@
 # lowercase, punctuation dropped, spaces -> hyphens, hyphen/underscore
 # runs kept; duplicate headings get -1/-2 suffixes.
 #
-# Usage: tools/check_spec_anchors.sh   (exit 0 = clean, 1 = violations)
+# Usage: tools/check_spec_anchors.sh [--base <ref>]
+#   (exit 0 = clean, 1 = violations)
+#
+# --base <ref> (round 27, review-17 item 42): when a merge-base ref is
+#   given, fragments that are themselves added or modified in
+#   `git diff --name-only <ref>...HEAD` get an extra check - every
+#   adds/modifies/removes anchor must point at a spec file that also
+#   changed in the same diff, so a "modifies" entry can no longer
+#   point at an untouched requirement. Pending fragments NOT part of
+#   the diff keep the plain existence checks (round 27 fixup): they
+#   live between releases and are folded by a separate release-prep
+#   PR, so an old fragment must not fail a PR that never touched its
+#   spec file. Without --base the existence checks above still apply
+#   (a bare "-" noop remains undeclarable - a script cannot prove no
+#   behavior changed).
 set -euo pipefail
+
+BASE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) BASE="${2:?--base needs a ref}"; shift 2 ;;
+    *) echo "usage: check_spec_anchors.sh [--base <ref>]" >&2; exit 2 ;;
+  esac
+done
 
 TOP=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repo" >&2; exit 1; }
 CHANGES="$TOP/.changes"
 
 [ -d "$CHANGES" ] || { echo "no .changes/ directory - nothing to check"; exit 0; }
 
+CHANGED_PATHS=""
+SPEC_BASE_SET=0
+if [ -n "$BASE" ]; then
+  SPEC_BASE_SET=1
+  if git merge-base "$BASE" HEAD >/dev/null 2>&1; then
+    CHANGED_PATHS=$(git diff --name-only "$BASE...HEAD") \
+      || { echo "cannot diff $BASE...HEAD" >&2; exit 1; }
+  else
+    CHANGED_PATHS=$(git diff --name-only "$BASE" HEAD) \
+      || { echo "cannot diff $BASE HEAD" >&2; exit 1; }
+  fi
+fi
+export CHANGED_PATHS SPEC_BASE_SET
+
 CHANGES_DIR="$CHANGES" TOP_DIR="$TOP" python3 - <<'PYEOF'
 import os, re, sys
 
 changes_dir = os.environ["CHANGES_DIR"]
 top = os.environ["TOP_DIR"]
+# None when --base was not given (existence-only mode); otherwise a
+# possibly EMPTY set of repo-relative paths changed in the diff.
+# The diff is split in two: spec files touched by the PR (the
+# enforced anchor-target set) and fragments themselves added or
+# modified by the PR. The "spec must have changed" rule applies
+# ONLY to fragments inside the diff - pending fragments from
+# earlier rounds live between releases and must not fail a PR that
+# never touched their spec file (round 27 fixup).
+_raw = os.environ.get("CHANGED_PATHS", "")
+changed_paths = (
+    set(_raw.splitlines())
+    if os.environ.get("SPEC_BASE_SET", "0") == "1"
+    else None
+)
+changed_specs = changed_fragments = None
+if changed_paths is not None:
+    changed_specs = {
+        p for p in changed_paths
+        if p.startswith("docs/specs/") and p.endswith(".md")
+    }
+    changed_fragments = {
+        p for p in changed_paths
+        if p.startswith(".changes/") and p.endswith(".md")
+    }
 
 ANCHOR_OPS = ("adds", "modifies", "removes")
 NOOP = {"-", "- none", "none", "- n/a", "n/a"}
@@ -111,6 +171,8 @@ if not files:
 problems = []
 anchor_cache = {}
 for name in files:
+    # repo-relative fragment path, matched against the --base diff set
+    frag_rel = os.path.relpath(os.path.join(changes_dir, name), top)
     entries = parse_impact(os.path.join(changes_dir, name))
     if entries is None:
         problems.append(f"{name}: missing '## Spec impact' section")
@@ -155,6 +217,24 @@ for name in files:
         if op == "removes" and anchor in anchors:
             problems.append(
                 f"{name}: removes anchor '#{anchor}' still present in {spec_rel}"
+            )
+        # --base mode (round 27, review-17 item 42 + fixup): for a
+        # fragment that is itself added or touched by this diff, the
+        # anchored spec file MUST also be part of the PR's spec
+        # delta - an adds/modifies/removes entry pointing at an
+        # untouched spec file is a stale or vacuous declaration.
+        # Fragments outside the diff skip this check entirely: they
+        # are pending entries awaiting the release-prep fold, not
+        # claims this PR makes.
+        if (
+            changed_specs is not None
+            and frag_rel in changed_fragments
+            and spec_rel not in changed_specs
+        ):
+            problems.append(
+                f"{name}: {op} anchor '#{anchor}' targets {spec_rel}, "
+                "which is unchanged in this diff - update the spec or "
+                "drop the anchor"
             )
 
 for p in problems:

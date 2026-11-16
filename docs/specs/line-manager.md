@@ -1,8 +1,9 @@
 # Spec — LineManager contract (Phase-0 freeze)
 
 Normative requirements for `src/phonebridge/domain/contract.py`,
-frozen at round 24 (architect review `SA_carbon_review_13`) ahead of
-implementation milestones M1–M5. Prose sections carry the
+frozen at round 27 (architect reviews `SA_carbon_review_13`,
+`SA_carbon_review_15`, `SA_carbon_review_16`, `SA_carbon_review_17`)
+ahead of implementation milestones M1–M5. Prose sections carry the
 requirements; each is cited by `.changes` fragments via its heading
 anchor (see `docs/specs/README.md`).
 
@@ -95,7 +96,11 @@ same ring as a NEW `incoming_call`.
 overwrite a call fact (a `BUSY` line stays `BUSY` while its
 provider degrades). Provider health lives on the separate
 `LivenessState` axis (`reachable`/`ws_disconnected`/
-`unreachable`), surfaced via `event.line_health_changed`; liveness
+`unreachable`, plus the listing-only `unbound` for a line with no
+provider attached — legal as `event.line_health_changed`
+`old_state` solely on the first-attach `unbound -> reachable`
+transition, never as `new_state` or a reported fact, round 27),
+surfaced via `event.line_health_changed`; liveness
 transitions drive teardown policy (orphan grace vs immediate
 hangup), never occupancy.
 
@@ -105,11 +110,16 @@ hangup), never occupancy.
 `event.claim_resolved{claim_id, line_id, status, assignment_id?,
 reason?}` to the claiming session on approval AND rejection, and on
 approval additionally `event.assignment_granted{assignment_id,
-line_id, mode}` to the new owner — this is the ONLY path delivering
+line_id, mode}` to the new owner — the primary path delivering
 the `assignment_id` an owner needs for
 `call.release{assignment_id}` (an undelivered `assignment_id` makes
 a granted exclusive line un-releasable). `admin.assign_line` grants
-emit `event.assignment_granted` identically.
+emit `event.assignment_granted` identically. Delivery MUST NOT
+depend on the owner having a live session at grant time (round
+27): a pending grant is replayed to an owner session on
+`register_intent`, and `call.get_lines` fills
+`LineSummary.assignment_id` on the owner's own EXCLUSIVE rows as
+the durable read fallback.
 
 ### Requirement: Media credentials are split per role and reissuable (round 25)
 
@@ -117,7 +127,11 @@ emit `event.assignment_granted` identically.
 `provider_media_endpoint` pairs (local UDS vs WAN WSS coexist), and
 the one-shot per-role tokens MUST be reissuable without tearing
 down the call: `line.reattach_media` feeds fresh provider
-credentials to a lease preserved across `provider.reregister`, and
+credentials to a lease preserved across `provider.reregister`,
+`provider.reattach_media` covers the same provider-side reissue
+when the provider's media socket dropped while its control
+channel stayed alive (round 27 — the reregister path cannot cover
+it, it requires a control-socket drop first), and
 `call.reattach_media` feeds fresh agent credentials when the
 agent's media socket dropped while control stayed alive. A burned
 one-shot token MUST never be required twice.
@@ -138,22 +152,29 @@ restart).
 ### Requirement: Queue sequence is minted at acquire ingress (round 25)
 
 A single global monotonic `seq` is allocated to EVERY `call.acquire`
-at ingress — including immediate grants — so a preempted
+at ingress — including immediate grants, refusals, and deduplicated
+retries (round 27; sequence gaps are expected and carry no
+meaning) — so a preempted
 grant-but-undialed lease re-enters the queue head with its ORIGINAL
 sequence and FIFO fairness survives preemption; signed `seq` space
 is not required because every participant already holds a value.
+`position` reported on tickets/`event.queue_updated` is the GLOBAL
+FIFO rank across all eligible tickets — never a per-line rank
+(round 27).
 Server-side ticket removal (exclusivity, provider loss, capability
 removal, claim resolution) MUST emit `event.queue_cancelled` to the
 ticket's session.
 
-### Requirement: Exclusive-line privacy is filtered at the edge (round 25)
+### Requirement: Exclusive-line privacy is filtered at the edge (round 25; routing fixed round 27)
 
 `call.get_lines` MUST omit other agents' EXCLUSIVE lines entirely
 (the claimable pool view is unaffected); `event.line_state_changed`
-for an exclusive line MUST broadcast a redacted `reason` to
-non-owners and deliver the real reason ONLY to the owner's
-session(s) — a shared event bus MUST NOT leak whose private line
-did what.
+and `event.line_health_changed` for an agent-owned EXCLUSIVE line
+MUST be routed ONLY to the owner's `agent` audience plus an
+`admin` copy — broadcast is FORBIDDEN entirely, because even a
+reason-redacted broadcast still leaks the private line's activity
+(supersedes the round-25 broadcast-with-redacted-reason scheme);
+SHARED_POOL lines keep broadcast routing.
 
 ### Requirement: Forwarding policies are loop-safe and bounded (round 25)
 
@@ -202,7 +223,8 @@ write it through to SQLite verbatim, and
 interval negotiated for the current provider session (default
 `5000`, `> 0`), converted from the effective
 `heartbeat_interval_sec` by `heartbeat_interval_ms_from_sec` —
-`round(sec * 1000)` clamped to ≥ 1 ms; `heartbeat_interval_sec`
+nearest millisecond (halves up — `int(sec * 1000 + 0.5)`, round 27;
+Python `round()` is banker's) clamped to ≥ 1 ms; `heartbeat_interval_sec`
 itself is floored at `0.001` s (millisecond granularity, the wire
 unit) on both `LineTimeouts` and `TimeoutConfig`, so a valid config
 can never stamp a zero cadence. A `heartbeat_interval_sec` config
