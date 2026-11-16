@@ -413,7 +413,7 @@ provider clock can neither freeze nor fast-forward the heartbeat
 ladder; a stamp in the PAST is retained VERBATIM as a
 dedupe/ordering key and MUST NEVER feed elapsed-time or liveness
 math (round-28 fix). The normalization MUST be applied through
-the canonical `_clamp_provider_stamp` helper (round 29) so every
+the canonical `clamp_provider_stamp` helper (round 29) so every
 provider-stamp ingress path shares one implementation of the
 rule. Dedup keys are scoped to the binding (round 29): the
 dedupe/ordering key is `(assignment_id, lease_or_call,

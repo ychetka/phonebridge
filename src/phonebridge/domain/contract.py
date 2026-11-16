@@ -89,6 +89,7 @@ __all__ = [
     "MAX_IDEMPOTENCY_KEY_LEN",
     "MAX_LEASES_PER_SESSION",
     "MAX_LINES_TOTAL",
+    "MAX_LIST_PAGE",
     "MAX_PENDING_CLAIMS_PER_AGENT",
     "MAX_PENDING_CLAIMS_TOTAL",
     "MAX_PROFILE_LEN",
@@ -203,6 +204,7 @@ __all__ = [
     "TicketId",
     "TimeoutConfig",
     "WireCallState",
+    "clamp_provider_stamp",
     "ensure_aware_utc",
     "heartbeat_interval_ms_from_sec",
     "is_system_agent_id",
@@ -1228,6 +1230,17 @@ every queue/liveness sweep into unbounded work.
 :meth:`LineAdminKernel.provision_line` MUST reject a provisioning
 attempt beyond this count with ``RESOURCE_EXHAUSTED``."""
 
+MAX_LIST_PAGE: int = 256
+"""Page bound for the shared ``{offset?, limit?}`` window on the
+listing calls (round 29, SA_quant_review_1 slice-B item 1; PR #74
+review): ``call.get_lines``, ``admin.list_lines``,
+``admin.list_leases`` and ``admin.list_tickets`` accept an optional
+``limit`` inside ``1..MAX_LIST_PAGE`` (default ``MAX_LIST_PAGE``)
+and return a stable-ordered slice, so an unbounded listing can
+never overrun the wire's 64 KiB WS-TEXT frame cap at scale. The
+bound is named once here so the wire tables, the kernel signatures
+and the store implementations pin the same number."""
+
 MAX_DETAIL_LEN: int = 256
 """Upper bound on ``ErrorData.detail`` (round 27, review-17 item
 63; rule 7): the human-readable error context is an external
@@ -1282,7 +1295,7 @@ may report a non-strict identity - the bound keeps the value
 bounded without cutting a legal number."""
 
 
-def _clamp_provider_stamp(stamp: datetime, now: datetime) -> datetime:
+def clamp_provider_stamp(stamp: datetime, now: datetime) -> datetime:
     """Canonical advisory-stamp clamp for provider-side timestamps
     (round 29, SA_quant_review_1 slice-A item 4): the ONE place the
     skew rule lives, shared by every provider-fact ingestion path
@@ -4062,7 +4075,7 @@ class ProviderLiveness(ContractModel):
     is normalized to ``now`` at ingestion; a PAST stamp is
     retained VERBATIM as the dedupe key and never feeds
     elapsed-time or liveness math. The normalization itself is the
-    canonical :func:`_clamp_provider_stamp` helper (round 29,
+    canonical :func:`clamp_provider_stamp` helper (round 29,
     SA_quant_review_1 slice-A item 4) - implementations MUST apply
     it verbatim at ingestion rather than re-deriving the rule, so
     this field and
@@ -4199,7 +4212,7 @@ class ProviderCallStateUpdate(ContractModel):
     cannot suspend call-state ordering; a PAST stamp is retained
     VERBATIM as the dedupe key and never feeds elapsed-time
     math. The normalization itself is the canonical
-    :func:`_clamp_provider_stamp` helper (round 29,
+    :func:`clamp_provider_stamp` helper (round 29,
     SA_quant_review_1 slice-A item 4) - the same clamp
     :attr:`ProviderLiveness.checked_at` mandates, so both
     provider-stamp ingress paths share one rule."""
@@ -5034,10 +5047,26 @@ class LineManager(ABC):
 
     @abstractmethod
     async def get_lines(
-        self, session_id: SessionId, intent: Intent | None = None
+        self,
+        session_id: SessionId,
+        intent: Intent | None = None,
+        *,
+        offset: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=1, le=MAX_LIST_PAGE)] = MAX_LIST_PAGE,
     ) -> list[LineSummary]:
         """call.get_lines: pool view filtered by intent. Always bounded
         (rule 7): the line set is finite config, not a stream.
+
+        Bounded pagination (round 29, SA_quant_review_1 slice-B item
+        1; PR #74 review): ``offset``/``limit`` carry the shared wire
+        ``{offset?, limit?}`` window - a negative ``offset`` or a
+        ``limit`` outside ``1..MAX_LIST_PAGE`` is INVALID_ARGUMENT
+        (the ``Field`` bounds reject it at the model boundary). The
+        page is a STABLE-ORDERED slice: rows enumerate in
+        ``line_id`` order, so offset-paging a quiescent listing
+        never skips or repeats a row; a full ``limit``-sized page
+        means "advance ``offset`` by ``limit``", a short page ends
+        the list.
 
         ``intent=Intent.EXCLUSIVE_LINE`` filter semantics (round 24,
         review-13 M3): returns the lines whose
@@ -5284,7 +5313,7 @@ class LineManager(ABC):
         normalized to kernel ``now`` at ingestion - a PAST stamp
         is retained VERBATIM as the dedupe/ordering key and NEVER
         feeds elapsed-time or liveness math. The clamp is applied
-        through :func:`_clamp_provider_stamp` (round 29,
+        through :func:`clamp_provider_stamp` (round 29,
         SA_quant_review_1 slice-A item 4) - the single shared
         implementation of this rule. The binding's
         ``last_seen_at`` is ALWAYS kernel receipt time and every
@@ -5458,7 +5487,7 @@ class LineManager(ABC):
         is retained VERBATIM as the dedupe/ordering key and NEVER
         feeds elapsed-time or liveness math, so deadline
         arithmetic never reads the provider's clock. The clamp is
-        applied through :func:`_clamp_provider_stamp` (round 29,
+        applied through :func:`clamp_provider_stamp` (round 29,
         SA_quant_review_1 slice-A item 4) - the single shared
         implementation of this rule.
 
@@ -6139,32 +6168,58 @@ class LineAdminKernel(ABC):
         ...
 
     @abstractmethod
-    async def list_lines(self) -> list[AdminLineView]:
+    async def list_lines(
+        self,
+        *,
+        offset: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=1, le=MAX_LIST_PAGE)] = MAX_LIST_PAGE,
+    ) -> list[AdminLineView]:
         """Admin read ``admin.list_lines`` (round 27, review-17 item
         3): every configured line as an :class:`AdminLineView` -
         the admin-scoped superset of :class:`LineSummary` carrying
         ``assignment_id``/``owner_agent_id`` and, for a live call,
         ``lease_id`` plus the head ticket's ``queue_position``.
         Bounded by :data:`MAX_LINES_TOTAL` (rule 7 - the line set
-        is finite and now explicitly capped, round 29)."""
+        is finite and now explicitly capped, round 29). Paged by
+        the shared ``{offset?, limit?}`` window (round 29, PR #74
+        review - :data:`MAX_LIST_PAGE`); the stable slice order is
+        ``line_id``."""
         ...
 
     @abstractmethod
-    async def list_leases(self) -> list[CallLease]:
+    async def list_leases(
+        self,
+        *,
+        offset: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=1, le=MAX_LIST_PAGE)] = MAX_LIST_PAGE,
+    ) -> list[CallLease]:
         """Admin read ``admin.list_leases`` (round 27, review-17 item
         3): every live :class:`CallLease` - the objects exist only
         in kernel state, so the kernel surface is the ONLY place
         this listing can come from. Bounded by
-        :data:`MAX_LEASES_PER_SESSION` x live sessions (rule 7)."""
+        :data:`MAX_LEASES_PER_SESSION` x live sessions (rule 7).
+        Paged by the shared ``{offset?, limit?}`` window (round 29,
+        PR #74 review - :data:`MAX_LIST_PAGE`); the stable slice
+        order is ``(created_at, lease_id)`` - :class:`CallLease`
+        carries no ``seq``, so the deterministic pair of mint time
+        plus the unique lease id is the listing order."""
         ...
 
     @abstractmethod
-    async def list_tickets(self) -> list[QueueTicket]:
+    async def list_tickets(
+        self,
+        *,
+        offset: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=1, le=MAX_LIST_PAGE)] = MAX_LIST_PAGE,
+    ) -> list[QueueTicket]:
         """Admin read ``admin.list_tickets`` (round 27, review-17
         item 3): every pending :class:`QueueTicket` in the global
         FIFO - same single-ordering rule as
         :attr:`QueueTicket.seq`; bounded by
-        :data:`MAX_QUEUE_TICKETS_TOTAL` (rule 7)."""
+        :data:`MAX_QUEUE_TICKETS_TOTAL` (rule 7). Paged by the
+        shared ``{offset?, limit?}`` window (round 29, PR #74
+        review - :data:`MAX_LIST_PAGE`); the stable slice order is
+        ``seq`` itself - the mandatory FIFO ordering."""
         ...
 
     @abstractmethod

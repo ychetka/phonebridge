@@ -40,6 +40,7 @@ from phonebridge.domain.contract import (
     MAX_IDEMPOTENCY_KEYS_PER_SESSION,
     MAX_LEASES_PER_SESSION,
     MAX_LINES_TOTAL,
+    MAX_LIST_PAGE,
     MAX_PENDING_CLAIMS_PER_AGENT,
     MAX_PENDING_CLAIMS_TOTAL,
     MAX_PROFILE_LEN,
@@ -1206,7 +1207,12 @@ class _FakeLineManager(LineManager):
         return contract.ClaimResult(claim_id=ClaimId("claim-1"))
 
     async def get_lines(
-        self, session_id: SessionId, intent: Intent | None = None
+        self,
+        session_id: SessionId,
+        intent: Intent | None = None,
+        *,
+        offset: int = 0,
+        limit: int = contract.MAX_LIST_PAGE,
     ) -> list[LineSummary]:
         return [
             LineSummary(
@@ -1695,7 +1701,9 @@ class _FakeLineAdminKernel(LineAdminKernel):
             )
         ]
 
-    async def list_lines(self) -> list[AdminLineView]:
+    async def list_lines(
+        self, *, offset: int = 0, limit: int = contract.MAX_LIST_PAGE
+    ) -> list[AdminLineView]:
         # Round 27 (review-17 item 3): the admin line view exposes
         # the durable/call ids the agent listing hides.
         return [
@@ -1711,7 +1719,9 @@ class _FakeLineAdminKernel(LineAdminKernel):
             )
         ]
 
-    async def list_leases(self) -> list[CallLease]:
+    async def list_leases(
+        self, *, offset: int = 0, limit: int = contract.MAX_LIST_PAGE
+    ) -> list[CallLease]:
         return [
             CallLease(
                 lease_id=LeaseId("l-1"),
@@ -1723,7 +1733,9 @@ class _FakeLineAdminKernel(LineAdminKernel):
             )
         ]
 
-    async def list_tickets(self) -> list[QueueTicket]:
+    async def list_tickets(
+        self, *, offset: int = 0, limit: int = contract.MAX_LIST_PAGE
+    ) -> list[QueueTicket]:
         return [_ticket("t-1", 1)]
 
     async def remove_line(self, line_id: LineId) -> None:
@@ -4564,11 +4576,14 @@ def test_round29_bounds_constants_exported() -> None:
     for name in (
         "MAX_IDEMPOTENCY_KEYS_PER_SESSION",
         "MAX_LINES_TOTAL",
+        "MAX_LIST_PAGE",
         "SNAPSHOT_RECONCILED_PHASES",
+        "clamp_provider_stamp",
     ):
         assert name in contract.__all__
     assert MAX_IDEMPOTENCY_KEYS_PER_SESSION == 256
     assert MAX_LINES_TOTAL == 256
+    assert MAX_LIST_PAGE == 256
 
 
 def test_snapshot_reconciled_phases() -> None:
@@ -4597,24 +4612,24 @@ def test_clamp_provider_stamp() -> None:
     window and every PAST stamp returns verbatim; naive inputs are
     rejected per ``ensure_aware_utc``."""
     far_future = NOW_UTC + timedelta(seconds=MAX_CLOCK_SKEW_SEC + 0.5)
-    assert contract._clamp_provider_stamp(far_future, NOW_UTC) == NOW_UTC
+    assert contract.clamp_provider_stamp(far_future, NOW_UTC) == NOW_UTC
     # The rule is strictly-greater: exactly MAX_CLOCK_SKEW_SEC out
     # is still a verbatim dedupe key.
     at_boundary = NOW_UTC + timedelta(seconds=MAX_CLOCK_SKEW_SEC)
-    assert contract._clamp_provider_stamp(at_boundary, NOW_UTC) == at_boundary
+    assert contract.clamp_provider_stamp(at_boundary, NOW_UTC) == at_boundary
     within = NOW_UTC + timedelta(seconds=MAX_CLOCK_SKEW_SEC - 1)
-    assert contract._clamp_provider_stamp(within, NOW_UTC) == within
+    assert contract.clamp_provider_stamp(within, NOW_UTC) == within
     past = NOW_UTC - timedelta(hours=3)
-    assert contract._clamp_provider_stamp(past, NOW_UTC) == past
+    assert contract.clamp_provider_stamp(past, NOW_UTC) == past
     # Non-UTC aware input normalizes to UTC per ensure_aware_utc.
     plus3 = timezone(timedelta(hours=3))
     foreign = datetime(2026, 11, 13, 15, 0, 30, tzinfo=plus3)  # 12:00:30Z
-    assert contract._clamp_provider_stamp(foreign, NOW_UTC) == NOW_UTC + timedelta(seconds=30)
+    assert contract.clamp_provider_stamp(foreign, NOW_UTC) == NOW_UTC + timedelta(seconds=30)
     # Naive stamps and naive `now` are rejected - rule 6 fail-closed.
     with pytest.raises(ValueError, match="naive"):
-        contract._clamp_provider_stamp(datetime(2026, 11, 13, 12, 0, 0), NOW_UTC)
+        contract.clamp_provider_stamp(datetime(2026, 11, 13, 12, 0, 0), NOW_UTC)
     with pytest.raises(ValueError, match="naive"):
-        contract._clamp_provider_stamp(NOW_UTC, datetime(2026, 11, 13, 12, 0, 0))
+        contract.clamp_provider_stamp(NOW_UTC, datetime(2026, 11, 13, 12, 0, 0))
 
 
 def test_provider_binding_heartbeat_interval_ms_upper_bound() -> None:

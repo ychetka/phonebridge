@@ -12,7 +12,7 @@ dev_summary: >-
   after missed_call declared kernel-internal bookkeeping
   (RINGING_LOCKED stays wire-visible); AnswerAndAnnounceFallback
   eligibility pinned as a decision-time normative requirement;
-  single _clamp_provider_stamp helper unifies advisory-stamp
+  single clamp_provider_stamp helper unifies advisory-stamp
   normalization (only future skew > MAX_CLOCK_SKEW_SEC clamps);
   reregister determinism - always supersedes the current live
   binding (last-writer-wins, racing reregisters resolve
