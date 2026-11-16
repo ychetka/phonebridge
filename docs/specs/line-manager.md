@@ -32,26 +32,45 @@ rejected at `configure_line`.
 
 ### Requirement: Outbox soft-cap pre-flight and drain discipline
 
-Load-creating operations (`acquire`, `dial`, `accept`, `claim_exclusive`)
-MUST check remaining outbox capacity BEFORE mutating state and
-reject with `RESOURCE_EXHAUSTED` when the soft cap would be
-exceeded. Teardown paths (`hangup`, `ingest_call_state`
-disconnected, `drop_session`, `tick`) MUST NEVER raise
-`RESOURCE_EXHAUSTED` — their events append unconditionally, and the
-adapter MUST call `drain_events()`/`drain_provider_commands()`
-after every kernel call.
+The outbox is a TWO-LEVEL bounded model (round 30). Only
+agent-initiated resource-creating operations (`acquire`, `dial`,
+`accept`, `claim_exclusive`) run the soft-cap pre-flight: they MUST
+check remaining outbox capacity BEFORE mutating state and reject
+with `RESOURCE_EXHAUSTED` only when the outbox ALREADY holds >=
+`OUTBOX_SOFT_CAP` (256) entries — the check guards new ingress,
+never a projected fanout. Provider facts, admin mutation cascades,
+event fanout and teardown paths are EXEMPT from the soft cap:
+`hangup`, `release`, `release_assignment`, `drop_session`,
+`ingest_call_state` teardowns, provider-loss, `tick` expiries and
+the admin mutations `revoke_assignment`/`remove_line` (plus their
+lease/claim cascades) MUST never deadlock on the soft cap — they
+are bounded by `OUTBOX_HARD_CAP`
+(`OUTBOX_SOFT_CAP + MAX_SESSIONS_TOTAL + MAX_LINES_TOTAL +
+MAX_SESSIONS_TOTAL * MAX_LEASES_PER_SESSION` = 5120, round 30), the
+final bounded-capacity guard EVERY mutation checks BEFORE
+committing partial state; overflow there is `RESOURCE_EXHAUSTED`.
+`ingest_ring` event fanout is bounded by `MAX_SESSIONS_TOTAL`
+sessions and admin cascades by `MAX_LINES_TOTAL` lines plus the
+live-lease bound. The adapter MUST call
+`drain_events()`/`drain_provider_commands()` after every kernel
+call.
 
 ### Requirement: Saga compensation on line.dial and line.answer
 
 The adapter MUST await the provider's `{accepted}` reply to
-`line.dial`/`line.answer` with a ~2 s deadline. `{accepted:false}`,
-timeout or transport error MUST be fed back as
-`ingest_call_state(DISCONNECTED, NETWORK_ERROR)` so the lease never
-wedges in DIALING. After either compensation the adapter MUST issue
-a best-effort `line.hangup` against the call (round 25): a
-`dial`/`answer` that timed out on the wire may still have executed
-on the modem, and an uncompensated air-side call would outlive its
-lease as a ghost ring.
+`line.dial`/`line.answer` with a ~2 s deadline. On
+`{accepted:false}`, timeout or transport error the adapter MUST
+compensate by calling `hangup()` FIRST (round 30): the
+`ProviderHangupCommand` that call enqueues IS the best-effort
+air-side teardown — a `dial`/`answer` that timed out on the wire
+may still have executed on the modem, and an uncompensated air-side
+call would outlive its lease as a ghost ring — and the lease ends
+atomically with `network_error` so it never wedges in DIALING.
+Synthesizing a `disconnected` `ingest_call_state` fact is
+FORBIDDEN: the provider never reported it, and a fabricated fact
+would confuse dedup; a late provider fact about the ended lease is
+deduplicated through the `_closed_leases` ring afterwards (a
+dedupe/no-op, never `STALE_TOKEN`).
 
 ### Requirement: Idle escalation is alert-only
 
@@ -100,7 +119,21 @@ emitted the interval awaiting `disconnected` or
 `LineState.RINGING_LOCKED` remains the reported state throughout,
 and implementations MUST track the sub-phase in private kernel
 state; the contract deliberately adds no public enum rung or
-field for it.
+field for it. Burned-token edge cases inside the drain (round 30):
+(a) a handset answering during the drain sends `state:"active"`
+correlated by the echoed BURNED `call_token` — the kernel MUST
+transition the line to `BUSY`/`external_call`; the burned ring
+token stays a CORRELATION key for that ring's lifecycle facts
+until the line is FREE and is NEVER an action token; (b) a
+genuinely NEW `ingest_ring` while the drain is pending MUST be
+recorded as the line's `pending_ring` — dedupe is by ring
+identity — and `ingest_ring` during the drain MUST NOT return the
+burned token (it returns `None`); when the drain completes the
+kernel MUST mint a fresh `call_token` and emit a new
+`IncomingCallEvent` for the parked ring; (c) a `disconnected`
+update correlated by the echoed burned ring token ends the
+`external_call` — or the pending drain itself — and MUST return
+the line to `FREE`, never `STALE_TOKEN`.
 
 ### Requirement: Driver methods are kernel-internal (round 29)
 
@@ -200,7 +233,14 @@ that loses a half gets a `MEDIA_PAIR_TTL_SEC` (30 s) re-attach
 deadline for the detached role to re-auth, and the lease MUST end
 with `event.call_state_changed{reason:"network_error"}` when the
 window lapses — a live call never silently loses its audio
-channel.
+channel. The media adapter reports attachment facts through
+`ingest_media_state(lease_id, role, attached)` (round 30): it MUST
+call it with `attached:true` after a successful `media.auth` for
+that role and with `attached:false` when that role's media socket
+closes — a detach arms a fresh `MEDIA_PAIR_TTL_SEC` window, an
+attach disarms it, `MediaAllocator.reissue()` re-arms a fresh
+window from the reissue instant, and `tick()` enforces the lapse
+as the `network_error` teardown above.
 
 ### Requirement: Ring correlation is by line, not by token (round 25)
 
@@ -213,7 +253,15 @@ gateway-minted `call_token` whenever it has one. A
 `state_snapshot` call with `lease_id:null` binds to the line's
 single orphaned lease under the 1:1 ambiguity rule (the provider
 keeps a `/run` state file for exact re-binding after its own
-restart).
+restart) — the uncorrelated shape is legal ONLY when exactly ONE
+orphaned lease or external call exists on the line: zero
+candidates is meaningless and multiple candidates is ambiguous, so
+the kernel MUST reject the fact `INVALID_ARGUMENT` rather than
+guess (round 30). A snapshot element with `state:"ringing"` MUST
+be processed through the `ingest_ring` path — the kernel mints a
+`call_token` for it and returns it inside
+`ProviderRegisterResult.pending_rings` so the adapter can relay it
+to the provider (deduplicated by ring identity, never re-minted).
 
 ### Requirement: Queue sequence is minted at acquire ingress (round 25)
 
@@ -253,6 +301,12 @@ An `acquire(profile?)` label MUST be recorded on the
 `QueueTicket` for a queued acquire, and the `CallLease` minted
 when the ticket is granted MUST inherit the ticket's `profile`
 verbatim — the label survives queueing (round-28 fix).
+`cancel_acquire` is OWNERSHIP-CHECKED like every ID-keyed
+operation (round 30): it MUST look the ticket up and verify
+`session_id` ownership BEFORE idempotent no-op handling — a
+session that never held the ticket gets `OWNER_MISMATCH`
+fail-closed, never a silent no-op — and a ticket id that was
+never queued returns `False`.
 
 ### Requirement: Exclusive-line privacy is filtered at the edge (round 25; routing fixed round 27)
 
@@ -345,7 +399,11 @@ interval negotiated for the current provider session (default
 `heartbeat_interval_sec <= 86400`, round 29), converted from the effective
 `heartbeat_interval_sec` by `heartbeat_interval_ms_from_sec` —
 nearest millisecond (halves up — `int(sec * 1000 + 0.5)`, round 27;
-Python `round()` is banker's) clamped to ≥ 1 ms; `heartbeat_interval_sec`
+Python `round()` is banker's) clamped to ≥ 1 ms — which MUST
+reject a non-real, non-finite or non-positive input (bool, `nan`,
+`inf`, `<= 0`) and any value whose converted interval exceeds the
+named bound `MAX_HEARTBEAT_INTERVAL_MS` (86_400_000, round 30);
+`heartbeat_interval_sec`
 itself is floored at `0.001` s (millisecond granularity, the wire
 unit) on both `LineTimeouts` and `TimeoutConfig`, so a valid config
 can never stamp a zero cadence. A `heartbeat_interval_sec` config
@@ -399,12 +457,25 @@ exits (round-28 fix): the socket-loss axis overrides the
 elapsed-time rung, so a DEGRADED binding that loses its control
 socket still reaches the orphan-grace path; `ws_disconnected`
 remains the ONLY liveness state that grants the orphan grace —
-`degraded` and `unreachable` never arm it.
+`degraded` and `unreachable` never arm it. `unreachable` is
+TERMINAL on the event channel (round 30): an
+`unreachable -> ws_disconnected` `event.line_health_changed` MUST
+never be minted — a dead binding never re-enters the orphan-grace
+state, and a socket-drop fact on an already-UNREACHABLE binding
+maps to no rung change (recovery goes through reregister, not a
+state flip). A stored `ProviderBinding` in `ws_disconnected` MUST
+carry its `orphan_deadline_at` — the state exists precisely to arm
+the grace window — and a `ProviderBinding` MUST never be stored
+with `liveness=unbound` (round 30): `unbound` is a listing-only
+projection for a line with no binding row, never a durable row
+state.
 
 ### Requirement: Provider-side stamps are advisory only (round 28)
 
-`ProviderLiveness.checked_at` and
-`ProviderCallStateUpdate.observed_at` are ADVISORY dedup/ordering
+`ProviderLiveness.checked_at`,
+`ProviderCallStateUpdate.observed_at` and
+`IncomingRingIngress.observed_at` (the third provider-stamp path,
+added to the rule in round 30) are ADVISORY dedup/ordering
 keys on the provider's clock — a same-stamp repeat is a duplicate
 — and MUST NOT be used for deadline arithmetic. ONLY a stamp
 deeper than `MAX_CLOCK_SKEW_SEC` (30 s) into the FUTURE MUST be
@@ -415,15 +486,21 @@ dedupe/ordering key and MUST NEVER feed elapsed-time or liveness
 math (round-28 fix). The normalization MUST be applied through
 the canonical `clamp_provider_stamp` helper (round 29) so every
 provider-stamp ingress path shares one implementation of the
-rule. Dedup keys are scoped to the binding (round 29): the
-`checked_at` liveness stamp dedupes on `(assignment_id,
+rule. Dedup keys are scoped to the LINE (round 30 — the
+binding-scoped rule is superseded): the
+`checked_at` liveness stamp dedupes on `(line_id,
 accepted_stamp)` — a ping carries no call correlator — while the
-`observed_at` call-state stamp dedupes on `(assignment_id,
-lease_or_call, accepted_stamp)`; in both scopes a stamp replayed
-by a NEW binding can never collide with a superseded binding's
-recorded dedup entry, so a
-past-skewed stamp stays a harmless verbatim key instead of a
-false duplicate. `last_seen_at` is always kernel receipt
+`observed_at` call-state stamp dedupes on `(line_id,
+lease_or_call, accepted_stamp)`; the per-line watermark survives
+a reregister, and facts naming a superseded `assignment_id` are
+already rejected `STALE_TOKEN` through the closed-assignment ring
+before dedup is consulted. Each scope's watermark is
+MONOTONE-MAX: a verbatim PAST stamp below the recorded maximum
+stays a dedupe key for detecting repeats but MUST NEVER regress
+the ordering — an out-of-order fact is dropped as a duplicate,
+never applied backwards, and phase legality is governed solely by
+`CALL_PHASE_FORWARD_TRANSITIONS`, not stamp comparisons.
+`last_seen_at` is always kernel receipt
 time and every timer stays kernel-clock.
 
 ### Requirement: Reregister supersedes a live binding, register does not (round 28)
@@ -450,8 +527,14 @@ formally, leases whose phase is a member of the contract constant
 `SNAPSHOT_RECONCILED_PHASES` (`DIALING`/`ALERTING`/`ACTIVE`/
 `TERMINATING`, round 29): an
 undialed `ACQUIRED` grant is pre-dial, so an empty snapshot MUST
-NOT kill it, and a `RINGING` lease reached via
-`ACQUIRED -> RINGING` preemption is excluded the same way.
+NOT kill it. `CallPhase.RINGING` is RESERVED for wire/schema
+compatibility — its `CALL_PHASE_FORWARD_TRANSITIONS` row stays
+for enum completeness but the phase is UNREACHABLE on a
+`CallLease` (round 30 — `ACQUIRED -> RINGING` is removed;
+inbound-ring state lives on `LineState.RINGING_LOCKED` and the
+line's ring slot, never on a lease phase): a `CallLease` MUST
+reject `phase="ringing"`, so no snapshot element can ever
+reconcile against one.
 Reregister is deterministic under a reconnect storm (round 29):
 the supersede applies to the line's CURRENT live binding —
 whatever it is at the instant the mutation runs, including a
@@ -465,7 +548,26 @@ MUST resolve through the closed-assignment ring and be rejected
 superseded control socket after delivering the supersede reply.
 A `provider.register` on an already-live binding MUST
 be rejected `INVALID_STATE` — reconnect inside the grace window
-uses `provider.reregister`.
+uses `provider.reregister`. Registration facts MUST mint a
+`channel_seq` — a per-channel strictly-positive monotone
+ordinal assigned at register/reregister/`ingest_liveness`/snapshot
+ingestion (round 30): `ProviderRegisterResult` carries it on
+`binding.channel_seq`, `ProviderLiveness` and
+`ProviderRegistration` carry it as a field, and the kernel uses it
+to demote a late-arriving stale-channel fact instead of letting a
+pre-supersede ping overwrite the new binding's state: a REACHABLE
+fact MUST clear `orphan_deadline_at` ONLY when its `channel_seq`
+equals the binding's live `channel_seq` — a ping replayed on a
+lingering pre-reregister socket can never disarm the new channel's
+grace deadline.
+`register_provider` MUST return a
+`ProviderRegisterResult` (round 30 — never a bare
+`ProviderBinding`): `binding` (the created/superseded
+`ProviderBinding`) and `pending_rings` (a frozen `PendingRing`
+tuple — snapshot-reported rings the kernel minted `call_token`s
+for through the `ingest_ring` path, relayed to the provider so
+each rediscovered ring keeps one kernel-minted token,
+deduplicated by ring identity, never re-minted).
 
 ### Requirement: Dead-binding cleanup runs at the mutation (round 28)
 
@@ -511,16 +613,63 @@ MUST accept `profile?` (the administrative label, ≤128 chars,
 `None` = unchanged, no clear op). `admin.remove_line` MUST refuse
 while another configured line's `forward_via_line` targets it and
 MUST emit `assignment_revoked` to the owner BEFORE deleting an
-agent-OWNED quiescent line (a SHARED_POOL line emits no event).
+agent-OWNED quiescent line (a SHARED_POOL line emits no event). `admin.assign_line` and
+`admin.approve_claim` MUST reject a `RINGING_LOCKED` line with
+`INVALID_STATE` (round 30): an ownership mutation during a live
+ring would strand the pending fallback decision and the parked
+ring bookkeeping. `admin.remove_line` MUST mint the
+`provider.revoke` command and every `assignment_revoked`/
+`claim_resolved` cascade event BEFORE the line's
+`ProviderBinding` is deleted, and MUST record every deleted
+`assignment_id` — durable or live — in the bounded closed-
+assignment ring so post-delete facts still resolve to `None`,
+never `STALE_TOKEN` (round 30).
 All three MUST follow kernel-first write-through ordering: the
 kernel mutates its record first, the admin adapter writes/drops
 the `lines` row second — a failed precondition never reaches the
-store. `admin.revoke_assignment` on a `SHARED_POOL`
+store. When an adapter-side `lines`-row write fails AFTER the
+kernel committed a mutation, the adapter MUST call
+`restore_line(snapshot)` with the pre-mutation `LineAssignment` —
+or `None` for a provision rollback — which is the ONLY legal
+rollback path (round 30): it restores or deletes the line's
+kernel record VERBATIM — the restored `LineAssignment` keeps its
+stored `last_seen_at` and every durable field, so a persistence
+retry never rotates an id or widens a deadline — mints the
+compensating events
+that keep the outbox truthful — an `assignment_revoked` for a
+rolled-back grant, a grant-side event for a rolled-back revoke —
+and MUST mint a `domain.config_stale` admin event so the console
+surfaces that memory and store diverged.
+`hydrate_lines(rows, bindings)` (round 30) is the batch variant:
+the adapter MUST load ALL persisted `lines` rows and
+`provider_bindings` rows in ONE hydration call — each call wipes
+the previous hydration state wholesale so a retry after a partial
+load cannot leave a half-hydrated kernel. Hydration restores each
+record VERBATIM — `assignment_id`, owner, mode, `profile` and
+`last_seen_at` survive a restart unmodified; it emits NO events
+and rotates NO ids — and it validates the `forward_via_line` graph
+only AFTER every row is loaded, rejecting the batch on a dangling
+target or a cycle that line-by-line loading could never see.
+`admin.revoke_assignment`
+on a `SHARED_POOL`
 `LineAssignment` id MUST be rejected `INVALID_STATE` (the pool
 record is a configured line's default state, not a binding); a
 repeated provider-binding revoke MUST be idempotent — the dead
 id resolves through the closed-assignment ring and returns
-`None`, never `STALE_TOKEN` for an id the kernel once owned.
+`None`, never `STALE_TOKEN` for an id the kernel once owned —
+and the same recorded-idempotency applies to a repeat
+`revoke_assignment` on a `LineAssignment` id already revoked
+(`EXCLUSIVE` or `SHARED_POOL`, round 30). The closed-assignment
+and closed-lease rings are INSERTION-ORDER FIFO tombstone rings
+(round 30): a hit marks an entry as duplicate — it MUST NOT
+refresh the entry's eviction position — and new ids append at the
+tail, so capacity evicts the oldest insertions and no ordering
+field is needed. Every admin listing —
+`list_assignments`, `list_pending_claims` and
+`list_provider_bindings` — is PAGINATED (round 30):
+`offset >= 0` and `1 <= limit <= MAX_LIST_PAGE` (default
+`MAX_LIST_PAGE`) bound the returned slice so an unbounded dump is
+impossible.
 
 ### Requirement: max_call_duration is enforced by tick (round 28)
 
@@ -537,10 +686,13 @@ exempt — the grant TTL owns its deadline.
 `idle_revoke_after` MUST be strictly positive when set and bounded
 at 86400 s — a `timedelta.max`-scale value would overflow the
 `last_seen_at + idle_revoke_after` hydration arithmetic.
-`last_seen_at` — the idle clock — MUST refresh only on owner line
-operations and on `drop_session` closing the owner's last open
-session; a bare provider-side `ingest_ring` MUST NOT stamp it —
-the phone ringing is not the owner using the line.
+`last_seen_at` — the idle clock — MUST refresh ONLY on owner line
+operations (`acquire`, `dial`, `accept`, `release`, `hangup`,
+`send_dtmf`, claim mutations) and on `drop_session` closing the
+owner's last open session; provider facts (`ingest_ring`,
+`ingest_call_state`, `ingest_liveness`) and `configure_line` MUST
+NEVER stamp it — the phone ringing, the modem reporting, and the
+admin relabeling are not the owner using the line.
 
 ### Requirement: The 0x02 flush watermark rides the agent stream clock (round 28)
 
@@ -551,4 +703,11 @@ for DTMF synthesis, or `0` when no frame was consumed yet — never
 a router-local wall-clock stamp. On receipt the router MUST drop
 queued uplink `0x01` frames with `timestamp_ms <= watermark` for
 that lease and keep post-watermark speech; the `0x02` itself is
-consumed at the router and never forwarded to the provider.
+consumed at the router and never forwarded to the provider. An
+AGENT-originated `0x02` (barge-in, round 30) is the DISTINCT
+discard-all case: it MUST carry the reserved marker
+`timestamp_ms = 0xFFFFFFFF` — outside the serial-comparison range
+a real stream stamp can reach — and on receipt the router MUST
+drop ALL still-queued uplink frames for the lease regardless of
+timestamp; it is consumed at the router and never bridged to the
+provider.

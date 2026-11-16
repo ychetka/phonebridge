@@ -63,6 +63,7 @@ referenced sections.
 | round 23 (architect review 12 — `SA_carbon_review_12`, Phase-0 contract freeze) | `line.hangup` XOR target `{lease_id? \| call_token?}` (reject-fallback executability); `ForwardViaLineFallback` gains `target_number`/`target_country` + config-time self-loop ban; `MediaAllocator` lifecycle fixed (allocate at dial/accept + idempotent `revoke(lease_id)` on lease ENDED); `_mask_for_log` serializes datetime/timedelta/Enum (json.dumps-safe logs); two-level outbox overflow model (SOFT_CAP pre-flight on acquire/dial/accept/claim, teardown never raises, drain after every call); Saga compensation on `line.dial`/`line.answer` (`{accepted}` ~2 s deadline → `disconnected`/`network_error`); `FallbackTriggeredEvent.expires_at` + `TimeoutConfig.fallback_accept_ttl_sec`; `event.idle_alert`/`IdleAlertEvent` + `AdminAudience` (idle escalation is alert-only, never a revoke); `reissued_ticket_id` on `call_state_changed`; bounded `idempotency_key` (1-128); deterministic `phone_mac → agN` chain + Call Waiting auto-reject; hci-agent token = long-lived per-line pre-shared secret + uplink playout jitter buffer; MediaRouter 20 ms uplink pacing + asymmetric rings (ADR-A); M1↔M2 storage split (SQLite durable config vs in-memory lease/queue state, admin write-through under `asyncio.Lock`); capability matrix (`CAP_NET_ADMIN`/`CAP_NET_RAW` only bluetoothd + wg-supervisor, vhci-feeder zero-caps on wg0 IP); pinned PipeWire node format 16 kHz/S16LE/mono; exec-hooks execve-only + webhook retry deadline `expires_at - 1s`; `profile` informational only (eligibility via `RECEIVE_INBOUND` in caps); `py.typed` + `docs/specs/` skeleton + doc drift fixes | contract.py, docs/api-contract.md, docs/hci-agent.md, §1, §3.5-§3.6, §4.2-§4.5, §5.2-§5.3, §6.3-§6.4, §7, §9-§10 |
 | round 24 (architect review 13 — `SA_carbon_review_13`, final Phase-0 contract freeze v0.0.19, issue #59) | MediaRouter pacing direction CORRECTED (ADR-24.1): the agent-socket reader drains continuously at socket speed (`0x01` → 1500-frame ring, `0x02` → immediate ring drain), pacing applies on EGRESS — one 640 B frame per monotonic 20 ms tick toward the LineProvider; `LineTimeouts` effective-value model (ADR-24.2) split from the `TimeoutConfig` patch — `LineAssignment.timeouts` for SQLite write-through + `ProviderBinding.heartbeat_interval_ms` stamps the negotiated per-session cadence; `heartbeat_down_after > heartbeat_degraded_after` validated on both models; `validate_e164_country` + `ForwardViaLineFallback` model validator + `LineAssignment` self-loop ban move dial-target validation from `configure_line` into the constructors; provider `caps` are non-empty telecom-only (`dial_out`/`receive_inbound` — `exclusive_line` is a `LineAssignment.claimable`/`mode` property, never a cap); docstrings freeze the `ingest_ring` glare matrix (BUSY/DOWN → `INVALID_STATE`, provider Hangup), `tick(now)` as the sole timer driver (`decide_fallback` before `expires_at` → `INVALID_STATE`; `fallback_accept_ttl_sec` expiry → `RINGING_LOCKED -> FREE` + `MissedCallEvent{ACCEPT_WINDOW_EXPIRED}`), error mapping (`CLAIM_NOT_FOUND` under `INVALID_STATE`, unknown `assignment_id` → `STALE_TOKEN`, `call.release` XOR breach → `INVALID_ARGUMENT`) and `AssignmentId` rotation on owner/mode change with bounded `_closed_assignments`; hci-agent `0x16 SCO_STATE` gains `handle?: uint16` (required on open, ADR-24.3) + continuous 2-bit H2 counter rewritten on ALL outbound mSBC packets including silence | contract.py, docs/api-contract.md, docs/hci-agent.md, §3.3, §3.6, §6.3, §6.6, §9 |
 | round 25 (`SA_carbon_review_15` — pre-M1 contract consolidation) | Deployment: `--network=host` + `/dev/vhci` on a dedicated host ratified as THE production profile (`AF_BLUETOOTH` is `init_net`-only; isolated netns impossible), micro-VM documented as optional hardened profile; `phonebridge doctor` pre-flight; UDS `0660`/`0700` state dirs. Contract: `LineState`/`LivenessState` split (`event.line_health_changed`, RESERVED/DEGRADED/DOWN removed from occupancy); `event.claim_resolved`/`event.assignment_granted`/`event.queue_cancelled` added (`assignment_id` finally reaches the owner); agent/provider media endpoint split (`MediaCredentials`); `line.reattach_media`/`call.reattach_media` token reissue; ring correlates by line not token (fallback token + snapshot reconcile + 1:1 ambiguity rule + provider `/run` state file); queue `seq` minted at acquire ingress; provider `call_state` gains `observed_at`/`call_token`/`caller_id`/`reason` echo + provider disconnect-reason closed vocab; `call.release` XOR `{lease_id\|assignment_id}` + `STALE_TOKEN`; `system:*` identities rejected on external sockets; `clear_idle_revoke_after`; forwarding cycle bound 8 hops; `max_call_duration_sec`/`ring_drain_ttl_sec` timeouts; media pair TTL 30 s + `network_error` teardown on timeout; DTMF `0x02` timestamped watermark flush + ALERTING early-media gate; `call.get_lines` privacy filter + redacted broadcast `line_state_changed` reasons for exclusive lines; JSON-RPC numeric error codes + `error_code`/`ErrorData` + `UNAUTHORIZED`/`FORBIDDEN`/`SESSION_NOT_FOUND`; WS-over-UDS framing 64 KiB | contract.py, docs/api-contract.md, docs/hci-agent.md, §2.1, §4.5, §5.2-§5.4, §6.3-§6.4, §7, §9-§10, §13 |
+| round 30 (`SA_carbon_review_19` slice B2a — design-doc hardening) | Webhook HTTP client never follows `3xx` (redirect = delivery failure under the retry budget); `/var/lib/phonebridge-media` third volume + media quotas (`max_recording_sec`, per-line cap, delete-after-send, retention TTL, ENOSPC isolation from SQLite WAL); `restore_line` kernel compensation + single-transaction `lines`+`line_assignments` writes + hydration as last-resort reconciler; single mutation lock covers kernel call→drain→`bus.publish` on every adapter path (per-mutation FIFO); `forward_via_line` second-leg FSM (`enqueue` on busy, terminal on unreachable/`DIAL_REJECTED`, ~20 s budget, either-leg teardown); `answer_and_announce` decision-time eligibility (EXCLUSIVE or live `receive_inbound`, degrade `no_pickup`), WAV-only ref validated at `configure_line`, hangup only after MediaRouter drain + jitter budget; `record_and_telegram` bot token in SQLite secrets injected by supervisor, mandatory beep before record, dead-letter spool + restart resume; `/run/phonebridge/<line_id>.json` bound to call-instance id + deleted on teardown + stale-age rejection; sibling-liveness check precedes D-Bus-loss `call_state` reports (`dongle_lost` ordering, supervisor flush window); phone numbers PII-masked incl. exec-hook stdio, `DIAL_REJECTED.detail`, `phonebridgectl` (default masked, `--reveal`); `remove_line` → `INVALID_STATE` while referenced by another line's `forward_via_line`; exec-hook coalescing keyed per `(hook, line_id)` keeps latest payload (cross-line payloads never merge); `vhci.lock` on a host-shared path (bind-mount or host-side lock service) | §2.1, §4.5, §5.3-§5.4, §7, §10 |
 
 ## §1. Service boundary
 
@@ -155,7 +156,25 @@ Production deployment is a **single Docker container**
   LineProvider as `dongle_lost` (immediate teardown, NO orphan
   grace — the same consequence class as tunnel/USB death), so a
   dead feeder can never leave its provider happily pinging
-  `reachable` while the control tunnel is already gone,
+  `reachable` while the control tunnel is already gone.
+  **Sibling-liveness precedes D-Bus facts (round 30, review-19
+  B2a#11):** when a `vhci-feeder` dies its `/dev/vhci` fd closes
+  and the kernel destroys `hciN` INSTANTLY — `Adapter1`/
+  `Device1`/`VoiceCall` removal signals can reach the LineProvider
+  BEFORE the feeder↔provider IPC EOF does, tempting it to report
+  an ordinary `disconnected`/`stack_restart` instead of
+  `dongle_lost`. The ordering rule is therefore explicit: on ANY
+  D-Bus object loss the LineProvider MUST check sibling liveness
+  (feeder IPC health) FIRST and classify the cascade as
+  `dongle_lost` when the feeder is gone — a D-Bus removal storm is
+  evidence of feeder death, not an independent call fact. The
+  bundle supervisor applies the symmetric rule: on feeder death it
+  gives the LineProvider a bounded flush window (~1 s) to emit its
+  `dongle_lost` report over the control socket BEFORE restarting
+  or killing the sibling — a supervisor that reaps the
+  LineProvider first turns an immediate `dongle_lost` into a
+  gateway-side `WS_DISCONNECTED` and wrongly arms the 10 s orphan
+  grace on calls whose media path is already dead,
 - BlueZ + PipeWire + dbus-daemon inside the container,
 - **no USB dongles passed through** (round 12, replaces the earlier
   `--device` model): every adapter inside the container is a kernel
@@ -184,7 +203,33 @@ per-host exclusive lock — a `flock` on a lock file such as
 `open("/dev/vhci")` through index discovery. Parallel line-bundle
 starts/restarts serialize on the file, so the mapping is
 deterministic no matter how many bundles the supervisor launches
-at once.
+at once. **The lock path MUST be host-shared (round 30,
+review-19 B2a#4):** `/dev/vhci` is global to the host kernel
+(`init_net`), but a container-private `/run` is mount-namespaced
+— a `flock` taken inside the container can never serialize
+against a still-dying previous container instance, a second
+gateway container, or any host-side `/dev/vhci` consumer
+(a host-native `hci-agent` debugging session, `btattach`). The
+deployment therefore MUST do one of:
+
+- bind-mount a host-visible state dir (e.g. host
+  `/run/phonebridge/` or `/var/lib/phonebridge-run/`) into the
+  container at `/run/phonebridge/` so the lock file is ONE
+  inode shared by every consumer on the host — the default
+  deployment recipe; the mount is mandatory, `phonebridge doctor`
+  fails fast when the path is not on a host-shared mount — or
+- take the lock from a host-side lock service (a tiny host helper
+  holding the flock and vending an attach slot over a UDS
+  handshake), so no container process touches the lock file at
+  all.
+
+A container-private `/run/phonebridge/vhci.lock` is a DEPLOYMENT
+BUG, not a fallback: it silently degrades the guarantee to
+"serialized within one container instance", which is exactly the
+restart-window race the lock exists to close. (hci-agent.md
+specifies the same logical lock path for agent-side tooling — the
+host-visibility requirement above applies wherever the file is
+taken.)
 
 Canonical deployment profile — **dedicated telephony host/VPS**
 (recommended, ratified round 25):
@@ -217,13 +262,20 @@ with `CONFIG_BT`+`CONFIG_BT_VHCI` — gated on an audio-jitter spike
 (real-time `PipeWire` timing inside a micro-VM is unproven) and on
 actual demand; NOT an MVP deliverable.
 
-Persistence requirement (ADR-03, round 11): "wipe-safe" is only true
-with two MANDATORY persistent volumes:
+Persistence requirement (ADR-03, round 11; third volume added round
+30): "wipe-safe" is only true with these MANDATORY persistent
+volumes:
 
 - `/var/lib/bluetooth` - BlueZ link keys; without it recreating the
   container drops phone pairing and demands manual re-pairing.
-- `/var/lib/phonebridge` - SQLite (keys, LineAssignments, configs)
-  and any recorded media.
+- `/var/lib/phonebridge` - SQLite (keys, LineAssignments, configs).
+- `/var/lib/phonebridge-media` - recorded call audio and the
+  `record_and_telegram` dead-letter spool — a THIRD mandatory
+  volume, on a SEPARATE filesystem/mount from the SQLite volume
+  (round 30, review-19 B2a#3): recordings grow unbounded relative
+  to config and must never share an `ENOSPC` fate with the WAL —
+  a full media volume fails recording, never an admin mutation;
+  see §10 "Media file quotas and lifecycle".
 
 Line identity binding is by `adapter_mac` (BDADDR), never `hciN` -
 indices are assigned in enumeration order and swap across reboots.
@@ -627,6 +679,14 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   serializes these rare writes under an `asyncio.Lock` through the
   SAME write-through path: first the kernel call, then the returned
   immutable `LineAssignment` snapshot is committed to SQLite.
+  **The durable write is ONE transaction (round 30, review-19
+  B2a#5):** a line-level mutation that touches both tables — the
+  `lines` row and its `line_assignments` row(s), e.g.
+  `provision_line`'s insert or `remove_line`'s delete — commits as
+  a single SQLite `BEGIN IMMEDIATE`…`COMMIT`; a half-written pair
+  (a `lines` row without its assignment, or an orphan assignment
+  row) is impossible, so hydration can never observe a torn
+  record.
   **Admin mutations serialize globally (round 29, review-1 B15):**
   ALL admin mutation calls — `configure_line` (including its
   cross-line forward-chain cycle/depth revalidation of every line
@@ -660,14 +720,52 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   admin diagnostics stream — neither `LineAssignment` nor
   `LineSummary` carries it, because the kernel never observes
   store-write outcomes.
-- **Drain discipline (round 25, clarification):** whichever adapter
+- **Write-through failure = kernel compensation (round 30,
+  review-19 B2a#1):** a failed durable write AFTER the kernel
+  mutation committed is rolled back through
+  `LineAdminKernel.restore_line(snapshot)` — the only legal
+  compensation path. The adapter captures the pre-mutation
+  `LineAssignment` snapshot before every write-through; on a
+  failed `lines`-row upsert/delete it passes that snapshot back
+  (`snapshot=None` un-creates a just-provisioned record, a prior
+  snapshot is restored verbatim for a patched/revoked/removed
+  one), the kernel emits the COMPENSATING events the rollback
+  implies so the already-drained outbox never claims a durable
+  change the store does not reflect, and the failure surfaces as
+  `config_stale` plus an admin alert. This closes the lifecycle
+  hole `config_stale` alone could not: a failed `provision_line`
+  write no longer leaves a lease-serving ghost that vanishes at
+  restart, and a failed `remove_line` delete no longer resurrects
+  the line from `initial_lines` at next hydration — the
+  compensation runs inside the same call, so the kernel and the
+  store re-converge immediately instead of diverging until the
+  next boot. Hydration is the LAST-resort reconciler: boot-time
+  `hydrate_lines` loads `initial_lines` verbatim from the store
+  (the store is authoritative on cold start — a kernel-only record
+  that never persisted is simply absent), so any residue a crashed
+  compensation left is re-converged at restart, never mid-flight.
+- **Drain discipline + event ordering (round 25, clarified;
+  ordering pinned round 30, review-19 B2a#5-6):** whichever adapter
   called the kernel, the drained outbox items feed the SHARED
   EventBus and provider-command executor — never the draining
   adapter's own connection. An admin-adapter drain after
   `approve_claim` therefore still delivers `event.claim_resolved`
   to the agent's session through the same bus; this is why
   `LineAdminKernel` exposes `drain_events()`/
-  `drain_provider_commands()` too.
+  `drain_provider_commands()` too. The SINGLE mutation lock covers
+  the WHOLE emission cycle for EVERY adapter path — agent RPC,
+  provider RPC, `tick(now)`, and admin RPC alike: kernel call →
+  `drain_events()` → `drain_provider_commands()` →
+  `bus.publish`/command dispatch, with the SQLite write-through
+  (and any `restore_line` compensation) inside the same critical
+  section. No adapter may drain outside the lock, and the EventBus
+  preserves per-mutation FIFO — envelopes enter the bus in exactly
+  the order their mutations committed. A lock-free drain (e.g. a
+  `tick` racing an `await`-parked write-through) could interleave
+  events and provider commands across mutation boundaries —
+  forbidden: ordering is part of the single-writer contract, not
+  a best-effort property of whichever adapter happened to call
+  last.
 
 ## §5. Call lifecycle
 
@@ -774,16 +872,86 @@ HTTP, WAV files, or call bridging:
   line (round 22) - the admin who configured the policy accepted
   that override; the worker gets no other privileges. Transitive
   forward cycles (`A → B → … → A`) are rejected at `configure_line`
-  by walking the stored policy chain (bounded at 8 hops, round 25),
+  by walking the stored policy chain (bounded at 8 hops, round 25).
+  **Second-leg FSM (round 30, review-19 B2a#7):** the worker's
+  `call.accept` on the source line answers the PHYSICAL call
+  first — that is inherent to the accept-first flow and means the
+  caller is connected (and, on metered carriers, billed) from that
+  instant; the target leg MUST therefore resolve inside a bounded
+  `forward_leg_ttl_sec` budget (~20 s) or the caller pays for
+  silence. Leg-B outcomes: target `BUSY`/`RINGING_LOCKED` → the
+  worker issues `call.acquire{enqueue:true}` and waits ONE queue
+  turn up to the budget — a granted lease proceeds, an expired
+  wait is terminal; target `unreachable`/`LINE_NOT_FOUND`/
+  `DIAL_REJECTED`/`PROVIDER_UNREACHABLE` → terminal immediately,
+  no queue (the target cannot serve at all — and a configured
+  `forward_via_line` target can no longer be deleted out from
+  under the policy, see `remove_line`). Terminal path: the worker
+  plays the line's announcement (the `answer_and_announce`
+  machinery, so the caller hears "unreachable, try later" rather
+  than dead air) and hangs up the answered leg. Bridging: both
+  legs wait for `audio_ready` before the worker cross-connects
+  PCM; each leg's `0x02` flush semantics stay leg-local (a flush
+  on A never drops B's queue and vice versa). Teardown is
+  symmetric — loss of EITHER leg ends BOTH: leg B drops →
+  `call.hangup` on A, leg A drops → `call.hangup`+release on B;
+  the worker's own death is covered by the generic
+  dead-man-switch on BOTH sessions' leases (see "Worker dies
+  mid-forward" below),
 - `record_and_telegram:<channel>` - answer, record the call/
-  voicemail ourselves, post to a Telegram channel (recording length
-  is bounded by `max_call_duration_sec`, round 25),
+  voicemail ourselves, post to a Telegram channel (recording
+  architecture expanded round 30, review-19 B2a#9): **beep first** —
+  the worker MUST play an audible announce/beep to the caller
+  BEFORE recording starts (the `answer_and_announce` machinery),
+  so a recorded party never hears dead air and hangs up thinking
+  the line is dead; recording length is bounded by
+  `max_recording_sec` (§10 media quotas — a dedicated bound
+  independent of `max_call_duration_sec`, which defaults off).
+  **Bot-token storage:** the Telegram bot token is a SECRET —
+  stored in the SQLite `escalation_hooks`/`secrets` row alongside
+  the channel id, never in `fallback_policy_json` and never on
+  the worker's argv/env-visible process surface: the supervisor
+  injects it into the FallbackWorker through its private config
+  channel at process start (the worker holds no `admin` scope and
+  never opens the SQLite DB itself). **Delivery guarantee:**
+  uploads go through the SAME hardened egress path as webhook
+  delivery (explicit timeouts, SSRF guard where the endpoint is
+  configurable, `api.telegram.org` allowlisted) and through a
+  DEAD-LETTER spool on the `/var/lib/phonebridge-media` volume —
+  a recording whose send fails (Telegram outage, worker crash
+  mid-upload) lands as a spool entry `{file, channel, attempts,
+  next_retry_at}` and is retried with bounded backoff; a
+  restarted FallbackWorker re-scans the spool at startup and
+  resumes pending sends, so a voicemail can never die silently on
+  a worker restart (retention still applies — §10),
 - `answer_and_announce:<announcement_ref>` - answer and play an
-  announcement (only if the line has an agent registered for
-  inbound). `announcement_ref` is the admin-provisioned WAV/text
-  selector carried INSIDE the policy (round 22) - the FallbackWorker
+  announcement. **Eligibility (round 30, review-19 B2a#8 —
+  replaces the ambiguous "only if the line has an agent
+  registered for inbound"):** the predicate is evaluated at
+  DECISION time on live kernel state, not at `configure_line`
+  time — the policy is eligible when the line's
+  `assignment.mode == EXCLUSIVE` OR at least one live session
+  holds `receive_inbound` intent on it (the
+  `system:fallback_worker` session itself never counts toward
+  that set); when neither holds, `decide_fallback` degrades to
+  `no_pickup` — the fallback worker never burns a token for an
+  announcement it could not have been expected to replace.
+  `announcement_ref` is the admin-provisioned **WAV-asset
+  selector** carried INSIDE the policy (round 22) — WAV only, no
+  text/TTS selector: TTS lives client-side by design (§1), so a
+  configured ref MUST name an existing provisioned audio asset
+  validated at `configure_line` (a missing/invalid asset fails
+  config, not the ring) - the FallbackWorker
   connects via the standard agent API and has no admin scope to
-  query line config.
+  query line config. **Hangup pacing (round 30):** the worker
+  streams the WAV paced at real-time (≤1 `0x01` frame per 20 ms —
+  dumping the file into the MediaRouter ring at socket speed
+  would buffer seconds of unplayed audio), then waits for the
+  MediaRouter uplink ring to DRAIN plus the jitter-buffer budget
+  deadline before issuing `call.hangup` — an early hangup would
+  cut the announcement mid-word: the queued frames the provider
+  never heard would be silently dropped, so the caller must hear
+  the tail, not just the head, of the message.
 
 **Fallback token mechanics (round 14; delivery fixed round 22):**
 when `accept_window_sec` expires on a worker-policy line, the
@@ -891,7 +1059,23 @@ agent-initiated hangup.
   `lease_id` → D-Bus object path, so a restart re-binds ids exactly
   — the file survives a provider-process restart only: `/run` is
   tmpfs (round 27), so a container/host reboot legitimately finds
-  it absent and falls back to rule (b);
+  it absent and falls back to rule (b). **Call-instance binding
+  (round 30, review-19 B2a#10):** D-Bus call object paths are
+  REUSED — `/org/pipewire/Telephony/agN/callM` numbering restarts
+  after a stack restart or a phone re-dial, so the bare path is
+  not an identity. The state file MUST bind each mapping to a
+  unique call-instance id (the modem call uid where the stack
+  exposes one, else a provider-minted per-call instance token
+  recorded at first sighting) and MUST carry a `recorded_at`
+  stamp; the file is DELETED on the call's `disconnected`
+  transition and on clean provider shutdown, and a stale file —
+  older than the line's `max_call_duration_sec` ceiling (or a
+  bounded 24 h default when unset), or whose call-instance id
+  does not match the live object under the same path — is
+  rejected at rehydrate time and treated as absent (rule (b)
+  applies). Without that binding a leftover `lease_id → call1`
+  entry could silently re-bind yesterday's lease onto today's
+  unrelated call that happens to reuse `call1`;
   (b) when the file is absent/cold, the kernel applies the 1:1
   ambiguity rule — a snapshot call with `lease_id:null` on a line
   holding EXACTLY ONE orphaned lease binds to that lease (at most
@@ -1166,7 +1350,17 @@ Three primitives only - no broker in v1:
    with `Host`/SNI still naming the original hostname; a second
    resolution between the check and `connect()` is FORBIDDEN, so
    there is no resolve-check-connect window for a short-TTL
-   DNS-rebind TOCTOU to slip through. The
+   DNS-rebind TOCTOU to slip through. **No redirect following
+   (round 30, review-19 B2a#2 — the picked rule):** the webhook
+   HTTP client MUST NOT follow `3xx` redirects AT ALL — any
+   `301`/`302`/`307`/`308` response is a DELIVERY FAILURE fed into
+   the normal bounded-retry budget, never a new request. Following
+   a redirect would re-enter the whole validate-resolve-pin
+   pipeline per hop — a chain `public → 127.0.0.1` would sail
+   straight into host loopback under `--network=host` past every
+   pinned check — so the fail-closed rule is to treat a redirect
+   as a dead endpoint rather than to re-validate a moving target.
+   The
    gateway itself
    binds only loopback/wg0; a webhook is the one daemon-originated
    egress an operator can point anywhere.
@@ -1181,7 +1375,25 @@ Three primitives only - no broker in v1:
    a hard process timeout (default 10 s, admin-cap 60 s), a
    per-hook concurrency cap of 1 queued run (later triggers
    coalesce), and cgroup-less memory discipline via a bounded
-   stdin payload (≤64 KiB). File-drop hooks write `0600` files into
+   stdin payload (≤64 KiB). **Coalescing never loses a call
+   (round 30, review-19 B2a#14):** the queue is keyed per
+   `(hook, line_id)` and holds the LATEST complete payload for
+   that key — a second trigger on the same line replaces the
+   still-queued payload with the newest event wholesale, so the
+   run always fires with current data; payloads for DIFFERENT
+   `line_id`s are separate queue entries and NEVER coalesce into
+   each other, so two simultaneous rings on two pool lines always
+   produce two hook executions. A same-line `incoming_call` then
+   `missed_call` burst coalesces to the freshest payload — by
+   design: the newest event is the actionable one, and the
+   wake-up semantics of these hooks only need "something happened
+   on this line" to reach the sleeper once. Child `stdout`/`stderr`
+   are CAPTURED, byte-bounded and PII-scrubbed before they can
+   reach the daemon log (§10): a hook that echoes its stdin JSON
+   to stderr must never write `caller_id` into the service log —
+   captured output is truncated at a small cap and dropped from
+   INFO-level logs entirely (diagnostic surface only, opt-in).
+   File-drop hooks write `0600` files into
    a tmpfs-backed `0700` spool dir owned by the `phonebridge`
    group, with a
    TTL sweep (default 5 min) so stale wake files never pile up
@@ -1352,6 +1564,16 @@ status (mirrors the busctl commands used in Phase-0).
   `provider.reregister`/`provider.register`, so reconfiguring a
   line mid-call cannot drop the call over a heartbeat window
   mismatch.
+- **`admin.remove_line` refuses a forward target (round 30,
+  review-19 B2a#13):** removing a line that ANOTHER configured
+  line's `forward_via_line` policy still references is rejected
+  `INVALID_STATE` — a dangling policy would only surface as a
+  `LINE_NOT_FOUND` at ring time, long after the misconfiguration
+  was made. Deterministic reject was chosen over cascade-clear:
+  silently rewriting another line's `fallback_policy` inside a
+  delete would hide an admin's intent behind a side effect; the
+  operator retargets or clears the referencing policy first
+  (`configure_line`), then removes the line.
 - **Escalation channels** (round 10c): admin-configured (e.g.
   Telegram) for idle/broken-line alerts; `idle_revoke_after` fires
   `event.idle_alert` (admin-audience, §3.6/§7) - alerts only,
@@ -1386,11 +1608,44 @@ status (mirrors the busctl commands used in Phase-0).
   string (`UNAUTHORIZED`/`FORBIDDEN`/`SESSION_NOT_FOUND` included),
   `error.data` is the `ErrorData` JSON `{reason?, detail?,
   free_lines?}` — see `docs/api-contract.md` error map.
+- **Media file quotas and lifecycle (round 30, review-19 B2a#3):**
+  recorded audio lives ONLY on the dedicated
+  `/var/lib/phonebridge-media` volume (§2.1 — separate mount from
+  the SQLite WAL volume, so recording `ENOSPC` can never stall an
+  admin write-through) and is bounded end to end:
+  `max_recording_sec` (admin-configurable, default 300 s) caps a
+  single `record_and_telegram` recording INDEPENDENTLY of
+  `max_call_duration_sec` — the call may continue past it, the
+  file stops; a per-line storage cap (default 100 MiB) bounds
+  accumulated recordings plus that line's pending spool, with
+  oldest-first eviction and an immediate `ENOSPC`-equivalent
+  refusal path on a full volume (record fails closed, call and
+  config writes unaffected); sent recordings are deleted right
+  after a confirmed Telegram send (delete-after-successful-send —
+  the spool entry, not the audio, is the retry unit); unsent
+  spool entries carry a bounded retention TTL (default 72 h) with
+  sweeper expiry + an admin alert on drop, so a permanently dead
+  endpoint cannot accumulate voicemail forever; and the spool
+  itself is file-per-entry `{file, channel, attempts,
+  next_retry_at}` under `0600`/`0700` — audio is PII and obeys the
+  same filesystem discipline as the wake spool.
 - Secrets/PII (tokens, caller numbers) must never reach logs:
   `CallToken`/`MediaToken` travel inside `RedactedString`-style
   containers that refuse `str()`/`json.dumps` without an explicit
   `.expose()`, and `safe_dump()` masks them in every structured
   log line (round 25 — a `NewType(str)` token was a log leak).
+  **Phone numbers get the same treatment (round 30, review-19
+  B2a#12):** `caller_id`/`number`/`target_number` are PII in
+  EVERY surface — wrapped/masked in event models and structured
+  logs like the tokens, carried masked through exec-hook handling
+  (the child sees the full JSON on stdin because it needs it;
+  the child's captured `stdout`/`stderr` is byte-bounded and
+  PII-scrubbed before the daemon log can record it — §7), kept
+  OUT of `DIAL_REJECTED`'s `data.detail` (the typed `reason`
+  says WHAT failed; the rejected number is not echoed back into
+  an error string that lands in client logs), and masked in
+  `phonebridgectl` output by default (an explicit `--reveal`
+  flag is required to print raw numbers).
 
 ## §11. Test strategy without a real call
 
