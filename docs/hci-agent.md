@@ -112,8 +112,8 @@ receive_inbound?:bool}` object, never a free-form list).
 | kind | direction | payload |
 |---|---|---|
 | `0x01` HCI_PASSTHRU | both | HCI packet prefixed with its H4 type byte (`0x01` cmd / `0x02` ACL / `0x04` evt); the byte is synthesized from the USB endpoint class |
-| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the **long-lived per-line pre-shared secret** from `agent_token_file` (round 23 fix — earlier drafts wrongly called it a single-use credential; it is re-presented on EVERY control session, sent inside the authenticated tunnel only). On WAN profiles the container validates `token` AND the tunnel peer identity together — WireGuard `/32` peer public key or mTLS client cert CN — both MUST map to the same `line_id`; either check failing rejects the session. On a co-located `127.0.0.1` endpoint the peer-identity factor does not exist (loopback is a one-host trust domain, round 28) — the `token` alone authenticates, and a UDS variant may substitute `SO_PEERCRED` (§6) |
-| `0x11` HELLO_ACK | container→ | `{accepted:true, line_id, heartbeat_interval_ms, server_time, session_nonce}` or reject+close — `session_nonce` is a fresh `uint32` minted per control session (round 20); the agent MUST echo it in every media-UDP datagram of this session. Rejection (round 30): `{accepted:false, reason}` (typed reason string; `session_nonce`/`server_time` ABSENT — no half-issued session state) followed by an immediate FIN — a rejected session is never left half-open. `heartbeat_interval_ms` in this frame is AUTHORITATIVE for the session (round 30 — `agent.yaml`'s `heartbeat.interval_ms` is the FALLBACK used only until the first `HELLO_ACK`; the kernel's per-line negotiated value wins every subsequent session, so `admin.configure_line` cadence changes propagate through the next re-handshake without editing every agent's file) |
+| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the **long-lived per-line pre-shared secret** from `agent_token_file` (round 23 fix — earlier drafts wrongly called it a single-use credential; it is re-presented on EVERY control session, sent inside the authenticated tunnel only). On WAN profiles the container validates `token` AND the tunnel peer identity together — WireGuard `/32` peer public key or mTLS client cert CN — both MUST map to the same `line_id`; either check failing rejects the session. On the co-located `loopback` profile the peer-identity factor is `SO_PEERCRED` (round 31, swe-2 item 32 — the earlier "token alone on `127.0.0.1`, UDS may substitute" wording is removed): `token` AND the connecting uid are BOTH REQUIRED and both MUST map to the same `line_id` — there is no token-only loopback variant (§3/§6) |
+| `0x11` HELLO_ACK | container→ | `{accepted:true, line_id, heartbeat_interval_ms, server_time, session_nonce}` or reject+close — `session_nonce` is a fresh `uint32` minted per control session (round 20); the agent MUST echo it in every media-channel datagram of this session (UDP on tunnel profiles, UDS datagram on `loopback`). Rejection (round 30): `{accepted:false, reason}` (typed reason string; `session_nonce`/`server_time` ABSENT — no half-issued session state) followed by an immediate FIN — a rejected session is never left half-open. `heartbeat_interval_ms` in this frame is AUTHORITATIVE for the session (round 30 — `agent.yaml`'s `heartbeat.interval_ms` is the FALLBACK used only until the first `HELLO_ACK`; the kernel's per-line negotiated value wins every subsequent session, so `admin.configure_line` cadence changes propagate through the next re-handshake without editing every agent's file) |
 | `0x12` HEARTBEAT | agent→ | `{seq, usb_ok, hci_ok}` every `heartbeat_interval_ms` — `hci_ok` reports the LOCAL health of the relay path (USB transfer engine alive, isoc state consistent), never a synthesized HCI command result: the dumb agent MUST NOT probe the controller with HCI commands of its own — every probe would consume the real controller's `ncmd` window and desync the kernel's command accounting (round 30) |
 | `0x17` HEARTBEAT_ACK | container→ | `{seq}` — echoes the received `HEARTBEAT.seq` (round 30, review-19 B2b#7): the bidirectional half of liveness — the agent counts missing ACKs against the SAME `missed_limit` the feeder applies to missed heartbeats, so a dead tunnel is detected in ~3 intervals ON BOTH SIDES. Without it the agent could only write into a dead TCP send buffer until `tcp_retries2` (~15 min) noticed, while a read-deadline on an idle-but-healthy line would tear down a perfectly good session — the ACK is what makes `missed_limit` meaningful agent-side |
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
@@ -155,9 +155,13 @@ agent `0x16 SCO_STATE`:
   `60` — it is the HCI SCO payload length the selected
   altsetting actually produces on the wire: `48` B under
   `altsetting 2` (CVSD), `60` B under `altsetting 6` (mSBC),
-  `72` B under `altsetting 3` (mSBC spread across ~3
-  microframes). Hard-coding `60` would let the kernel slice
-  inbound 48/72 B packets at a wrong boundary and corrupt the
+  `60` B under `altsetting 3` (the mSBC fallback — the payload
+  stays 60 B; the 63 B HCI SCO packet, 3-byte header included,
+  is chopped across ~3 consecutive 25 B `wMaxPacketSize`
+  microframes — round 31 fix, the earlier `72` B figure counted
+  framing the payload never carries). Hard-coding a single `60`
+  would let the kernel slice
+  inbound 48 B packets at a wrong boundary and corrupt the
   mSBC frame alignment the H2 rewrite depends on; the feeder
   stamps the declared length per negotiated profile, and the
   agent chops outgoing HCI SCO packets into the REAL
@@ -279,7 +283,13 @@ live in the vhci experiment. Therefore:
   allocator chase a garbage length field (HCI ACL/event payloads are
   ≲1 KiB; HELLO/STATUS JSON fits easily).
 
-### Media channel — UDP
+### Media channel — datagrams (UDP on tunnel profiles, UDS datagram on `loopback`)
+
+The media channel carries one self-contained datagram per frame;
+the transport is profile-dependent (§3): UDP inside the tunnel
+profiles, a connected UDS datagram socket under
+`/run/phonebridge/media/` on `loopback` — the on-wire layout
+below is IDENTICAL in both cases.
 
 `uint8 kind · uint32 BE session_nonce · uint16 BE media_seq ·
 uint32 BE ts_ms · payload` — one datagram per media frame (round
@@ -313,7 +323,11 @@ Kinds:
 
 **Uplink endpoint binding (round 18).** UDP is connectionless: the
 feeder learns the agent's source `(IP, port)` only from received
-datagrams. Until the first packet arrives — or after a NAT/firewall
+datagrams. On `loopback` the media channel is a CONNECTED UDS
+datagram pair, so the endpoint is bound at `connect()` and
+verified by the same `SO_PEERCRED` uid check the control socket
+applies (§3) — the `(IP, port)` learning path below applies to
+the UDP profiles only. Until the first packet arrives — or after a NAT/firewall
 mapping expires between calls — the container has no return path for
 uplink audio. The agent therefore MUST send a `MEDIA_PING` frame
 immediately after `HELLO_ACK` and then every ~15 s while the session
@@ -455,20 +469,27 @@ must not block every other line's attach forever; timeout is a
 loud failure, not a retry loop), the lock fd is opened
 `O_CLOEXEC`/`FD_CLOEXEC` (a `vhci-feeder` that `execve`s a helper
 must never leak the lock to a child), it is held ONLY for the
-`open()`→index-discovery window — never for the feeder's
+`open()`→control-write→index-read window — never for the feeder's
 lifetime — and the `vhci` group + state-dir permissions let an
 unprivileged feeder take it (the feeder itself runs zero-caps).
-**Index discovery is kernel-local (round 30):** immediately after
-`open("/dev/vhci")` the kernel returns the freshly minted
-`hciN` index through an `HCI_VENDOR_PKT` — H4 type `0xff`,
-payload `[0xff, 0x00, <index_lo>, <index_hi>]` — delivered on the
-`read()` side of the fd. The `0xff` type is INTERNAL to the
+**Index discovery is kernel-local, write-then-read (round 30;
+order corrected round 31, swe-2 item 11):** `open("/dev/vhci")`
+creates ONLY the transport endpoint — no `hciN` exists yet.
+Inside the lock the feeder MUST first WRITE the one-time control
+packet `[0xff, 0x00]` — H4 vendor type `0xff` plus opcode
+`HCI_PRIMARY` (`0x00`); `hci_vhci` accepts ONLY a `0xff` write
+while no adapter exists (anything else is `-EINVAL`) — which
+makes the kernel create and register the adapter, and only then
+READS back the vendor event `[0xff, 0x00, <index_lo>,
+<index_hi>]` carrying the freshly minted `hciN` index. A bare
+`read()` without the write blocks forever — nothing mints an
+adapter on `open()` alone. The `0xff` type is INTERNAL to the
 feeder↔kernel boundary: it is consumed at the feeder for index
 assignment and MUST NEVER be forwarded onto the control tunnel
 (it is not part of the `0x01/0x02/0x04` passthrough set, and the
 agent would have nowhere meaningful to relay it). Discovery needs
-no `bluetoothd` round-trip: the vendor packet is the whole
-discovery — the lock is released as soon as it lands.
+no `bluetoothd` round-trip: the write/read pair is the whole
+discovery — the lock is released as soon as the index lands.
 
 **MTU alignment (round 30 rework — real geometry, review-19
 B2b#2).** `hci_vhci` carries no `btusb` USB quirks: the
@@ -487,9 +508,10 @@ like any other `HCI_PASSTHRU`, the REAL `0x0e` answer comes back —
 the feeder's only local job is to RECORD the returned
 `sco_data_packet_len`/`acl` values as the negotiated geometry and
 to intersect the SCO length with the selected altsetting's real
-payload (48/60/72 B per altsetting 2/6/3 — see the altsetting
-table above; a `60` constant is wrong for CVSD and for the
-alt-3 fallback). The EXACT locally-rewritten command set is
+payload (48/60/60 B per altsetting 2/6/3 — see the altsetting
+table above; a `60` constant is wrong for CVSD — the alt-3
+mSBC fallback produces the same 60 B payload as alt 6, only
+spread over more microframes). The EXACT locally-rewritten command set is
 enumerated, never implied by "etc." (round 30): in V1 the feeder
 rewrites NOTHING else — every other command passes through
 verbatim; the only LOCAL intervention is stamping the
@@ -516,12 +538,21 @@ link-key stores inside the shared `bluetoothd`. The check is
 mandatory on every session, not only first attach — a swapped
 dongle on a re-handshake is the same violation.
 
-**Frame validation before `/dev/vhci` (round 30).** The feeder is
+**Frame validation before `/dev/vhci` (round 30; agent-side H4
+allowlist tightened round 31, swe-2 item 32).** The feeder is
 the last sanity gate between tunnel bytes and the kernel
 transport: a `HCI_PASSTHRU` frame is checked before any
 `write("/dev/vhci")` — the inner HCI header's declared length
 (event `param_len` / ACL `data_len` / SCO `payload_len`) MUST
-equal the actual inner payload (`len - 5 - header`), H4 type
+equal the actual inner payload (`len - 5 - header`), and the H4
+type itself is allowlisted to the passthrough set
+`0x01`/`0x02`/`0x04` (§"H4 type split"): an agent-originated
+`0xff` vendor type is REJECTED — `0xff` is reserved for the
+feeder's OWN vhci index handshake at the kernel boundary
+(above) and an agent has no business minting one; `0x03` SCO
+is REJECTED on the control channel — SCO belongs on the media
+channel, and a control-carried SCO frame would bypass the
+handle gate entirely; H4 type
 `0x05` (vendor-diag channel on real UARTs) is REJECTED — it is
 not a legal H4 type on the `vhci` link — ACL `data_len` MUST NOT
 exceed the negotiated buffer geometry learned from the real
@@ -598,7 +629,7 @@ canonical, shipped by the system, and not user-editable.
 | profile | carriage | status |
 |---|---|---|
 | `wireguard` | system-managed `wg0` peer; auth = peer pubkey ↔ line_id | V1 default |
-| `loopback` | UDS control + `127.0.0.1` UDP media; auth = token + `SO_PEERCRED` uid ↔ line_id | V1 (co-located agent) — round 30 |
+| `loopback` | UDS control + UDS datagram media under `/run/phonebridge/media/`; auth = token + `SO_PEERCRED` uid ↔ line_id on BOTH sockets | V1 (co-located agent) — round 30; media UDS pinned round 31 |
 | `direct_mtls` | plain TCP/UDP + mutual TLS; cert CN ↔ line_id | V1 (LAN/VPN-ready nets) |
 | `sstp` | reserved profile — server pack shipped by system | future |
 | `openconnect` | reserved profile | future |
@@ -610,15 +641,22 @@ unmodified. `direct_mtls` wraps the TCP control channel in TLS and the
 UDP media channel in DTLS. Line identity is always bound to the tunnel
 credential — an agent cannot feed a line it was not provisioned for.
 
-**`loopback` (round 30):** the canonical profile for a dongle
+**`loopback` (round 30; media transport pinned round 31, swe-2
+item 32):** the canonical profile for a dongle
 physically on the gateway host — control rides a per-line
 `unix://` socket (the bind-mounted `0660` agent socket dir, group
-`phonebridge`), media rides `127.0.0.1` UDP. `SO_PEERCRED` is the
-second factor: the feeder maps the connecting uid to the agent's
+`phonebridge`), media rides a CONNECTED UDS datagram socket pair
+under `/run/phonebridge/media/` (same `0660` dir discipline, one
+socket per line). `SO_PEERCRED` is the second factor on BOTH
+sockets: the feeder maps the connecting uid to the agent's
 provisioned uid for that `line_id` — the `agent.token` in HELLO
 is still REQUIRED (defence in depth for a same-host process
 running under a shared uid), but the uid check is what a foreign
-uid cannot forge. No wireguard/tls stack is involved — loopback
+uid cannot forge. There is NO unauthenticated UDP path even on
+loopback — the media peer is verified at `connect()` exactly
+like the control peer, and the `session_nonce` still binds
+datagrams to the live control session (§2). No wireguard/tls
+stack is involved — loopback
 is the one-host trust domain made explicit.
 
 **`direct_mtls` and NAT rebind (round 30):** classic DTLS 1.2
@@ -867,8 +905,11 @@ every failure source, because a virtual adapter never wedges the kernel.
   is unreachable except through the authenticated tunnel. For a
   dongle physically co-located with the container the
   `loopback` profile is canonical (§3): control rides a UDS
-  socket in the bind-mounted `0660` dir, media rides `127.0.0.1`
-  UDP. The AUTHENTICATION model keeps two factors there too
+  socket in the bind-mounted `0660` dir, media rides a CONNECTED
+  UDS datagram socket under `/run/phonebridge/media/` — the
+  profile exposes NO UDP listener at all, so no unauthenticated
+  datagram path exists even on loopback (round 31). The
+  AUTHENTICATION model keeps two factors there too
   (round 30 — the earlier "token alone on loopback" rule is
   superseded): `agent.token` PLUS `SO_PEERCRED` — the connecting
   process's uid MUST match the uid provisioned for that

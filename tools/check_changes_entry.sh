@@ -32,7 +32,15 @@ PR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) MODE="base"; BASE="${2:?--base needs a ref}"; shift 2 ;;
-    --pr) MODE="pr"; PR="${2:?--pr needs a number}"; shift 2 ;;
+    --pr) MODE="pr"; PR="${2:?--pr needs a number}"
+        # round 31, swe-2 item 40: $PR is interpolated into the
+        # `gh api repos/.../pulls/$PR/files` URL below - a non-numeric
+        # value could inject extra path segments or query params, so
+        # reject anything but digits before it is used.
+        case "$PR" in
+            ''|*[!0-9]*) echo "--pr must be numeric, got '$PR'" >&2; exit 2 ;;
+        esac
+        shift 2 ;;
     *) echo "usage: check_changes_entry.sh --base <ref> | --pr <n>" >&2; exit 2 ;;
   esac
 done

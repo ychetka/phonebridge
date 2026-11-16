@@ -33,7 +33,11 @@
 #   the diff keep the plain existence checks (round 27 fixup): they
 #   live between releases and are folded by a separate release-prep
 #   PR, so an old fragment must not fail a PR that never touched its
-#   spec file. Without --base the existence checks above still apply
+#   spec file. A fragment inside the diff that declares a bare "-"
+#   noop while the same diff touches docs/specs/*.md is REJECTED
+#   (round 31, swe-2 item 40): the spec edit is documented behavior
+#   changing, so it must be anchored, not noop'd away. Without
+#   --base the existence checks above still apply
 #   (a bare "-" noop remains undeclarable - a script cannot prove no
 #   behavior changed).
 set -euo pipefail
@@ -183,6 +187,22 @@ for name in files:
     kinds = {k for k, _ in entries}
     if "noop" in kinds and kinds - {"noop", "malformed"}:
         problems.append(f"{name}: '-' cannot be combined with anchor entries")
+        continue
+    # round 31, swe-2 item 40: in --base mode a fragment that is
+    # itself part of the diff cannot declare a noop while the same
+    # diff touches docs/specs/*.md - the spec edit IS documented
+    # behavior changing, so it must be anchored, not noop'd away.
+    # Fragments outside the diff keep the old semantics (pending
+    # entries awaiting the release-prep fold).
+    if (
+        "noop" in kinds
+        and changed_specs
+        and frag_rel in changed_fragments
+    ):
+        problems.append(
+            f"{name}: '-' noop declared but the diff touches "
+            f"{sorted(changed_specs)} - a spec edit must be anchored"
+        )
         continue
     for op, ref in entries:
         if op == "noop":

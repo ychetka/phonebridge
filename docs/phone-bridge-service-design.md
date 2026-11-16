@@ -64,6 +64,7 @@ referenced sections.
 | round 24 (architect review 13 — `SA_carbon_review_13`, final Phase-0 contract freeze v0.0.19, issue #59) | MediaRouter pacing direction CORRECTED (ADR-24.1): the agent-socket reader drains continuously at socket speed (`0x01` → 1500-frame ring, `0x02` → immediate ring drain), pacing applies on EGRESS — one 640 B frame per monotonic 20 ms tick toward the LineProvider; `LineTimeouts` effective-value model (ADR-24.2) split from the `TimeoutConfig` patch — `LineAssignment.timeouts` for SQLite write-through + `ProviderBinding.heartbeat_interval_ms` stamps the negotiated per-session cadence; `heartbeat_down_after > heartbeat_degraded_after` validated on both models; `validate_e164_country` + `ForwardViaLineFallback` model validator + `LineAssignment` self-loop ban move dial-target validation from `configure_line` into the constructors; provider `caps` are non-empty telecom-only (`dial_out`/`receive_inbound` — `exclusive_line` is a `LineAssignment.claimable`/`mode` property, never a cap); docstrings freeze the `ingest_ring` glare matrix (BUSY/DOWN → `INVALID_STATE`, provider Hangup), `tick(now)` as the sole timer driver (`decide_fallback` before `expires_at` → `INVALID_STATE`; `fallback_accept_ttl_sec` expiry → `RINGING_LOCKED -> FREE` + `MissedCallEvent{ACCEPT_WINDOW_EXPIRED}`), error mapping (`CLAIM_NOT_FOUND` under `INVALID_STATE`, unknown `assignment_id` → `STALE_TOKEN`, `call.release` XOR breach → `INVALID_ARGUMENT`) and `AssignmentId` rotation on owner/mode change with bounded `_closed_assignments`; hci-agent `0x16 SCO_STATE` gains `handle?: uint16` (required on open, ADR-24.3) + continuous 2-bit H2 counter rewritten on ALL outbound mSBC packets including silence | contract.py, docs/api-contract.md, docs/hci-agent.md, §3.3, §3.6, §6.3, §6.6, §9 |
 | round 25 (`SA_carbon_review_15` — pre-M1 contract consolidation) | Deployment: `--network=host` + `/dev/vhci` on a dedicated host ratified as THE production profile (`AF_BLUETOOTH` is `init_net`-only; isolated netns impossible), micro-VM documented as optional hardened profile; `phonebridge doctor` pre-flight; UDS `0660`/`0700` state dirs. Contract: `LineState`/`LivenessState` split (`event.line_health_changed`, RESERVED/DEGRADED/DOWN removed from occupancy); `event.claim_resolved`/`event.assignment_granted`/`event.queue_cancelled` added (`assignment_id` finally reaches the owner); agent/provider media endpoint split (`MediaCredentials`); `line.reattach_media`/`call.reattach_media` token reissue; ring correlates by line not token (fallback token + snapshot reconcile + 1:1 ambiguity rule + provider `/run` state file); queue `seq` minted at acquire ingress; provider `call_state` gains `observed_at`/`call_token`/`caller_id`/`reason` echo + provider disconnect-reason closed vocab; `call.release` XOR `{lease_id\|assignment_id}` + `STALE_TOKEN`; `system:*` identities rejected on external sockets; `clear_idle_revoke_after`; forwarding cycle bound 8 hops; `max_call_duration_sec`/`ring_drain_ttl_sec` timeouts; media pair TTL 30 s + `network_error` teardown on timeout; DTMF `0x02` timestamped watermark flush + ALERTING early-media gate; `call.get_lines` privacy filter + redacted broadcast `line_state_changed` reasons for exclusive lines; JSON-RPC numeric error codes + `error_code`/`ErrorData` + `UNAUTHORIZED`/`FORBIDDEN`/`SESSION_NOT_FOUND`; WS-over-UDS framing 64 KiB | contract.py, docs/api-contract.md, docs/hci-agent.md, §2.1, §4.5, §5.2-§5.4, §6.3-§6.4, §7, §9-§10, §13 |
 | round 30 (`SA_carbon_review_19` slice B2a — design-doc hardening) | Webhook HTTP client never follows `3xx` (redirect = delivery failure under the retry budget); `/var/lib/phonebridge-media` third volume + media quotas (`max_recording_sec`, per-line cap, delete-after-send, retention TTL, ENOSPC isolation from SQLite WAL); `restore_line` kernel compensation + single-transaction `lines`+`line_assignments` writes + hydration as last-resort reconciler; single mutation lock covers kernel call→drain→`bus.publish` on every adapter path (per-mutation FIFO); `forward_via_line` second-leg FSM (`enqueue` on busy, terminal on unreachable/`DIAL_REJECTED`, ~20 s budget, either-leg teardown); `answer_and_announce` decision-time eligibility (EXCLUSIVE or live `receive_inbound`, degrade `no_pickup`), WAV-only ref validated at `configure_line`, hangup only after MediaRouter drain + jitter budget; `record_and_telegram` bot token in SQLite secrets injected by supervisor, mandatory beep before record, dead-letter spool + restart resume; `/run/phonebridge/<line_id>.json` bound to call-instance id + deleted on teardown + stale-age rejection; sibling-liveness check precedes D-Bus-loss `call_state` reports (`dongle_lost` ordering, supervisor flush window); phone numbers PII-masked incl. exec-hook stdio, `DIAL_REJECTED.detail`, `phonebridgectl` (default masked, `--reveal`); `remove_line` → `INVALID_STATE` while referenced by another line's `forward_via_line`; exec-hook coalescing keyed per `(hook, line_id)` keeps latest payload (cross-line payloads never merge); `vhci.lock` on a host-shared path (bind-mount or host-side lock service) | §2.1, §4.5, §5.3-§5.4, §7, §10 |
+| round 31 (`SA_swe2_review_1` — 40/40 accepted, design batch 3) | `provider_bindings` becomes a persisted table (`channel_seq`, `last_seen_at`, heartbeat stamps) — `hydrate_lines` loads bindings DEAD (`ws_disconnected` + expired `orphan_deadline_at`) and the first `tick` runs the full orphan cascade unless a fresh `provider.register` supersedes; orphan cascade spelled atomically (UNREACHABLE → lease `network_error` teardowns → ticket/claim `provider_lost` cancels → ring/`external_call` reset → binding tombstone; heartbeat-down suspended while `ws_disconnected`); uplink overflow single policy — socket ALWAYS read, `0x02`/`0x03` processed normally, drop-NEWEST PCM only, `0x04` + `event.media_overflow` once per contiguous episode; mutation lock NARROWED to kernel mutation + drains (in-memory) — SQLite write-through and `bus.publish` ride a single ordered writer task preserving per-mutation FIFO, `restore_line` compensation re-enters the lock deadlock-free; `compensate_dial(line_id, assignment_id, lease_id)` binding-scoped saga entry (hangup-first `network_error`, no fabricated provider facts); `CallPhase.ANSWERING` internal accept phase; provider-stamp watermark — ping facts below the watermark are applied CLAMPED, state facts are deduped; `provider_call_id` exact ring identity + `RING_DEDUP_MIN_GAP_SEC` best-effort fallback; `record_and_telegram` gains mandatory `announcement_ref` + `max_recording_sec` policy fields; stale-surface refresh (four listeners, `LineSummary.assignment_id`, full method/event inventories, `remove_line` quiescent-only) | §2.2-§3.6, §4.2, §4.5, §5.2-§5.4, §6.3-§6.4, §6.6, §7, §9-§10 |
 
 ## §1. Service boundary
 
@@ -326,6 +327,27 @@ interface LineProviderConfig {
   interval and rungs
   admin-configurable; `DEGRADED`/`DOWN` are no longer `LineState`
   members since round 25).
+- **Provider-side stamps are advisory dedup keys, never clocks
+  (rounds 28/31):** `provider.ping`'s `checked_at` and
+  `provider.call_state`'s `observed_at` travel on provider-clock
+  time and are used ONLY as dedup/ordering keys — all deadline
+  arithmetic (orphan grace, heartbeat ladder) runs on kernel
+  receipt time. A stamp deeper than `MAX_CLOCK_SKEW_SEC` (30 s)
+  into the FUTURE is normalized to kernel `now` at ingestion so an
+  NTP-skewed peer can neither arm a permanent dedup barrier nor
+  suspend the ladder; a PAST stamp is retained verbatim as the
+  dedup key. The dedup watermark is MONOTONE-MAX per line and
+  survives a reregister. **Clamp-vs-drop split (round 31,
+  SA_swe2_review_1 item 19 — the NTP-rewind rule):** a
+  sub-watermark PING still lands as a live-channel heartbeat —
+  it is APPLIED with its stamp clamped to the recorded watermark
+  (`last_seen_at` refreshes to kernel `now`, the stored ordering
+  key never rewinds) — while a sub-watermark STATE-CARRYING fact
+  (`provider.call_state`, a `state_snapshot` element) is DROPPED
+  as a duplicate and never applied backwards. Facts naming a
+  superseded `assignment_id` never reach the watermark at all —
+  they resolve `STALE_TOKEN` through the closed-assignment ring
+  first.
 - Two distinct failure levels (round 20 — resolves the §5.4
   contradiction): (a) provider **WS drop** while the underlying
   telephony path survives -> in-flight calls stay up at the provider,
@@ -355,15 +377,24 @@ code only, and registration is provider-initiated rather than the
 gateway reaching in. Superseded again round 12: remote nodes now run
 the hci-agent only; the provider is always container-local.)
 
-### §2.3 Two surfaces, one daemon
+### §2.3 Four surfaces, one daemon
 
-The gateway daemon exposes two listeners over one shared in-process
-LineManager kernel:
+The gateway daemon exposes four listeners over one shared in-process
+LineManager kernel (the admin and internal surfaces were always
+implicit; round 31 pins the full inventory):
 
 | Surface | Listener (example) | Peer | Namespace |
 |---|---|---|---|
 | **Manager** | `wss://gw:7001/provider` | Line providers (LocalLine, RemoteLine) | `provider.*` (up), `line.*` (down) |
 | **APICallService** | `wss://gw:7002/agent` | AI agents | `agent.*`, `call.*` (up), `event.*` (down) |
+| **AdminService** | `unix:///run/phonebridge/admin.sock` (mode 0600) or `wss://gw:7004/admin` | Admin clients (`phonebridgectl`, admin MCP) | `admin.*` |
+| **InternalService** | `unix:///run/phonebridge/internal.sock` (mode 0600, never bind-mounted or network-exposed) | In-container service identities (`system:*`, e.g. the FallbackWorker) | `agent.*`, `call.*` (up), `event.*` (down) |
+
+The internal listener is the ONLY socket family where a `system:*`
+identity may authenticate — its peer credential (`SO_PEERCRED`)
+attests the local service process; every externally issued key is
+forbidden from carrying a `system:*` subject, so an agent socket can
+never mint a worker identity.
 
 Deliberate asymmetries inside the otherwise symmetric "everything is
 registration" model:
@@ -414,7 +445,11 @@ type LivenessState = "reachable"|"degraded"|"ws_disconnected"|"unreachable"|"unb
 // "unbound" is a LineSummary listing value for provider-less lines —
 // never an event.line_health_changed endpoint (round 26).
 type LineSummary = { line_id: string, caps: Intent[], state: LineState,
-                     liveness: LivenessState, profile?: string };
+                     liveness: LivenessState, profile?: string,
+                     assignment_id?: string };
+// assignment_id is present ONLY on an EXCLUSIVE row owned by the
+// calling agent (round 27) — the durable fallback to
+// event.assignment_granted for call.release{assignment_id}.
 ```
 
 Error codes (contract-level; each maps to a numeric JSON-RPC
@@ -439,10 +474,13 @@ normal result, not an exception.
 | method | semantics |
 |---|---|
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` -> `{session_id}`; declarative wish resolved by the intent-resolver into a LineAssignment (§4) |
-| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?, idempotency_key?}` -> `{granted:true, line_id, lease_id, expires_at}` or `{granted:false, queued:true, ticket_id, position}` or `{granted:false, free_lines[]}`; `free_lines:[]` = nothing available - routine result, the client retries itself. `expires_at` is the grant TTL deadline (round 20). Optional `enqueue` joins the FIFO queue (§3.4); a non-empty `(session_id, idempotency_key)` scopes retry dedup (`idempotency_key` bounded 1-128 chars, round 23) |
+| `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?, idempotency_key?}` -> `{granted:true, line_id, lease_id, expires_at}` or `{granted:false, queued:true, ticket_id, position}` or `{granted:false, free_lines[]}`; `free_lines:[]` = nothing available - routine result, the client retries itself. `expires_at` is the grant TTL deadline (round 20). Optional `enqueue` joins the FIFO queue (§3.4); a non-empty `(method, session_id, idempotency_key)` triple scopes retry dedup — the keyspace is partitioned by METHOD (round 31), so the same key under `call.acquire`/`call.dial`/`call.accept`/`call.claim_exclusive` names independent operations; `idempotency_key` bounded 1-128 chars, round 23) |
 | `call.release` | `{session_id, lease_id?, assignment_id?}` - exactly ONE target (round 22): `lease_id` ends the ephemeral lease (undialed grant frees the line; in-flight call is hung up first); `assignment_id` is the durable-binding path - the exclusive owner voluntarily releases its LineAssignment. `OWNER_MISMATCH` on a foreign target; zero or BOTH targets = `INVALID_ARGUMENT` (round 24) |
-| `call.dial` | `{session_id, lease_id, number, country}` -> `{lease_id, media_endpoint, media_token}`; strict E.164 + ISO alpha-2 cross-check BEFORE the line (round 12) - `DIAL_REJECTED` with a typed `data.reason`, otherwise the validated E.164 passes to `line.dial` unchanged |
-| `call.accept` | `{session_id, call_token}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired or the token was already consumed, `OWNER_MISMATCH` as applicable (round 21) |
+| `call.dial` | `{session_id, lease_id, number, country, idempotency_key?}` -> `{lease_id, media_endpoint, media_token}`; strict E.164 + ISO alpha-2 cross-check BEFORE the line (round 12) - `DIAL_REJECTED` with a typed `data.reason`, otherwise the validated E.164 passes to `line.dial` unchanged. A same-key retry returns the STORED result — including media credentials whose one-shot `media_token` may already be consumed; fresh credentials come only from `call.reattach_media` (round 31) |
+| `call.accept` | `{session_id, call_token, idempotency_key?}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired or the token was already consumed, `OWNER_MISMATCH` as applicable (round 21). The minted lease starts in the internal `answering` phase (round 31 — `line.answer` in flight, no wire spelling) and reconciles to `active`/`disconnected` from provider facts; the same stored-result/consumed-token idempotency rule as `call.dial` applies |
+| `call.claim_exclusive` | `{session_id, line_id, idempotency_key?}` -> `{claim_id, status:"pending_approval"}` — durable exclusivity by CLAIM + moderator approval in admin (never self-granted, §4.2); resolution arrives asynchronously as `event.claim_resolved` (+`event.assignment_granted` on approval) |
+| `call.cancel_acquire` | `{session_id, ticket_id}` -> `{ok}` — withdraw a queued ticket; idempotent no-op for an id that is not a LIVE ticket of the calling session (never-queued, granted, cancelled or expired ids all resolve `{ok}`), `OWNER_MISMATCH` only for a LIVE foreign ticket (round 31) |
+| `call.reattach_media` | `{session_id, lease_id}` -> `{lease_id, media_endpoint, media_token}` — fresh AGENT media credentials for a live lease after its media socket dropped while the control channel lived (round 25); the new pair supersedes and invalidates the prior agent token |
 | `call.hangup` / `call.send_dtmf` / `call.get_lines` | call control and line listing |
 
 DTMF is mandatory from v1 - an agent cannot survive IVR trees
@@ -475,7 +513,14 @@ for single-task agents).
 
 Up: `provider.register`, `provider.reregister`, `provider.ping`,
 `provider.capability_update`, `provider.call_state`,
-`provider.audio_ready` (round 14).
+`provider.audio_ready` (round 14), `provider.audio_lost` (round 30 —
+`lease_id?` omitted for a line-scoped loss that resets every live
+lease on the line; resets the lease's `audio_ready` latch in
+kernel-side media state, not on the frozen `CallLease` DTO, so the
+latch re-arms on the next `audio_ready`), `provider.reattach_media`
+(round 27 — fresh provider media credentials for a live lease after
+the provider's media socket dropped while its control channel
+lived).
 Down (server-initiated on the provider's own inbound connection):
 `line.dial`, `line.answer`, `line.hangup`, `line.send_dtmf` -
 each carrying `{assignment_id, lease_id, ...}` and returning
@@ -484,10 +529,22 @@ each carrying `{assignment_id, lease_id, ...}` and returning
 (XOR target, round 23). `line.revoke` exists but is **admin-only**
 (round 10f). The `{accepted}` reply on `line.dial`/`line.answer`
 is awaited by the adapter with a ~2 s deadline (round 23, Saga
-compensation): `{accepted:false}` / timeout / transport error MUST
-be fed back as `provider.call_state{state:"disconnected",
-reason:"network_error"}` so the lease never wedges in DIALING -
-the kernel answers the agent's `call.dial`/`call.accept` without
+compensation; mechanism pinned round 31, SA_swe2_review_1 item 5):
+`{accepted:false}` / timeout / transport error MUST drive the
+kernel's binding-scoped `compensate_dial(line_id, assignment_id,
+lease_id)` entry — an adapter/kernel-internal call, never a wire
+method and never a fabricated `provider.call_state` fact (the
+provider reported nothing; a synthesized `disconnected` would lie
+about an observation that never happened). `compensate_dial`
+enqueues a best-effort `line.hangup{lease_id}` FIRST — air-side
+teardown of the call leg that may have physically reached the
+phone — then ends the lease with `network_error` in the same
+atomic mutation; if the provider socket is dead the command drops
+silently and the lease still ends. Unlike owner-scoped
+`call.hangup` it requires no agent `session_id` — the adapter
+holds none and must not forge one — and a genuine provider
+`disconnected` arriving later dedupes against the closed lease.
+The kernel answers the agent's `call.dial`/`call.accept` without
 waiting for this reply.
 
 ### §3.6 Events (`event.*` down to agents)
@@ -528,6 +585,27 @@ EXCLUSIVE line idle past `idle_revoke_after`: routed to admin-scope
 subscribers and the configured escalation channels, never to
 ordinary agent sessions, and NEVER implying a revoke; emitted at
 most once per continuous idle period.
+
+The liveness/claim/queue companions (rounds 25-28; inventory pinned
+round 31): `event.line_health_changed{line_id, old_state,
+new_state}` reports provider liveness transitions on the
+`LivenessState` axis (§2.2 — `reachable`/`degraded`/
+`ws_disconnected`/`unreachable`; `unbound` is legal only as the
+initial `old_state` of a first attach). `event.claim_resolved
+{claim_id, line_id, status, assignment_id?, reason?}` resolves a
+`call.claim_exclusive` filing to the claiming session
+(`assignment_id` present iff approved; `status:"rejected"` also
+fires automatically when the claimed line's provider dies —
+`reason:"provider_lost"`). `event.assignment_granted{assignment_id,
+line_id, mode}` hands the approved exclusive owner the
+`assignment_id` it needs for `call.release{assignment_id}` —
+re-delivered to a later-registering owner session.
+`event.queue_cancelled{session_id, ticket_id, reason}` reports a
+server-side ticket drop (`line_exclusive`/`provider_lost`/
+`capability_removed`/`claim_resolved`). `event.media_overflow
+{lease_id, line_id}` (round 31) is emitted ONCE per contiguous
+uplink-overflow episode — the pacing/buffer semantics live in
+§6.6.
 
 `sms_received` and every other SMS surface are removed (§8).
 
@@ -584,7 +662,13 @@ the ≤0.0.12 conflation where `register_provider` returned a
 LineAssignment is removed): the provider attachment record
 (`assignment_id` in the *binding* space, `caps`, `profile`,
 `liveness`, `connected_at`, `last_seen_at`,
-`orphan_deadline_at`). LineAssignment = who owns the line for
+`heartbeat_interval_ms`, `heartbeat_degraded_after`,
+`heartbeat_down_after`, `channel_seq`, `orphan_deadline_at` — the
+heartbeat stamps and `channel_seq` are frozen at register time, and
+the record persists on the `provider_bindings` table since round 31,
+§4.5 — `liveness`/`orphan_deadline_at` still re-derive on load
+because the sockets they describe died with the process).
+LineAssignment = who owns the line for
 AGENT purposes; ProviderBinding = which provider physically
 serves it. Both share the `AssignmentId` tag; admin operations
 disambiguate by which object the id resolves to — revoking a
@@ -654,7 +738,8 @@ with a SQLite store by the admin adapter (M2) without ever doing
 I/O inside a kernel mutation (CODING_HAZARDS rule 4).
 
 - **SQLite (`WAL` mode, `synchronous=NORMAL`) holds ONLY durable
-  configuration and keys:** `api_keys` (SHA-256/HMAC token hashes +
+  configuration, keys and provider-attachment rows:** `api_keys`
+  (SHA-256/HMAC token hashes +
   scope + subject_id), `lines` (`line_id`, `adapter_mac`,
   `paired_phone_mac`, `transport_profile`, `claimable`,
   `accept_window_sec`, `fallback_policy_json`,
@@ -664,21 +749,40 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   `owner_agent_id`, `mode`, `idle_revoke_after_sec`, `profile`,
   `last_seen_at` — required since round 25: without it the
   alert-only idle clock restarts from zero on every daemon restart),
-  and `escalation_hooks`.
-- **Memory-only (never persisted):** `ProviderBinding`,
-  `CallLease`, `QueueTicket`, `PendingClaim`, and the
+  `provider_bindings` (round 31, SA_swe2_review_1 item 3 —
+  `assignment_id`, `line_id`, `caps_json`, `profile`, `meta_json`,
+  `connected_at`, `last_seen_at`, `channel_seq`,
+  `heartbeat_interval_ms`, `heartbeat_degraded_after`,
+  `heartbeat_down_after`: the persisted identity card lets a
+  restarted kernel distinguish "provider that re-registers" from
+  "provider that never came back" and keeps the line-scoped stamp
+  watermark across restarts; `liveness`/`orphan_deadline_at` are
+  NOT durable columns — they re-derive on load, see the
+  hydrated-dead rule below) and `escalation_hooks`.
+- **Memory-only (never persisted):** `CallLease`, `QueueTicket`,
+  `PendingClaim`, and the
   `_closed_leases` tombstone ring. Active calls are NOT restored
   from the DB on restart - they are rebuilt through the
   `GetCalls()`/`state_snapshot` reconciliation protocol (§9), so
   the store can never disagree with the real modem state.
-- **Sync pattern (no I/O in the kernel; widened round 25):** at
-  startup the gateway reads `lines` + `line_assignments` and passes
-  them as `initial_lines` to the `InMemoryLineManager` constructor.
+- **Sync pattern (no I/O in the kernel; widened round 25;
+  `hydrate_lines` naming round 31):** at
+  startup the gateway reads `lines` + `line_assignments` +
+  `provider_bindings` and hands the validated rows to the kernel in
+  ONE batch `hydrate_lines(rows, bindings)` call — never per-row
+  `assign_line`/`register_provider` replays. Binding mutations
+  (`register`/`reregister`/supersede/revoke and their `channel_seq`/
+  `last_seen_at` stamps) upsert the `provider_bindings` row through
+  the same ordered writer path (round 31) — the provider adapter
+  owns those writes the way the admin adapter owns line config.
   EVERY `LineAssignment` mutation — not only admin calls: the
   agent-side `call.release{assignment_id}` path included —
-  serializes these rare writes under an `asyncio.Lock` through the
-  SAME write-through path: first the kernel call, then the returned
-  immutable `LineAssignment` snapshot is committed to SQLite.
+  serializes these rare writes through the SAME two-phase path
+  (lock narrowed round 31, see the drain-discipline bullet below):
+  first the kernel call under the single in-memory mutation lock,
+  then the returned immutable `LineAssignment` snapshot is
+  committed to SQLite by the shared ordered writer task — no disk
+  I/O ever inside the lock.
   **The durable write is ONE transaction (round 30, review-19
   B2a#5):** a line-level mutation that touches both tables — the
   `lines` row and its `line_assignments` row(s), e.g.
@@ -698,11 +802,13 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   on different lines of one chain can never each pass the check in
   isolation and combine into a cycle — the lock covers the
   revalidation, not only the row write
-  (`upsert` by `line_id`). `revoke_assignment` returns the new
-  post-revert snapshot (rotated `assignment_id`, `None` for a
-  provider-binding id). The kernel stays I/O-free; a crash between
+  (`upsert` by `line_id`). `revoke_assignment` returns a BOOLEAN
+  (round 31 — `True` when an agent-owned grant reverted to the
+  pool, `False` for a provider-binding id or an idempotent retry
+  on a tombstoned id). The kernel stays I/O-free; a crash between
   the two writes leaves SQLite one mutation behind — bounded and
-  surfaced: the store rows are rehydrated as `initial_lines` on next
+  surfaced: the store rows are reloaded through `hydrate_lines` on
+  next
   boot, and a failed write-through marks the line `config_stale`
   in observability until a succeeding write resyncs it. The same
   write-through path carries `last_seen_at` refreshes — stamped on
@@ -721,47 +827,87 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   `LineSummary` carries it, because the kernel never observes
   store-write outcomes.
 - **Write-through failure = kernel compensation (round 30,
-  review-19 B2a#1):** a failed durable write AFTER the kernel
+  review-19 B2a#1; `line_id` parameter added round 31):** a failed
+  durable write AFTER the kernel
   mutation committed is rolled back through
-  `LineAdminKernel.restore_line(snapshot)` — the only legal
+  `LineAdminKernel.restore_line(line_id, snapshot)` — the only legal
   compensation path. The adapter captures the pre-mutation
   `LineAssignment` snapshot before every write-through; on a
   failed `lines`-row upsert/delete it passes that snapshot back
-  (`snapshot=None` un-creates a just-provisioned record, a prior
+  (`snapshot=None` un-creates the record at `line_id`, a prior
   snapshot is restored verbatim for a patched/revoked/removed
-  one), the kernel emits the COMPENSATING events the rollback
+  one — including a tombstoned `assignment_id`: the
+  `_closed_assignments` ring is consulted on agent/provider
+  INGRESS only, never on hydration or restore), the kernel emits
+  the COMPENSATING events the rollback
   implies so the already-drained outbox never claims a durable
   change the store does not reflect, and the failure surfaces as
   `config_stale` plus an admin alert. This closes the lifecycle
   hole `config_stale` alone could not: a failed `provision_line`
   write no longer leaves a lease-serving ghost that vanishes at
   restart, and a failed `remove_line` delete no longer resurrects
-  the line from `initial_lines` at next hydration — the
+  the line at next hydration — the
   compensation runs inside the same call, so the kernel and the
   store re-converge immediately instead of diverging until the
   next boot. Hydration is the LAST-resort reconciler: boot-time
-  `hydrate_lines` loads `initial_lines` verbatim from the store
+  `hydrate_lines` loads the stored rows verbatim from the store
   (the store is authoritative on cold start — a kernel-only record
   that never persisted is simply absent), so any residue a crashed
   compensation left is re-converged at restart, never mid-flight.
+- **Hydrated-dead bindings (round 31, SA_swe2_review_1 items
+  3/18):** every persisted `provider_bindings` row loads through
+  `hydrate_lines` as a DEAD binding — liveness forced to
+  `ws_disconnected` regardless of the stored rung (the sockets it
+  described died with the process), `last_seen_at` preserved, and
+  `orphan_deadline_at` ALREADY EXPIRED — so the first `tick`
+  after hydration runs the standard orphan cascade on the row
+  (§5.4): live-lease teardown is a no-op (no `CallLease` rows
+  persist), pending tickets/claims resolve `provider_lost`, ring
+  and `external_call` bookkeeping resets, and the binding id moves
+  into the `_closed_assignments` tombstone ring. A fresh
+  `provider.register` arriving BEFORE that first tick legally
+  supersedes the dead row — it arrives on a NEW control socket,
+  so the kernel mints a fresh `assignment_id` and `channel_seq`
+  and the dead row's pending cascade never races the live binding
+  (reconnect inside a LIVE orphan-grace window still uses
+  `provider.reregister`; a `provider.register` is `INVALID_STATE`
+  only against a live-channel binding). Legacy rows written before
+  `channel_seq` existed are backfilled at the STORE layer
+  (generation `1`) before `hydrate_lines` is called — the kernel
+  hydrates only fully-validated rows and never normalizes a
+  missing generation itself.
 - **Drain discipline + event ordering (round 25, clarified;
-  ordering pinned round 30, review-19 B2a#5-6):** whichever adapter
+  ordering pinned round 30, review-19 B2a#5-6; lock NARROWED
+  round 31, SA_swe2_review_1 item 15):** whichever adapter
   called the kernel, the drained outbox items feed the SHARED
   EventBus and provider-command executor — never the draining
   adapter's own connection. An admin-adapter drain after
   `approve_claim` therefore still delivers `event.claim_resolved`
   to the agent's session through the same bus; this is why
   `LineAdminKernel` exposes `drain_events()`/
-  `drain_provider_commands()` too. The SINGLE mutation lock covers
-  the WHOLE emission cycle for EVERY adapter path — agent RPC,
-  provider RPC, `tick(now)`, and admin RPC alike: kernel call →
-  `drain_events()` → `drain_provider_commands()` →
-  `bus.publish`/command dispatch, with the SQLite write-through
-  (and any `restore_line` compensation) inside the same critical
-  section. No adapter may drain outside the lock, and the EventBus
-  preserves per-mutation FIFO — envelopes enter the bus in exactly
-  the order their mutations committed. A lock-free drain (e.g. a
-  `tick` racing an `await`-parked write-through) could interleave
+  `drain_provider_commands()` too. The SINGLE mutation lock now
+  covers ONLY the in-memory phase for EVERY adapter path — agent
+  RPC, provider RPC, `tick(now)`, and admin RPC alike: kernel call
+  → `drain_events()` → `drain_provider_commands()`, then the
+  lock RELEASES before any I/O. The I/O phase rides a SINGLE
+  ORDERED WRITER TASK shared by all adapters: each mutation hands
+  the writer one ordered bundle `{write-through job?, drained
+  events, drained provider commands}`; the writer performs the
+  SQLite write-through first, then `bus.publish`/command dispatch,
+  strictly in submission order — so per-mutation FIFO survives
+  without a socket or a disk write ever sitting inside the lock
+  (an `await` on the provider channel or the WAL can no longer
+  park a `tick` behind a slow mutation). Failure handling keeps
+  the same ordering: on a failed write-through the WRITER — not
+  the mutating adapter — invokes `restore_line(line_id,
+  snapshot)`, which re-enters the mutation lock as an ordinary
+  locked mutation (the lock is already free: no deadlock, the
+  writer never waits on itself) and drains its compensating
+  items onto the SAME writer queue behind the failed mutation's
+  own bundle — observers always see mutation-then-compensation in
+  order, never a compensation that outruns the mutation it
+  corrects. A lock-free drain (e.g. a
+  `tick` racing a parked writer) could interleave
   events and provider commands across mutation boundaries —
   forbidden: ordering is part of the single-writer contract, not
   a best-effort property of whichever adapter happened to call
@@ -800,7 +946,19 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
    inside `ingest_ring`, returned to the provider in the
    `{ok, call_token}` response (round 22) - the provider echoes it
    on subsequent reports for the ring so a pre-answer caller
-   hangup correlates.
+   hangup correlates. **Ring identity (round 31,
+   SA_swe2_review_1 item 20):** the ring report (and each
+   `state_snapshot` ringing element) may carry the provider's own
+   `provider_call_id` handle — when present it is the EXACT dedup
+   key: distinct handles are distinct calls no matter how close
+   together, and a re-report under the same handle can never mint
+   a second `call_token`. Without the handle dedup is best-effort
+   on `(line_id, caller_id)`: two same-number ring reports within
+   `RING_DEDUP_MIN_GAP_SEC` (30 s) merge as ONE physical ring,
+   while reports further apart are genuinely distinct calls — the
+   residual ambiguity is documented (a fast same-number redial
+   inside the window merges; an adapter that always fills
+   `provider_call_id` removes it).
 2. Gateway consults LineAssignment: owner exists -> wake owner via
    configured hooks; no owner -> event to the live
    `receive_inbound`-intent sessions (round 22 - a shared pool
@@ -819,7 +977,13 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
    attach. Owner-scoped lines reject non-owner accepts with
    `OWNER_MISMATCH`; a second accept gets `STALE_TOKEN` (round 21 -
    `LINE_BUSY_INCOMING` never applies here: the accept consumes the
-   ring, it does not contend with one).
+   ring, it does not contend with one). The minted lease starts in
+   the kernel-internal `CallPhase.ANSWERING` (round 31): the
+   `line.answer` command is in flight but the network has not yet
+   confirmed — the phase has NO wire spelling (it never appears as
+   an `event.call_state_changed.state`), reconciles to `active` or
+   `disconnected` from the provider's reports, and is covered by
+   `max_call_duration_sec` like any other post-acquire phase.
 5. **Accept window: default 30 s; ALL timeouts and windows are
    admin-configurable** (round 10a).
 6. Timeout -> the line's `fallback_policy` (§5.3). **Ring-drain rule
@@ -901,12 +1065,18 @@ HTTP, WAV files, or call bridging:
 - `record_and_telegram:<channel>` - answer, record the call/
   voicemail ourselves, post to a Telegram channel (recording
   architecture expanded round 30, review-19 B2a#9): **beep first** —
-  the worker MUST play an audible announce/beep to the caller
-  BEFORE recording starts (the `answer_and_announce` machinery),
-  so a recorded party never hears dead air and hangs up thinking
-  the line is dead; recording length is bounded by
-  `max_recording_sec` (§10 media quotas — a dedicated bound
-  independent of `max_call_duration_sec`, which defaults off).
+  the policy carries a MANDATORY `announcement_ref` field (round 31,
+  SA_swe2_review_1 item 26 — the checked-identifier selector of the
+  provisioned WAV asset the worker MUST play BEFORE recording
+  starts, the `answer_and_announce` machinery; a recording leg
+  never runs unannounced, so a recorded party never hears dead air
+  and hangs up thinking the line is dead); recording length is
+  bounded by the policy's own `max_recording_sec` field (round 31 —
+  a `RecordAndTelegramFallback` model field, not a `timeouts` knob:
+  default 300 s, `0 < v <= 86400`, the SINGLE authoritative
+  recording bound; the line's optional `max_call_duration_sec`
+  still caps the WHOLE call independently and the stricter of the
+  two wins — see §10 media quotas for the storage side).
   **Bot-token storage:** the Telegram bot token is a SECRET —
   stored in the SQLite `escalation_hooks`/`secrets` row alongside
   the channel id, never in `fallback_policy_json` and never on
@@ -1011,6 +1181,25 @@ agent-initiated hangup.
   lease then gets FRESH provider media credentials via
   `line.reattach_media` — media tokens are one-shot and did not
   survive the dropped socket (round 25).
+  **While the binding sits `WS_DISCONNECTED` the heartbeat-down
+  check is SUSPENDED (round 31, SA_swe2_review_1 item 22):** the
+  elapsed-silence ladder (`degraded`/`unreachable`) does not run on
+  a socket-less binding — `orphan_deadline_at` is its SOLE clock.
+  Expiry resolves the whole orphan atomically inside one `tick`
+  mutation — the **orphan cascade**: the binding escalates
+  `ws_disconnected -> unreachable`, every live lease on it ends
+  `network_error` (a best-effort `line.hangup` where a call leg
+  existed), every pending queue ticket the binding served cancels
+  `event.queue_cancelled{reason:"provider_lost"}`, every pending
+  claim on the line auto-rejects `provider_lost`, any ring or
+  `external_call` bookkeeping the binding owned resets (an expired
+  `fallback_call_token`/ring timer burns with its `MissedCallEvent`),
+  and the binding id tombstones into `_closed_assignments` so later
+  facts resolve `STALE_TOKEN`. A **hydrated-dead** persisted
+  `provider_bindings` row (§4.5) hits the identical cascade on the
+  first `tick` after load — its `orphan_deadline_at` loads already
+  expired — unless a fresh `provider.register` supersedes it
+  first.
 - **Half-open supersede (round 28):** a `provider.reregister` on a
   live REACHABLE binding — the provider's fresh control channel
   arrived before the old socket's death was even detected — is a
@@ -1184,13 +1373,26 @@ preserved there as the per-line tunnel port pair.)
   outbound USB mSBC packet, including generated silence on
   underrun (round 24, review-13 H1). The SCO packet SIZE the feeder
   emits MUST match the virtual adapter's declared synchronous
-  geometry — behind `/dev/vhci` the feeder IS the controller and
-  answers `HCI_Read_Buffer_Size`/synchronous-flow-control queries
-  itself with `sco_data_packet_len = 60` (mSBC profile,
-  `docs/hci-agent.md` §2): `hci_vhci` has no
+  geometry — behind `/dev/vhci` the feeder IS the controller, but
+  the geometry it declares comes from the REAL dongle, never from a
+  local constant (round 30/31, `docs/hci-agent.md` §2):
+  `HCI_Read_Buffer_Size` (`0x1005`) is PROXIED through the tunnel
+  to the physical controller like any other `HCI_PASSTHRU` — the
+  real `0x0e` answer comes back and the feeder only RECORDS the
+  returned `sco_data_packet_len`/ACL values as the negotiated
+  geometry — the earlier locally-answered `sco_data_packet_len =
+  60` rule is REMOVED (a fabricated answer would feed the kernel
+  buffer counts the chip never granted and would rewrite
+  `hdev->cmd_cnt` without the real controller's in-flight
+  bookkeeping). The declared length intersects the selected USB
+  altsetting's real payload: 48 B under altsetting 2 (CVSD),
+  60 B under altsetting 6 (mSBC), 60 B under altsetting 3 — the
+  alt-3 mSBC fallback carries the same 60 B mSBC payload, the
+  63 B HCI SCO packet (3 B header + 60 B) simply rides ~3
+  consecutive 25 B isoc microframes (`hci_vhci` has no
   `btusb` quirks, so a length negotiated for a real USB controller
   would misalign the 1-frame-per-packet invariant the H2 counter
-  rewrite assumes. The agent's numeric `air_mode` code (`0x03` =
+  rewrite assumes). The agent's numeric `air_mode` code (`0x03` =
   transparent/mSBC on BT Core Vol 4 Part B §2.1) is taken from the
   `0x2c` SCO-connection event, never from a string field.
 - **Playout start prefill (round 25, replaces any DSP-resampling
@@ -1264,9 +1466,21 @@ Design consequences:
   flush's `timestamp_ms` rides the AGENT'S UPLINK STREAM clock
   (round 28): the LineProvider stamps the `timestamp_ms` value of
   the last agent `0x01` frame it consumed before muting uplink for
-  the DTMF segment — `0` when no frame was consumed yet — never a
+  the DTMF segment — never a
   router-local wall-clock stamp, so the two clocks need no
-  alignment for the comparison to be meaningful.
+  alignment for the comparison to be meaningful. **"No frame
+  consumed yet" rides the `0x05` DTMF-START frame, not the
+  watermark (round 31, SA_swe2_review_1 item 34):** the provider
+  announces the mute with a 12 B `0x05` control frame carrying
+  `pre_dtmf_consumed` — the stamp of the last consumed agent
+  frame, or the reserved `0xFFFFFFFF` (`none`) when none was
+  consumed yet, which makes the trailing flush discard EVERY
+  still-queued frame. `timestamp_ms = 0` on a `0x02` is a REAL
+  watermark — the first stream frame legitimately stamps `0` —
+  never a sentinel; the `0xFFFFFFFF` discard-all encoding is
+  shared with the agent-side barge-in `0x02`, which occupies a
+  different frame's `timestamp_ms` slot and cannot collide with
+  `pre_dtmf_consumed`.
 
 ### §6.5 Remote-line audio transport (round 12)
 
@@ -1279,21 +1493,37 @@ control-TCP. A QUIC/multiplexed-streams unification is a V2 track.
 
 - **Uplink (agent → phone):** the MediaRouter reads the agent's
   media socket CONTINUOUSLY at socket speed (non-blocking drain —
-  the reader loop NEVER sleeps on a timer). Each `0x01` frame is
+  the reader loop NEVER sleeps on a timer, and it NEVER stops
+  reading under saturation either — round 31, SA_swe2_review_1
+  item 8: the kernel socket buffer is never used as a backpressure
+  lever, because an unread socket would strand the `0x02`/`0x03`
+  control frames multiplexed on the same stream behind PCM noise).
+  Each `0x01` frame is
   appended to a bounded, asymmetric uplink ring of **1500 frames
-  (30 s), drop-NEWEST** on overflow; a `0x02` frame drains the ring
-  IMMEDIATELY on receipt. Pacing applies strictly on EGRESS: a
+  (30 s), drop-NEWEST** on overflow; `0x02` flush and `0x03`
+  keepalive frames are processed normally even while the ring is
+  full (a `0x02` drains it IMMEDIATELY on receipt) — only `0x01`
+  PCM pays for saturation: the NEWEST arriving frame is dropped
+  and frames already queued are never evicted. Pacing applies strictly on EGRESS: a
   dedicated pacer task steps on a monotonic 20 ms schedule and
   writes ONE 640 B frame per tick from the ring into the
   LineProvider socket. Pacing the socket READ instead (round 24,
   review-13 C1) would strand an agent-originated `0x02` barge-in
   behind hundreds of queued audio frames inside `SO_RCVBUF` for
   seconds while the router ring idles near-empty — so the drain
-  side is deliberately unthrottled. Each overflow drops the NEW
-  frame and increments the `media.uplink_overflow` counter (plus a
+  side is deliberately unthrottled. Each dropped frame increments
+  the `media.uplink_overflow` counter (plus a
   warning log at first occurrence per lease) — the counter exists
   so the "agent wrote 30 s of audio in 100 ms" bug class is
-  observable instead of invisible latency.
+  observable instead of invisible latency. **Saturation signals
+  are per-EPISODE, not per-frame (round 31):** a contiguous
+  overflow episode emits exactly ONE `0x04 OVERFLOW` control frame
+  back to the producer plus ONE `event.media_overflow{lease_id,
+  line_id}` on the agent event channel — a new episode begins only
+  after the ring has drained and a further `0x01` is dropped. The
+  producer contract: an agent MUST NOT stream faster than
+  real-time minus jitter headroom — a TTS preload burst paces
+  itself to ≤1 `0x01` frame per 20 ms once it sees `0x04`.
 - **Downlink (phone → agent):** frames are written through
   IMMEDIATELY (no pacing) through a bounded ring of **100 frames
   (2 s), drop-OLDEST** — a slow reader hears the newest audio, not
@@ -1520,7 +1750,13 @@ status (mirrors the busctl commands used in Phase-0).
     round 22; line lifecycle and listings added rounds 27-28):
     `provision_line`/`assign_line`/`approve_claim`/`reject_claim`/
     `revoke_assignment`/`configure_line`/`remove_line`/
-    `list_lines`/`list_leases`/`list_tickets` — the agent-facing
+    `get_line`/`list_lines`/`list_leases`/`list_tickets`/
+    `list_pending_claims`/`list_assignments`/
+    `list_provider_bindings`, plus the store-facing
+    `hydrate_lines`/`restore_line` pair (§4.5) — every listing is
+    paginated at `MAX_LIST_PAGE` 64 rows per page (round 30/31,
+    same 64-row/64 KiB list-page bound as the agent listings) —
+    the agent-facing
     `LineManager` deliberately exposes no privileged mutations.
     `admin.provision_line` (round 28) is the "create" half of the
     line lifecycle: it mints a configured, quiescent `SHARED_POOL`
@@ -1565,7 +1801,8 @@ status (mirrors the busctl commands used in Phase-0).
   line mid-call cannot drop the call over a heartbeat window
   mismatch.
 - **`admin.remove_line` refuses a forward target (round 30,
-  review-19 B2a#13):** removing a line that ANOTHER configured
+  review-19 B2a#13; quiescent-only pinned round 31):** removing a
+  line that ANOTHER configured
   line's `forward_via_line` policy still references is rejected
   `INVALID_STATE` — a dangling policy would only surface as a
   `LINE_NOT_FOUND` at ring time, long after the misconfiguration
@@ -1573,7 +1810,15 @@ status (mirrors the busctl commands used in Phase-0).
   silently rewriting another line's `fallback_policy` inside a
   delete would hide an admin's intent behind a side effect; the
   operator retargets or clears the referencing policy first
-  (`configure_line`), then removes the line.
+  (`configure_line`), then removes the line. The same
+  `INVALID_STATE` refusal covers EVERY live attachment — a live
+  `ProviderBinding`, any `CallLease`, pending tickets or pending
+  claims (round 31, SA_swe2_review_1 item 6): `remove_line` never
+  mints a `provider.revoke` or an implicit teardown, so the
+  operator detaches through the existing revoke/hangup paths and
+  retries; only an OWNED-but-quiescent line emits an
+  `assignment_revoked` to its owner before the durable
+  `LineAssignment` is deleted (§4.5 write-through ordering).
 - **Escalation channels** (round 10c): admin-configured (e.g.
   Telegram) for idle/broken-line alerts; `idle_revoke_after` fires
   `event.idle_alert` (admin-audience, §3.6/§7) - alerts only,
@@ -1766,5 +2011,7 @@ Sequenced into narrow, independently testable PRs:
    §2.1; supervisord: gateway + per-line bundles + shared
    dbus/bluez/pipewire; hci-agents run OUTSIDE the container, one
    per dongle) with mandatory volumes `/var/lib/bluetooth` +
-   `/var/lib/phonebridge` (both `0700`), plus the `phonebridge
+   `/var/lib/phonebridge` + `/var/lib/phonebridge-media` (all
+   `0700` — three volumes, round 30/31; the media volume rides a
+   SEPARATE filesystem from the SQLite volume, §1 persistence), plus the `phonebridge
    doctor` pre-flight check in the entrypoint.

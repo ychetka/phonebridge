@@ -4,11 +4,18 @@
 # version bump merged without a release cannot stay invisible (the
 # 2026-11-12 version-tag-drift incident). Polls the remote for up to
 # VERSION_TAG_TIMEOUT seconds (default 600) because the release step
-# lands a few seconds after the merge push.
+# lands a few seconds after the merge push. A timeout of 0 means
+# "check once immediately, no polling" (round 31, swe-2 item 40 -
+# previously it made the poll loop exit without a single check).
 # Usage: check_version_tag.sh [timeout_seconds]
 set -uo pipefail
 
 TIMEOUT="${1:-${VERSION_TAG_TIMEOUT:-600}}"
+case "$TIMEOUT" in
+  ''|*[!0-9]*)
+    echo "FAIL: timeout must be a non-negative integer, got '$TIMEOUT'" >&2
+    exit 2 ;;
+esac
 
 VER=$(awk -F= '
   /^\[project\][[:space:]]*$/ {inp=1; next}
@@ -25,7 +32,12 @@ TAG="v$VER"
 echo "checking for remote tag $TAG (timeout ${TIMEOUT}s)"
 
 elapsed=0
-while [ "$elapsed" -lt "$TIMEOUT" ]; do
+# Run the check at least once regardless of TIMEOUT (round 31,
+# swe-2 item 40): with TIMEOUT=0 this loop performs a single
+# immediate check and falls through to FAIL - the old `-lt` guard
+# skipped the body entirely, so a 0 timeout false-failed without
+# ever looking at the remote.
+while true; do
   git fetch --tags --quiet \
     || echo "WARN: git fetch --tags failed - checking local refs only" >&2
   if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 \
@@ -33,8 +45,11 @@ while [ "$elapsed" -lt "$TIMEOUT" ]; do
     echo "PASS: tag $TAG exists on an ancestor of HEAD ($(git rev-parse --short "$TAG^{commit}"))"
     exit 0
   fi
-  sleep 30
-  elapsed=$((elapsed + 30))
+  [ "$elapsed" -ge "$TIMEOUT" ] && break
+  remaining=$((TIMEOUT - elapsed))
+  [ "$remaining" -gt 30 ] && remaining=30
+  sleep "$remaining"
+  elapsed=$((elapsed + remaining))
 done
 
 echo "FAIL: pyproject version $VER has no remote tag $TAG after ${TIMEOUT}s"
