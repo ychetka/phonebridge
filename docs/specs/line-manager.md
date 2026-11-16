@@ -96,7 +96,11 @@ same ring as a NEW `incoming_call`.
 overwrite a call fact (a `BUSY` line stays `BUSY` while its
 provider degrades). Provider health lives on the separate
 `LivenessState` axis (`reachable`/`ws_disconnected`/
-`unreachable`), surfaced via `event.line_health_changed`; liveness
+`unreachable`, plus the listing-only `unbound` for a line with no
+provider attached — legal as `event.line_health_changed`
+`old_state` solely on the first-attach `unbound -> reachable`
+transition, never as `new_state` or a reported fact, round 27),
+surfaced via `event.line_health_changed`; liveness
 transitions drive teardown policy (orphan grace vs immediate
 hangup), never occupancy.
 
@@ -106,11 +110,16 @@ hangup), never occupancy.
 `event.claim_resolved{claim_id, line_id, status, assignment_id?,
 reason?}` to the claiming session on approval AND rejection, and on
 approval additionally `event.assignment_granted{assignment_id,
-line_id, mode}` to the new owner — this is the ONLY path delivering
+line_id, mode}` to the new owner — the primary path delivering
 the `assignment_id` an owner needs for
 `call.release{assignment_id}` (an undelivered `assignment_id` makes
 a granted exclusive line un-releasable). `admin.assign_line` grants
-emit `event.assignment_granted` identically.
+emit `event.assignment_granted` identically. Delivery MUST NOT
+depend on the owner having a live session at grant time (round
+27): a pending grant is replayed to an owner session on
+`register_intent`, and `call.get_lines` fills
+`LineSummary.assignment_id` on the owner's own EXCLUSIVE rows as
+the durable read fallback.
 
 ### Requirement: Media credentials are split per role and reissuable (round 25)
 
@@ -118,7 +127,11 @@ emit `event.assignment_granted` identically.
 `provider_media_endpoint` pairs (local UDS vs WAN WSS coexist), and
 the one-shot per-role tokens MUST be reissuable without tearing
 down the call: `line.reattach_media` feeds fresh provider
-credentials to a lease preserved across `provider.reregister`, and
+credentials to a lease preserved across `provider.reregister`,
+`provider.reattach_media` covers the same provider-side reissue
+when the provider's media socket dropped while its control
+channel stayed alive (round 27 — the reregister path cannot cover
+it, it requires a control-socket drop first), and
 `call.reattach_media` feeds fresh agent credentials when the
 agent's media socket dropped while control stayed alive. A burned
 one-shot token MUST never be required twice.

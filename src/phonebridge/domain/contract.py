@@ -1508,6 +1508,14 @@ class RecordAndTelegramFallback(ContractModel):
 
     policy: Literal["record_and_telegram"] = "record_and_telegram"
     channel: _CheckedId
+    """Opaque channel selector for the FallbackWorker (the
+    ``record_and_telegram:<channel>`` wire spelling), constrained by
+    the strict :func:`_check_id` grammar
+    (``[A-Za-z0-9][A-Za-z0-9._-]*``, alphanumeric first char): a
+    Telegram ``@handle`` or a numeric chat-id (``-100...``) can
+    never appear on the wire - administrative config MUST use a safe
+    alias the worker resolves locally (round 27, review-17 item 13
+    side effect, PR #68 review)."""
 
 
 class AnswerAndAnnounceFallback(ContractModel):
@@ -3469,7 +3477,11 @@ class ProviderActiveCall(ContractModel):
         the token names a still-ringing call, the lease an
         established one - carrying BOTH makes the snapshot element's
         binding ambiguous; NEITHER is the documented external-call
-        case."""
+        case. Correlator<->state coherence is deliberately NOT
+        checked (round 27, review-17 item 11, PR #68 review):
+        ``call_token`` with ``state == ACTIVE`` is legal - the
+        snapshot may describe a ring the air side already answered
+        before the kernel's ``line.answer`` landed."""
         if self.call_token is not None and self.lease_id is not None:
             raise ValueError("call_token and lease_id are mutually exclusive")
         return self

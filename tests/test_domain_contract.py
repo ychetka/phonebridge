@@ -3903,6 +3903,29 @@ def test_provider_liveness_snapshot_reachable_only() -> None:
             )
 
 
+def test_provider_active_call_correlators_xor() -> None:
+    """Round 27 (review-17 item 11, PR #68 review): the snapshot
+    element's correlators are ALTERNATIVE - carrying BOTH
+    ``call_token`` and ``lease_id`` is rejected, while carrying
+    NEITHER is the documented external-call case and constructs."""
+    with pytest.raises(ValidationError):
+        ProviderActiveCall(
+            call_token=CallToken(RedactedString("ring-token")),
+            lease_id=LeaseId("l-1"),
+            state=ProviderCallState.ACTIVE,
+        )
+    external = ProviderActiveCall(state=ProviderCallState.DIALING)
+    assert external.call_token is None
+    assert external.lease_id is None
+    # Deliberately unchecked: correlator<->state coherence - a
+    # token-carrying ACTIVE element is legal because the snapshot
+    # may describe a ring the air side answered before line.answer.
+    ProviderActiveCall(
+        call_token=CallToken(RedactedString("ring-token")),
+        state=ProviderCallState.ACTIVE,
+    )
+
+
 def test_call_lease_audio_ready_received_flag() -> None:
     """Round 27 (review-17 item 53): ``CallLease.audio_ready_received``
     defaults to False and records the provider's local BT SCO path

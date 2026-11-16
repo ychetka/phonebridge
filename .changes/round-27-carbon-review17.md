@@ -49,3 +49,6 @@ refs: issue #67
 - modifies: docs/specs/line-manager.md#requirement-queue-sequence-is-minted-at-acquire-ingress-round-25
 - modifies: docs/specs/line-manager.md#requirement-exclusive-line-privacy-is-filtered-at-the-edge-round-25-routing-fixed-round-27
 - modifies: docs/specs/line-manager.md#requirement-effective-timeouts-hydrate-the-kernel-dtos
+- modifies: docs/specs/line-manager.md#requirement-occupancy-and-liveness-are-orthogonal-axes-round-25
+- modifies: docs/specs/line-manager.md#requirement-claim-and-assignment-results-reach-the-agent-round-25
+- modifies: docs/specs/line-manager.md#requirement-media-credentials-are-split-per-role-and-reissuable-round-25
