@@ -2723,11 +2723,16 @@ class CallLease(ContractModel):
     answer_confidence: AnswerConfidence = "provisional"
     grant_expires_at: AwareDatetime | None = None
     """Grant deadline copied from AcquireGranted/QueueReadyEvent
-    (round 20): a lease still in CallPhase.ACQUIRED whose
-    grant_expires_at lapses is torn down as
-    call_state_changed{reason: "grant_ttl_expired"} by tick(). None
-    means "no grant TTL pending" (dial already issued, or the lease
-    came from accept() - inbound rings carry their own call_token
+    (round 20): a still-UNDIALED lease whose ``grant_expires_at``
+    lapses is torn down as
+    ``call_state_changed{reason: "grant_ttl_expired"}`` by
+    ``tick()``. The field is legal ONLY in the pre-established
+    phases ``ACQUIRED``/``DIALING``/``ALERTING`` — reaching
+    ``ACTIVE`` CONSUMES it, so ``ACTIVE``/``TERMINATING``/
+    ``ENDED`` leases MUST carry ``None`` (model-enforced by
+    ``_lease_invariants``, round 30). ``None`` means "no grant TTL
+    pending" (dial already issued, or the lease came from
+    ``accept()`` - inbound rings carry their own ``call_token``
     expiry)."""
     audio_ready_received: bool = False
     """Set by the kernel inside ``ingest_audio_ready`` (round 27,

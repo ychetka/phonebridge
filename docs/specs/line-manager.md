@@ -306,7 +306,8 @@ operation (round 30): it MUST look the ticket up and verify
 `session_id` ownership BEFORE idempotent no-op handling — a
 session that never held the ticket gets `OWNER_MISMATCH`
 fail-closed, never a silent no-op — and a ticket id that was
-never queued returns `False`.
+never queued is an idempotent no-op: the method signature is
+`-> None` and the wire answer is `{ok}`, never an error.
 
 ### Requirement: Exclusive-line privacy is filtered at the edge (round 25; routing fixed round 27)
 
@@ -550,7 +551,7 @@ A `provider.register` on an already-live binding MUST
 be rejected `INVALID_STATE` — reconnect inside the grace window
 uses `provider.reregister`. Registration facts MUST mint a
 `channel_seq` — a per-channel strictly-positive monotone
-ordinal assigned at register/reregister/`ingest_liveness`/snapshot
+ordinal assigned at register/reregister/`note_provider_liveness`/snapshot
 ingestion (round 30): `ProviderRegisterResult` carries it on
 `binding.channel_seq`, `ProviderLiveness` and
 `ProviderRegistration` carry it as a field, and the kernel uses it
@@ -638,8 +639,10 @@ retry never rotates an id or widens a deadline — mints the
 compensating events
 that keep the outbox truthful — an `assignment_revoked` for a
 rolled-back grant, a grant-side event for a rolled-back revoke —
-and MUST mint a `domain.config_stale` admin event so the console
-surfaces that memory and store diverged.
+and MUST surface the divergence as a `config_stale` CONDITION
+plus an admin alert — a flagged store/kernel-divergence state on
+the admin console, not a `domain.*` event: the domain event
+vocabulary has no such member.
 `hydrate_lines(rows, bindings)` (round 30) is the batch variant:
 the adapter MUST load ALL persisted `lines` rows and
 `provider_bindings` rows in ONE hydration call — each call wipes
@@ -650,6 +653,13 @@ record VERBATIM — `assignment_id`, owner, mode, `profile` and
 and rotates NO ids — and it validates the `forward_via_line` graph
 only AFTER every row is loaded, rejecting the batch on a dangling
 target or a cycle that line-by-line loading could never see.
+Legacy-row compatibility (round 30): `channel_seq` is a REQUIRED
+`ge=1` field on `ProviderBinding` — a `provider_bindings` row
+persisted before the `channel_seq` era fails model validation, so
+the STORE-layer migration MUST backfill a generation (the lowest
+legal value is `1`) before `hydrate_lines` is called; the kernel
+never normalizes a missing/zero generation itself — it hydrates
+only fully-validated rows, verbatim.
 `admin.revoke_assignment`
 on a `SHARED_POOL`
 `LineAssignment` id MUST be rejected `INVALID_STATE` (the pool
@@ -690,7 +700,7 @@ at 86400 s — a `timedelta.max`-scale value would overflow the
 operations (`acquire`, `dial`, `accept`, `release`, `hangup`,
 `send_dtmf`, claim mutations) and on `drop_session` closing the
 owner's last open session; provider facts (`ingest_ring`,
-`ingest_call_state`, `ingest_liveness`) and `configure_line` MUST
+`ingest_call_state`, `note_provider_liveness`) and `configure_line` MUST
 NEVER stamp it — the phone ringing, the modem reporting, and the
 admin relabeling are not the owner using the line.
 
