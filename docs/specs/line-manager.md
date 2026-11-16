@@ -109,8 +109,10 @@ provider attached — legal as `event.line_health_changed`
 transition, never as `new_state` or a reported fact, round 27;
 `degraded` is the kernel-computed middle rung of the heartbeat
 ladder `reachable -> degraded -> unreachable`, entered only from
-`reachable` and resolving only into `reachable` or `unreachable`,
-never a provider-reported fact, round 28),
+`reachable` and resolving into `reachable`, `unreachable` or
+`ws_disconnected` (a control-socket drop overrides the
+elapsed-time rung, round-28 fix), never a provider-reported
+fact, round 28),
 surfaced via `event.line_health_changed`; liveness
 transitions drive teardown policy (orphan grace vs immediate
 hangup), never occupancy.
@@ -204,6 +206,10 @@ on). Acquire dedup MUST record the OUTCOME of a keyed request —
 the granted `lease_id` or queued `ticket_id` — so a same-key retry
 returns the recorded outcome while the object lives, and the same
 key with different params MUST be rejected `INVALID_ARGUMENT`.
+An `acquire(profile?)` label MUST be recorded on the
+`QueueTicket` for a queued acquire, and the `CallLease` minted
+when the ticket is granted MUST inherit the ticket's `profile`
+verbatim — the label survives queueing (round-28 fix).
 
 ### Requirement: Exclusive-line privacy is filtered at the edge (round 25; routing fixed round 27)
 
@@ -335,26 +341,41 @@ already late: the stamped interval is the expected arrival).
 `degraded` is kernel-computed, never a provider-reported fact; a
 REACHABLE fact on the live channel restores `degraded -> reachable`,
 and `ws_disconnected`/`unreachable` can never transition INTO
-`degraded`.
+`degraded`. From `degraded`, BOTH `-> unreachable` (the elapsed
+threshold) and `-> ws_disconnected` (control-socket loss) are legal
+exits (round-28 fix): the socket-loss axis overrides the
+elapsed-time rung, so a DEGRADED binding that loses its control
+socket still reaches the orphan-grace path; `ws_disconnected`
+remains the ONLY liveness state that grants the orphan grace —
+`degraded` and `unreachable` never arm it.
 
 ### Requirement: Provider-side stamps are advisory only (round 28)
 
 `ProviderLiveness.checked_at` and
 `ProviderCallStateUpdate.observed_at` are ADVISORY dedup/ordering
 keys on the provider's clock — a same-stamp repeat is a duplicate
-— and MUST NOT be used for deadline arithmetic. A stamp deeper
-than `MAX_CLOCK_SKEW_SEC` (30 s) into the future MUST be
+— and MUST NOT be used for deadline arithmetic. ONLY a stamp
+deeper than `MAX_CLOCK_SKEW_SEC` (30 s) into the FUTURE MUST be
 normalized to kernel receipt time at ingestion, so a fast
 provider clock can neither freeze nor fast-forward the heartbeat
-ladder. `last_seen_at` is always kernel receipt time.
+ladder; a stamp in the PAST is retained VERBATIM as a
+dedupe/ordering key and MUST NEVER feed elapsed-time or liveness
+math (round-28 fix). `last_seen_at` is always kernel receipt
+time and every timer stays kernel-clock.
 
 ### Requirement: Reregister supersedes a live binding, register does not (round 28)
 
 The wire carries two method names and no `reregister` field: the
 adapter MUST distill which method arrived into
 `ProviderRegistration.reregister` (`false` for `provider.register`,
-`true` for `provider.reregister`). A `provider.reregister` on a
-live REACHABLE binding is the LEGAL half-open supersede — the
+`true` for `provider.reregister`) — the flag is derived ONLY from
+the RPC method name, and a `reregister` key in the wire params
+MUST be ignored, never copied into the distilled fact (round-28
+fix). A `provider.reregister` on a
+live REACHABLE **or DEGRADED** binding is the LEGAL half-open
+supersede (round-28 fix — DEGRADED is still a live-control
+state; WS_DISCONNECTED keeps the orphan-grace ws-loss reattach
+path and UNREACHABLE classifies as a fresh register) — the
 provider's fresh control channel arrived before the old socket's
 death was detected: the old binding MUST be marked superseded, a
 FRESH `assignment_id` MUST be minted, and live leases MUST be

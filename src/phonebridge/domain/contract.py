@@ -68,6 +68,7 @@ from pydantic import (
 from pydantic_core import core_schema
 
 __all__ = [
+    "CALL_PHASE_FORWARD_TRANSITIONS",
     "CALL_PHASE_WIRE_STATES",
     "DTMF_PATTERN",
     "E164_PATTERN",
@@ -644,6 +645,30 @@ Drift against the doc's state vocabulary is caught by
 ``test_call_phase_wire_state_parity``."""
 
 
+CALL_PHASE_FORWARD_TRANSITIONS: dict[CallPhase, frozenset[CallPhase]] = {
+    CallPhase.ACQUIRED: frozenset({CallPhase.DIALING, CallPhase.RINGING, CallPhase.ENDED}),
+    CallPhase.DIALING: frozenset({CallPhase.ALERTING, CallPhase.ACTIVE, CallPhase.ENDED}),
+    CallPhase.RINGING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
+    CallPhase.ALERTING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
+    CallPhase.ACTIVE: frozenset({CallPhase.TERMINATING, CallPhase.ENDED}),
+    CallPhase.TERMINATING: frozenset({CallPhase.ENDED}),
+    CallPhase.ENDED: frozenset(),
+}
+"""Authoritative forward-only :class:`CallPhase` transition matrix
+(round 28, review-18 item 16; ``DIALING -> ACTIVE`` added in the
+round-28 fix, PR #72 review - oFono/provider may report an
+alerting-less answer when the network answers before an
+``alerting`` leg propagates, and the matrix must not reject a
+legal provider fact). The kernel MUST apply ONLY the transitions
+listed here in :meth:`LineManager.ingest_call_state`: a regression
+(an ``ACTIVE`` lease returning to ``DIALING``/``ALERTING``) is a
+defect fact dropped like an out-of-order update, ``ENDED`` is
+terminal, and phase can never skip backwards over ``ENDED``.
+``ACQUIRED -> RINGING`` covers the preemption of an undialed
+grant by an inbound ring. Drift is pinned by
+``test_call_phase_forward_matrix``."""
+
+
 class AssignmentMode(str, Enum):
     """LineAssignment.mode (design §4.2)."""
 
@@ -665,7 +690,11 @@ class LivenessState(str, Enum):
     reports ``reachable``/``ws_disconnected``/``unreachable``
     observations and the kernel derives degradation itself. A
     REACHABLE fact on the live channel clears it, so
-    ``degraded -> reachable`` is legal.
+    ``degraded -> reachable`` is legal. A control-socket drop on a
+    DEGRADED binding resolves ``degraded -> ws_disconnected``
+    (round-28 fix, PR #72 review): the socket-loss axis overrides
+    the elapsed-time rung, so a degraded binding that loses its
+    socket still reaches the orphan-grace path.
 
     WS_DISCONNECTED (round 21, CRITICAL-3): the provider's WS control
     channel dropped while the telephony path may still be alive -
@@ -744,7 +773,13 @@ class CallEndReason(str, Enum):
     timeout: :meth:`LineManager.tick` ends a DIALING/ALERTING/ACTIVE
     lease whose wall-clock length crosses the cap with
     ``reason:"max_call_duration"`` (and bounds the
-    ``record_and_telegram`` recording by the same wall-clock rule)."""
+    ``record_and_telegram`` recording by the same wall-clock rule).
+    It is INADMISSIBLE on ``event.missed_call`` (round-28 fix,
+    PR #72 review - the exclusion is enforced on
+    :class:`MissedCallEvent`): a missed call is an unanswered ring
+    that never held a lease, so it can never hit the cap - the
+    teardown surfaces as ``call_state_changed`` + ``ended_lease``
+    instead."""
 
     NORMAL = "normal"
     BUSY = "busy"
@@ -1157,12 +1192,15 @@ review-18 items 8/17): ``ProviderLiveness.checked_at`` and
 ``ProviderCallStateUpdate.observed_at`` travel on provider-clock
 time and are used ONLY as dedup/ordering keys - deadline
 arithmetic (orphan grace, heartbeat ladder) ALWAYS uses kernel
-receipt time. A stamp deeper into the future than
-``MAX_CLOCK_SKEW_SEC`` past kernel ``now`` is recorded as ``now``
-at ingestion so an NTP-skewed peer can neither arm a permanent
-dedup barrier nor suspend the liveness detector (and a
+receipt time. The ceiling is one-directional (round-28 fix,
+PR #72 review): ONLY a stamp deeper into the future than
+``MAX_CLOCK_SKEW_SEC`` past kernel ``now`` is normalized to
+``now`` at ingestion so an NTP-skewed peer can neither arm a
+permanent dedup barrier nor suspend the liveness detector (and a
 ``timedelta.max``-magnitude stamp can never overflow a
-``stamp - last_seen`` subtraction)."""
+``stamp - last_seen`` subtraction); a stamp in the PAST is
+retained VERBATIM as a dedupe/ordering key and never feeds
+elapsed-time or liveness math."""
 
 MAX_TOKEN_LEN: int = 256
 """Upper bound on a ``CallToken``/``MediaToken`` value (round 28,
@@ -2396,8 +2434,10 @@ class CallLease(ContractModel):
     says the chosen profile rides the grant to the dial command and
     the admin listing, so it MUST be recorded here rather than
     recomputed - ``admin.list_leases`` reports it directly off the
-    stored field. Bounded like every profile carrier by
-    :data:`MAX_PROFILE_LEN`."""
+    stored field. On a QUEUED acquire the lease inherits the value
+    verbatim from :attr:`QueueTicket.profile` (round-28 fix,
+    PR #72 review) - the label survives queueing unchanged. Bounded
+    like every profile carrier by :data:`MAX_PROFILE_LEN`."""
 
     @model_validator(mode="after")
     def _lease_invariants(self) -> CallLease:
@@ -2477,6 +2517,15 @@ class QueueTicket(ContractModel):
     absent (no dedup - every call is independent) or a non-empty
     string of at most ``MAX_IDEMPOTENCY_KEY_LEN`` chars; an empty or
     overlong key is rejected as INVALID_ARGUMENT at the boundary."""
+    profile: str | None = Field(default=None, min_length=1, max_length=MAX_PROFILE_LEN)
+    """The ``acquire(profile=...)`` label recorded on the ticket
+    (round-28 fix, PR #72 review - audit item 20 named BOTH
+    :class:`CallLease` and QueueTicket, and the queued path was the
+    gap): the per-call label MUST survive queueing, so the kernel
+    saves the accepted value here and the :class:`CallLease` minted
+    when the ticket is granted INHERITS it verbatim. Same
+    ``1..MAX_PROFILE_LEN`` bound as :attr:`CallLease.profile` -
+    ``None`` means the acquire carried no label."""
 
     def __lt__(self, other: object) -> bool:
         if not isinstance(other, QueueTicket):
@@ -3531,15 +3580,22 @@ class LineHealthChangedEvent(ContractModel):
     derived :class:`LineSummary` listing state.
 
     DEGRADED is legal as ``new_state`` ONLY from ``reachable`` and
-    as ``old_state`` ONLY into ``reachable`` or ``unreachable``
-    (round 28, review-18 item 1): the heartbeat ladder is
+    resolves off the rung into ``reachable``, ``unreachable`` or
+    ``ws_disconnected`` (round 28, review-18 item 1; the
+    ``degraded -> ws_disconnected`` exit was added in the round-28
+    fix, PR #72 review): the heartbeat ladder is
     ``reachable -> degraded -> unreachable`` - the first missed-ping
-    step degrades, continued silence escalates to unreachable, and a
+    step degrades, continued silence escalates to unreachable, a
     REACHABLE fact on the live channel restores ``degraded ->
-    reachable`` (both resolutions off the degraded rung are legal).
-    Degradation is kernel-computed and has no reported-fact entry
-    into the ladder - ``ws_disconnected -> degraded`` or
-    ``unreachable -> degraded`` can never be emitted."""
+    reachable``, and a control-socket drop while DEGRADED resolves
+    ``degraded -> ws_disconnected`` - the socket-loss axis overrides
+    the elapsed-time rung, so the 10 s orphan-grace path stays
+    reachable from a degraded binding. ``ws_disconnected`` remains
+    the ONLY liveness state that arms the orphan grace -
+    ``degraded`` and ``unreachable`` never do. Degradation is
+    kernel-computed and has no reported-fact entry into the ladder -
+    ``ws_disconnected -> degraded`` or ``unreachable -> degraded``
+    can never be emitted."""
 
     line_id: _CheckedLineId
     old_state: LivenessState
@@ -3570,12 +3626,16 @@ class LineHealthChangedEvent(ContractModel):
 
     @model_validator(mode="after")
     def _degraded_ladder_rules(self) -> LineHealthChangedEvent:
-        """DEGRADED ladder rules (round 28, review-18 item 1): the
-        kernel-computed middle rung of ``reachable -> degraded ->
-        unreachable`` enters only from ``reachable`` (the first
-        missed-ping step) and resolves only into ``reachable`` (a
-        live ping restored health) or ``unreachable`` (escalation
-        to down)."""
+        """DEGRADED ladder rules (round 28, review-18 item 1; the
+        ``ws_disconnected`` exit was added in the round-28 fix,
+        PR #72 review): the kernel-computed middle rung of
+        ``reachable -> degraded -> unreachable`` enters only from
+        ``reachable`` (the first missed-ping step) and resolves
+        into ``reachable`` (a live ping restored health),
+        ``unreachable`` (elapsed-time escalation to down) or
+        ``ws_disconnected`` (control-socket loss - the socket-loss
+        axis overrides the elapsed-time rung, keeping the
+        orphan-grace path reachable from a degraded binding)."""
         if (
             self.new_state is LivenessState.DEGRADED
             and self.old_state is not LivenessState.REACHABLE
@@ -3584,8 +3644,11 @@ class LineHealthChangedEvent(ContractModel):
         if self.old_state is LivenessState.DEGRADED and self.new_state not in (
             LivenessState.REACHABLE,
             LivenessState.UNREACHABLE,
+            LivenessState.WS_DISCONNECTED,
         ):
-            raise ValueError("degraded resolves only to 'reachable' or 'unreachable'")
+            raise ValueError(
+                "degraded resolves only to 'reachable', 'unreachable' or 'ws_disconnected'"
+            )
         return self
 
 
@@ -3594,13 +3657,32 @@ class MissedCallEvent(ContractModel):
     (accept-window expiry, caller hangup, or reject-policy outcome).
     ``reason`` is REQUIRED on the wire (api-contract.md event table)
     and rides the CLOSED :class:`CallEndReason` vocabulary
-    (round-21 review). ``voicemail_ref`` was removed in round 27
-    (review-17 item 24): no producer ever minted it - a dead wire
-    member is dropped from the contract rather than carried."""
+    (round-21 review). One member of that shared vocabulary is
+    INADMISSIBLE here (round-28 fix, PR #72 review):
+    ``max_call_duration`` can never mint a missed_call - a
+    max-duration end is an established-lease teardown that
+    produces ``event.call_state_changed{state:"disconnected"}``
+    plus the ended lease, not an unanswered ring - so the
+    validator below enforces the exclusion rather than leaving it
+    to docstring discipline. ``voicemail_ref`` was removed in
+    round 27 (review-17 item 24): no producer ever minted it - a
+    dead wire member is dropped from the contract rather than
+    carried."""
 
     line_id: _CheckedLineId
     caller_id: _CheckedCallerNumber | None = None
     reason: CallEndReason
+
+    @model_validator(mode="after")
+    def _reason_is_a_missed_call_reason(self) -> MissedCallEvent:
+        """``max_call_duration`` is inadmissible on ``missed_call``
+        (round-28 fix, PR #72 review): a ring that never became a
+        lease can never hit the call-duration cap - the reason
+        would report a lease-scoped teardown fact on a ring
+        fact."""
+        if self.reason is CallEndReason.MAX_CALL_DURATION:
+            raise ValueError("max_call_duration is not a missed_call reason")
+        return self
 
 
 class IdleAlertEvent(ContractModel):
@@ -3729,24 +3811,33 @@ class ProviderRegistration(ContractModel):
     instead of by docstring. ``caps`` is non-empty and telecom-only
     - see :func:`_provider_caps_check` (round 24, review-13 M3).
 
-    ``reregister`` (round 28, review-18 item 3) is another
-    ADAPTER-distilled fact in the same style: the wire carries two
-    methods - ``provider.register`` and ``provider.reregister`` -
-    and only the adapter knows which one arrived, so it sets this
-    flag when distilling the request (``reregister=False`` for
-    ``provider.register``, ``True`` for ``provider.reregister``).
-    The kernel's register-vs-reregister classification
-    (:meth:`LineManager.register_provider`) runs on this flag - the
-    wire itself carries no ``reregister`` field."""
+    ``reregister`` (round 28, review-18 item 3; hardened in the
+    round-28 fix, PR #72 review) is another ADAPTER-distilled fact
+    in the same style: the wire carries two methods -
+    ``provider.register`` and ``provider.reregister`` - and only
+    the adapter knows which one arrived. The adapter MUST derive
+    this flag from the RPC METHOD NAME that arrived
+    (``provider.register`` -> ``False``, ``provider.reregister``
+    -> ``True``) and MUST NOT copy a ``reregister`` key out of the
+    wire params: a params-supplied value is ignored by the adapter
+    BEFORE the fact is distilled - otherwise a provider could
+    self-promote a plain register into a supersede. Same
+    distilled-fact discipline as the round-27 token removal
+    (review-17 item 32): the kernel's register-vs-reregister
+    classification (:meth:`LineManager.register_provider`) runs on
+    this flag - the wire itself carries no ``reregister`` field."""
 
     line_id: _CheckedLineId
     caps: tuple[Intent, ...]
     reregister: bool = False
-    """Adapter-distilled method flag (round 28, review-18 item 3):
-    ``True`` when the request arrived as ``provider.reregister``,
-    ``False`` for ``provider.register`` - the kernel uses it to
-    tell a fresh attach from a supersede/re-bind of a live binding
-    (see :meth:`LineManager.register_provider`)."""
+    """Adapter-distilled method flag (round 28, review-18 item 3;
+    hardened in the round-28 fix, PR #72 review): ``True`` when the
+    request arrived as ``provider.reregister``, ``False`` for
+    ``provider.register`` - derived ONLY from the RPC method name,
+    never from a ``reregister`` key in the wire params (a
+    params-supplied value is dropped before distilling). The kernel
+    uses it to tell a fresh attach from a supersede/re-bind of a
+    live binding (see :meth:`LineManager.register_provider`)."""
     profile: str | None = Field(default=None, min_length=1, max_length=MAX_PROFILE_LEN)
     """Bounded when present (round 26, review-16 item 4; rule 7 on an
     external ingress field): a non-empty label of at most
@@ -3834,13 +3925,16 @@ class ProviderLiveness(ContractModel):
     state: LivenessState
     checked_at: AwareDatetime
     """Provider-side observation stamp - ADVISORY ONLY (round 28,
-    review-18 items 8/11): the kernel uses it as a dedup/ordering
+    review-18 items 8/11; skew asymmetry clarified in the round-28
+    fix, PR #72 review): the kernel uses it as a dedup/ordering
     key (a same-stamp repeat is a duplicate, not a new fact) but
     NEVER for deadline arithmetic - ``last_seen_at`` on the binding
     is always KERNEL RECEIPT time, so a provider-clock skew can
-    neither freeze nor fast-forward the heartbeat ladder. A stamp
-    deeper than :data:`MAX_CLOCK_SKEW_SEC` into the future is
-    recorded as ``now`` at ingestion."""
+    neither freeze nor fast-forward the heartbeat ladder. ONLY a
+    stamp deeper than :data:`MAX_CLOCK_SKEW_SEC` into the FUTURE
+    is normalized to ``now`` at ingestion; a PAST stamp is
+    retained VERBATIM as the dedupe key and never feeds
+    elapsed-time or liveness math."""
     state_snapshot: tuple[ProviderActiveCall, ...] | None = None
     """Optional ``provider.ping{state_snapshot?}`` carrier (round-21
     review): same element shape as
@@ -3964,11 +4058,14 @@ class ProviderCallStateUpdate(ContractModel):
     reason: ProviderDisconnectReason | None = None
     observed_at: AwareDatetime
     """Provider-side observation stamp - ADVISORY ONLY (round 28,
-    review-18 items 8/11): a dedup/ordering key (a same-stamp repeat
-    is a duplicate), never an input to deadline arithmetic - a stamp
-    deeper than :data:`MAX_CLOCK_SKEW_SEC` into the future is
-    recorded as ``now`` at ingestion so an NTP-skewed provider
-    cannot suspend call-state ordering."""
+    review-18 items 8/11; skew asymmetry clarified in the round-28
+    fix, PR #72 review): a dedup/ordering key (a same-stamp repeat
+    is a duplicate), never an input to deadline arithmetic - ONLY
+    a stamp deeper than :data:`MAX_CLOCK_SKEW_SEC` into the FUTURE
+    is normalized to ``now`` at ingestion so an NTP-skewed provider
+    cannot suspend call-state ordering; a PAST stamp is retained
+    VERBATIM as the dedupe key and never feeds elapsed-time
+    math."""
 
     @field_validator("state")
     @classmethod
@@ -4413,7 +4510,13 @@ class LineManager(ABC):
         :meth:`register_intent`'s session label, INVALID_ARGUMENT
         beyond. The kernel MUST save the accepted value on
         :attr:`CallLease.profile` (round 28, review-18 item 13) -
-        the lease carries the label, it is never recomputed.
+        the lease carries the label, it is never recomputed. The
+        label MUST also survive queueing (round-28 fix, PR #72
+        review): a queued acquire records it on
+        :attr:`QueueTicket.profile`, and the lease minted when that
+        ticket is granted inherits the ticket's value verbatim -
+        same for the head-of-queue reissue of a preempted grant,
+        which carries the ORIGINAL ticket's profile forward.
         INVALID_INTENT when the intent is not in the line's caps;
         LINE_EXCLUSIVE_NOT_OWNER (+ ErrorData.free_lines) on exclusive
         conflict; LINE_BUSY_INCOMING on a RINGING_LOCKED line. A busy
@@ -4812,14 +4915,23 @@ class LineManager(ABC):
         Register vs reregistration (round 28, review-18 item 3):
         ``registration.reregister`` is the adapter-distilled flag of
         WHICH wire method arrived - ``provider.register`` sets
-        ``False``, ``provider.reregister`` sets ``True``. A
+        ``False``, ``provider.reregister`` sets ``True``; it is
+        derived from the method name alone, and a ``reregister``
+        key in the wire params is ignored, never copied
+        (:class:`ProviderRegistration`). A
         ``register`` fact (``reregister=False``) arriving while the
         line holds a LIVE binding is rejected
         ``PhonebridgeError(ErrorCode.INVALID_STATE)`` - a duplicate
         attach is a protocol violation, not a supersede. A
         ``reregister`` fact (``reregister=True``) on a live
-        REACHABLE binding is the legal half-open supersede: the
-        provider's new control channel arrived before the old
+        REACHABLE **or DEGRADED** binding is the legal half-open
+        supersede (round-28 fix, PR #72 review: DEGRADED is still a
+        live-control state - the socket is up, only pings are
+        late - so it shares the supersede path, while
+        WS_DISCONNECTED keeps the orphan-grace ws-loss reattach
+        path and UNREACHABLE falls under the dead-binding
+        fresh-register rule below): the provider's new control
+        channel arrived before the old
         socket's death was detected, so the kernel marks the OLD
         binding superseded, mints a FRESH ``assignment_id``, and
         preserves/re-binds the live leases per the
@@ -4955,18 +5067,26 @@ class LineManager(ABC):
         checked_at.
 
         ``checked_at`` is an ADVISORY dedup/ordering stamp on the
-        provider's clock (round 28, review-18 items 8/11): a
-        same-stamp repeat is a duplicate, and a stamp deeper than
-        :data:`MAX_CLOCK_SKEW_SEC` into the future is recorded as
-        ``now`` at ingestion - the binding's ``last_seen_at`` is
-        ALWAYS kernel receipt time, so provider-clock skew can
+        provider's clock (round 28, review-18 items 8/11; skew
+        asymmetry clarified in the round-28 fix, PR #72 review): a
+        same-stamp repeat is a duplicate, and ONLY a stamp deeper
+        than :data:`MAX_CLOCK_SKEW_SEC` into the FUTURE is
+        normalized to kernel ``now`` at ingestion - a PAST stamp
+        is retained VERBATIM as the dedupe/ordering key and NEVER
+        feeds elapsed-time or liveness math. The binding's
+        ``last_seen_at`` is ALWAYS kernel receipt time and every
+        timer stays kernel-clock, so provider-clock skew can
         neither freeze nor fast-forward the heartbeat ladder.
 
         A REACHABLE fact on the live channel clears a
         kernel-computed DEGRADED binding back to REACHABLE
         (round 28, review-18 item 1): ``degraded -> reachable`` is
         the recovery leg of the heartbeat ladder and surfaces as a
-        normal ``event.line_health_changed`` transition.
+        normal ``event.line_health_changed`` transition. A
+        WS_DISCONNECTED fact on a DEGRADED binding resolves
+        ``degraded -> ws_disconnected`` the same way (round-28
+        fix, PR #72 review): the socket-loss axis overrides the
+        elapsed-time rung and arms the orphan-grace window.
 
         An UNREACHABLE fact also cleans the provider-command outbox
         AT THE MUTATION (round 28, review-18 item 4): commands
@@ -5096,16 +5216,24 @@ class LineManager(ABC):
         round 22, review-10 HIGH-3, §5.4).
 
         ``observed_at`` is an ADVISORY dedup/ordering stamp on the
-        provider's clock (round 28, review-18 items 8/11): a
-        same-stamp repeat is a duplicate, and a stamp deeper than
-        :data:`MAX_CLOCK_SKEW_SEC` into the future is recorded as
-        ``now`` at ingestion - deadline arithmetic never reads the
-        provider's clock.
+        provider's clock (round 28, review-18 items 8/11; skew
+        asymmetry clarified in the round-28 fix, PR #72 review): a
+        same-stamp repeat is a duplicate, and ONLY a stamp deeper
+        than :data:`MAX_CLOCK_SKEW_SEC` into the FUTURE is
+        normalized to kernel ``now`` at ingestion - a PAST stamp
+        is retained VERBATIM as the dedupe/ordering key and NEVER
+        feeds elapsed-time or liveness math, so deadline
+        arithmetic never reads the provider's clock.
 
         Legal :class:`CallPhase` transitions (round 28, review-18
-        item 16 - the forward-only matrix): ``ACQUIRED`` may advance
-        to ``DIALING``/``RINGING`` (preemption)/``ENDED``;
-        ``DIALING`` -> ``ALERTING``/``ENDED``; ``RINGING`` ->
+        item 16 - the forward-only matrix, pinned verbatim by
+        :data:`CALL_PHASE_FORWARD_TRANSITIONS`): ``ACQUIRED`` may
+        advance to ``DIALING``/``RINGING`` (preemption)/``ENDED``;
+        ``DIALING`` -> ``ALERTING``/``ACTIVE`` (an alerting-less
+        answer - the network may report ``active`` before an
+        ``alerting`` leg propagates or without one, a legal
+        provider fact the matrix must not reject; added in the
+        round-28 fix, PR #72 review)/``ENDED``; ``RINGING`` ->
         ``ACTIVE`` (handset/agent answer)/``ENDED``;
         ``ALERTING`` -> ``ACTIVE``/``ENDED``; ``ACTIVE`` ->
         ``TERMINATING``/``ENDED``; ``TERMINATING`` -> ``ENDED``;
@@ -5163,9 +5291,10 @@ class LineManager(ABC):
         Parameter hygiene (round 28, review-18 item 16): the
         signature parameters are plain ids, so the implementation
         MUST apply the same model-boundary checks the checked field
-        aliases enforce - ``_check_id`` on ``line_id``/
-        ``lease_id`` and ``_check_assignment_id`` on
-        ``assignment_id`` - a malformed id is INVALID_ARGUMENT, and
+        aliases enforce - ``_check_line_id`` on ``line_id`` (the
+        ``"default"``-alias ban included) and ``_check_id`` on
+        ``lease_id``/``assignment_id`` - a malformed id is
+        INVALID_ARGUMENT, and
         an ``assignment_id`` naming a superseded binding resolves
         as ``PhonebridgeError(ErrorCode.STALE_TOKEN)`` (the same
         stale-binding rule as :meth:`ingest_ring`/

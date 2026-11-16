@@ -7,11 +7,16 @@ user_summary: "-"
 dev_summary: >-
   Round-28 blind paranoid audit fixes (SA_carbon_review_18, 33 findings):
   LivenessState gains the kernel-computed DEGRADED rung
-  (reachable -> degraded -> unreachable, elapsed-time ladder);
+  (reachable -> degraded -> unreachable, elapsed-time ladder;
+  degraded -> ws_disconnected legal on control-socket loss);
+  CALL_PHASE_FORWARD_TRANSITIONS pins the forward-only CallPhase
+  matrix including the alerting-less DIALING -> ACTIVE answer;
   MediaAllocator.reissue(lease_id, role) supersedes one role's media
   credentials without touching the other half; ProviderRegistration
-  carries the adapter-distilled reregister flag so a reregister on a
-  live REACHABLE binding is a legal half-open supersede (fresh
+  carries the adapter-distilled reregister flag (derived from the
+  RPC method name only - a `reregister` wire-params key is ignored)
+  so a reregister on a live REACHABLE or DEGRADED binding is a
+  legal half-open supersede (fresh
   assignment_id, leases preserved, snapshot reconciles only
   >=DIALING leases - ACQUIRED grants exempt); dead-binding outbox
   cleanup moved from drain time to the killing/superseding mutation
@@ -21,9 +26,10 @@ dev_summary: >-
   claims auto-reject); LineAdminKernel.provision_line creates
   quiescent UNBOUND lines and configure_line patches profile;
   CallEndReason.MAX_CALL_DURATION enforced by tick on DIALING+
-  leases (created_at + effective cap); provider checked_at/
-  observed_at stamps are advisory dedupe keys only, future stamps
-  beyond MAX_CLOCK_SKEW_SEC record as kernel now; handset-answered
+  leases (created_at + effective cap, inadmissible on missed_call);
+  provider checked_at/observed_at stamps are advisory dedupe keys
+  only - only future skew beyond MAX_CLOCK_SKEW_SEC is normalized
+  to kernel now, past stamps stay verbatim; handset-answered
   rings (call_state active + call_token on RINGING_LOCKED) surface
   as external_call BUSY with no lease/hangup/bridge, and ring-drain
   best-effort hangup only rides reject-path outcomes; 0x02 flush
@@ -35,6 +41,7 @@ dev_summary: >-
   MAX_LEASES_PER_SESSION is skipped, preempted reissue exempt from
   ticket caps, pool tickets cancel when their eligibility set
   empties, idempotency dedup records outcomes; CallLease.profile +
+  QueueTicket.profile (granted lease inherits the ticket label) +
   AdminLineView.profile/provider_meta added, provider_meta removed
   from LineSummary; get_lines(EXCLUSIVE_LINE) excludes UNBOUND;
   pending claims auto-reject on provider loss; forward target must

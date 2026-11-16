@@ -20,6 +20,7 @@ from pydantic import TypeAdapter, ValidationError
 
 import phonebridge.domain.contract as contract
 from phonebridge.domain.contract import (
+    CALL_PHASE_FORWARD_TRANSITIONS,
     CALL_PHASE_WIRE_STATES,
     DTMF_PATTERN,
     ERROR_CODE_WIRE,
@@ -1437,6 +1438,39 @@ def test_call_phase_wire_state_parity() -> None:
     doc_states = set(re.findall(r"`([a-z_]+)`", state_seg.group(1)))
     mapped = {v for v in CALL_PHASE_WIRE_STATES.values() if v is not None}
     assert doc_states == mapped
+
+
+def test_call_phase_forward_matrix() -> None:
+    """Round 28 (review-18 item 16; ``DIALING -> ACTIVE`` added in the
+    round-28 fix, PR #72 review): the forward-only transition matrix
+    is pinned verbatim - alerting-less answers are a legal provider
+    fact, regressions are defects, and ENDED is terminal."""
+    # Every phase has an explicit row - the matrix can never drift
+    # into an implicit default.
+    assert set(CALL_PHASE_FORWARD_TRANSITIONS) == set(CallPhase)
+    assert CALL_PHASE_FORWARD_TRANSITIONS == {
+        CallPhase.ACQUIRED: frozenset({CallPhase.DIALING, CallPhase.RINGING, CallPhase.ENDED}),
+        CallPhase.DIALING: frozenset({CallPhase.ALERTING, CallPhase.ACTIVE, CallPhase.ENDED}),
+        CallPhase.RINGING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
+        CallPhase.ALERTING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
+        CallPhase.ACTIVE: frozenset({CallPhase.TERMINATING, CallPhase.ENDED}),
+        CallPhase.TERMINATING: frozenset({CallPhase.ENDED}),
+        CallPhase.ENDED: frozenset(),
+    }
+    # Forward-only shape: no self-loops, nothing leaves ENDED, and a
+    # regression (ACTIVE -> DIALING/ALERTING) is never listed.
+    assert CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.ENDED] == frozenset()
+    for old, targets in CALL_PHASE_FORWARD_TRANSITIONS.items():
+        assert old not in targets
+        for new in targets:
+            assert new is not old
+    assert CallPhase.ACTIVE not in CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.ACTIVE]
+    for regressed in (CallPhase.DIALING, CallPhase.ALERTING):
+        assert regressed not in CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.ACTIVE]
+        assert regressed not in CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.RINGING]
+    # The alerting-less answer is the finding's case: DIALING may
+    # advance straight to ACTIVE.
+    assert CallPhase.ACTIVE in CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.DIALING]
 
 
 def test_provider_command_union_roundtrip() -> None:
@@ -4070,28 +4104,30 @@ def test_provider_media_reattach_models() -> None:
 
 
 def test_liveness_degraded_transition_matrix() -> None:
-    """Round 28 (review-18 item 1): DEGRADED is the kernel-computed
-    middle rung of ``reachable -> degraded -> unreachable`` - it is
-    entered ONLY from ``reachable`` and resolves ONLY into
-    ``reachable`` or ``unreachable``; every other touch of the rung
-    is rejected."""
+    """Round 28 (review-18 item 1; ``degraded -> ws_disconnected``
+    added in the round-28 fix, PR #72 review): DEGRADED is the
+    kernel-computed middle rung of ``reachable -> degraded ->
+    unreachable`` - it is entered ONLY from ``reachable`` and
+    resolves into ``reachable``, ``unreachable`` or
+    ``ws_disconnected`` (socket loss overrides the elapsed-time
+    rung so the orphan grace stays reachable); every other touch
+    of the rung is rejected."""
     line_id = LineId("line-main")
     for old, new in (
         (LivenessState.REACHABLE, LivenessState.DEGRADED),
         (LivenessState.DEGRADED, LivenessState.REACHABLE),
         (LivenessState.DEGRADED, LivenessState.UNREACHABLE),
+        (LivenessState.DEGRADED, LivenessState.WS_DISCONNECTED),
     ):
         ev = LineHealthChangedEvent(line_id=line_id, old_state=old, new_state=new)
         assert ev.new_state is new
     # No other transition touches the degraded rung - degradation is
     # kernel-computed, so neither a WS drop nor an unreachable fact
-    # can enter it, and it cannot resolve to ws_disconnected/unbound
-    # or self-loop.
+    # can enter it, and it cannot resolve to unbound or self-loop.
     for old, new in (
         (LivenessState.WS_DISCONNECTED, LivenessState.DEGRADED),
         (LivenessState.UNREACHABLE, LivenessState.DEGRADED),
         (LivenessState.UNBOUND, LivenessState.DEGRADED),
-        (LivenessState.DEGRADED, LivenessState.WS_DISCONNECTED),
         (LivenessState.DEGRADED, LivenessState.UNBOUND),
         (LivenessState.DEGRADED, LivenessState.DEGRADED),
     ):
@@ -4303,9 +4339,12 @@ def test_idle_revoke_after_upper_bound() -> None:
 
 
 def test_call_lease_profile() -> None:
-    """Round 28 (review-18 item 4): ``CallLease.profile`` preserves the
-    ``acquire(profile=...)`` label on the grant so admin lease
-    listings can show which profile won the line."""
+    """Round 28 (review-18 item 4; QueueTicket leg added in the
+    round-28 fix, PR #72 review - audit item 20 named BOTH models):
+    ``CallLease.profile`` preserves the ``acquire(profile=...)``
+    label on the grant so admin lease listings can show which
+    profile won the line, and ``QueueTicket.profile`` carries the
+    same label through queueing so the granted lease inherits it."""
     base: dict[str, Any] = {
         "lease_id": LeaseId("l-1"),
         "line_id": LineId("line-main"),
@@ -4319,6 +4358,58 @@ def test_call_lease_profile() -> None:
     for bad in ("", "p" * (MAX_PROFILE_LEN + 1)):
         with pytest.raises(ValidationError):
             CallLease(**base, profile=bad)
+
+    # Ticket -> lease inheritance: the ticket stores the label under
+    # the same Optional bounded-string semantics, so the lease minted
+    # at grant time can carry it forward verbatim.
+    ticket = _ticket("t-1", 1)
+    assert ticket.profile is None
+    labelled = QueueTicket(
+        ticket_id=TicketId("t-2"),
+        seq=2,
+        session_id=SessionId("sess-1"),
+        intent=Intent.DIAL_OUT,
+        enqueued_at=NOW_UTC,
+        profile="front-desk",
+    )
+    assert labelled.profile == "front-desk"
+    for bad in ("", "p" * (MAX_PROFILE_LEN + 1)):
+        with pytest.raises(ValidationError):
+            QueueTicket(
+                ticket_id=TicketId("t-3"),
+                seq=3,
+                session_id=SessionId("sess-1"),
+                intent=Intent.DIAL_OUT,
+                enqueued_at=NOW_UTC,
+                profile=bad,
+            )
+    # Field parity: identical annotation shape on both carriers is
+    # what makes verbatim inheritance expressible.
+    lease_field = CallLease.model_fields["profile"]
+    ticket_field = QueueTicket.model_fields["profile"]
+    assert lease_field.annotation == ticket_field.annotation
+    assert lease_field.is_required() == ticket_field.is_required() is False
+
+
+def test_missed_call_reason_excludes_max_call_duration() -> None:
+    """Round-28 fix (PR #72 review): ``max_call_duration`` rides the
+    shared :class:`CallEndReason` vocabulary for lease teardowns
+    but is INADMISSIBLE on ``event.missed_call`` - a missed call is
+    an unanswered ring that never held a lease, so the model
+    rejects the lease-scoped reason."""
+    with pytest.raises(ValidationError):
+        MissedCallEvent(
+            line_id=LineId("line-main"),
+            reason=CallEndReason.MAX_CALL_DURATION,
+        )
+    # The admissible missed_call reasons still construct.
+    for reason in (
+        CallEndReason.NORMAL,
+        CallEndReason.ACCEPT_WINDOW_EXPIRED,
+        CallEndReason.PROVIDER_LOST,
+    ):
+        ev = MissedCallEvent(line_id=LineId("line-main"), reason=reason)
+        assert ev.reason is reason
 
 
 def test_media_role_literal() -> None:
