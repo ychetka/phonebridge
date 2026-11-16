@@ -8,15 +8,15 @@ this directory are the canonical archived versions referenced by
 
 | File | Audit round | Baseline → produced |
 |------|-------------|---------------------|
-| SA_carbon_review6 | early | v0.0.8 baseline — full architecture and code review |
-| SA_carbon_review7 | early | v0.0.10 baseline — verification of remaining blind spots |
+| SA_carbon_review6 | early | v0.0.8 → v0.0.10 — full architecture and code review |
+| SA_carbon_review7 | early | v0.0.10 → v0.0.11–0.0.12 — verification of remaining blind spots |
 | SA_carbon_review_changes_8 | 20 | PLAN_DELTA task spec for the Round-20 hardening fixes (applied in v0.0.13) — a work-order document, not a findings journal |
-| SA_carbon_review_9 | 21 | v0.0.15 baseline — full review after rounds 20/20b |
-| SA_carbon_review_10_gemini | 22 | pre-freeze baseline — Gemini fresh-pass review of the domain contract |
+| SA_carbon_review_9 | 21 | v0.0.15 → v0.0.16 — full review after rounds 20/20b |
+| SA_carbon_review_10_gemini | 22 | pre-freeze → v0.0.17 — Gemini fresh-pass review of the domain contract |
 | SA_carbon_review_11_gemini | 22 | → v0.0.17 — Gemini verification pass confirming round-21/22 findings resolved |
-| SA_carbon_review_12 | 23 | v0.0.17 baseline — deep audit before the contract freeze |
-| SA_carbon_review_13 | 24 | v0.0.18 baseline — review of the round-23 fix package |
-| SA_carbon_review_13_gemini | 24 | v0.0.18 baseline — Gemini verification pass of round-23 fixes |
+| SA_carbon_review_12 | 23 | v0.0.17 → v0.0.18 — deep audit before the contract freeze |
+| SA_carbon_review_13 | 24 | v0.0.18 → v0.0.19 — review of the round-23 fix package |
+| SA_carbon_review_13_gemini | 24 | v0.0.18 → v0.0.19 — Gemini verification pass of round-23 fixes |
 | SA_carbon_review_14 | 24 | v0.0.18 → v0.0.19 — paranoid-architect audit |
 | SA_carbon_review_14-2 | 24 | v0.0.18 → v0.0.19 — second pass on the same baseline (deeper edge-case sweep) |
 | SA_carbon_review_15 | 25 | v0.0.19 → v0.0.20 — blocker-level audit (Bluetooth netns, claim events, token redaction) |
