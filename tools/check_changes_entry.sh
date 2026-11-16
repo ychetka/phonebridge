@@ -85,6 +85,7 @@ meta_body = os.environ.get("META_BODY", "")
 meta_labels = os.environ.get("META_LABELS", "")
 
 fragment = False
+fragment_paths = []
 changelog = False
 entries = []
 for line in files.splitlines():
@@ -98,6 +99,7 @@ for line in files.splitlines():
         if name.endswith(".md") and not name.startswith("_") \
                 and name != "README.md":
             fragment = True
+            fragment_paths.append(path)
     if path == "CHANGELOG.md" and status[0] in ("A", "M", "R"):
         changelog = True
 
@@ -105,6 +107,44 @@ if not entries:
     print('{"status":"pass","reason":"no file changes in diff"}')
     sys.exit(0)
 if fragment:
+    # Shape check (round 27, review-17 item 41): a bare filename used
+    # to satisfy the gate - an empty or shapeless .changes/*.md
+    # passed. When the file exists in the working tree (base/CI mode
+    # checks out the PR branch) it MUST carry the fragment shape:
+    # non-empty, a '---' frontmatter block, and a '## Spec impact'
+    # section. Files absent on disk (--pr metadata-only mode) keep
+    # the name-level verdict - the lint job's on-disk run catches
+    # them.
+    import pathlib
+    for frag in fragment_paths:
+        fpath = pathlib.Path(frag)
+        if not fpath.is_file():
+            continue
+        body = fpath.read_text(encoding="utf-8", errors="replace")
+        if not body.strip():
+            print(
+                f"FAIL: {frag} is empty - a release-notes record needs "
+                "frontmatter and a '## Spec impact' section",
+                file=sys.stderr,
+            )
+            print('{"status":"fail","reason":"empty_changes_fragment"}')
+            sys.exit(1)
+        if not body.lstrip().startswith("---"):
+            print(
+                f"FAIL: {frag} has no YAML frontmatter - see "
+                ".changes/_template.md for the required shape",
+                file=sys.stderr,
+            )
+            print('{"status":"fail","reason":"changes_fragment_no_frontmatter"}')
+            sys.exit(1)
+        if not re.search(r"(?m)^##\s+Spec impact\s*$", body):
+            print(
+                f"FAIL: {frag} has no '## Spec impact' section - "
+                "tools/check_spec_anchors.sh requires one",
+                file=sys.stderr,
+            )
+            print('{"status":"fail","reason":"changes_fragment_no_spec_impact"}')
+            sys.exit(1)
     print('{"status":"pass","reason":"new .changes fragment in diff"}')
     sys.exit(0)
 if changelog:

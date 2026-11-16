@@ -35,7 +35,14 @@ jobs:
       - name: Check types
         run: uv run mypy src tests
       - name: Check spec anchors
-        run: bash tools/check_spec_anchors.sh
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            bash tools/check_spec_anchors.sh --base "origin/$BASE_REF"
+          else
+            bash tools/check_spec_anchors.sh
+          fi
       - name: Check changes entry
         if: github.event_name == 'pull_request'
         env:

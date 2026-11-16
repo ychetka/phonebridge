@@ -489,9 +489,12 @@ back**.
 | Lifetime | survives agent sleep/disconnect | only during ringing/dialing/active |
 | Ends by | owner `call.release{assignment_id}` / admin `revoke_assignment` (round 23: idle expiry is alert-only via `event.idle_alert`, never a revoke) | auto-release on `call.hangup` or provider `disconnected`; `call.release{lease_id}` (mid-call = hangup-intent); dead-man switch; orphan grace |
 
-LineAssignment fields: `owner_agent_id`, `mode
-(exclusive|shared_pool)`, `claimable`, `accept_window_sec`,
-`fallback_policy`, `last_seen_at`, `idle_revoke_after`.
+LineAssignment fields (round 27 — refreshed against the contract
+model): `assignment_id`, `line_id`, `owner_agent_id`, `profile`
+(stored admin label), `mode (exclusive|shared_pool)`, `claimable`,
+`accept_window_sec`, `fallback_policy`, `timeouts` (resolved
+`LineTimeouts`), `allowed_number_types`, `last_seen_at`,
+`idle_revoke_after`.
 
 **ProviderBinding is a third, distinct object space** (round 20 —
 the ≤0.0.12 conflation where `register_provider` returned a
@@ -599,6 +602,12 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   surfaced: the store rows are rehydrated as `initial_lines` on next
   boot, and a failed write-through marks the line `config_stale`
   in observability until a succeeding write resyncs it.
+  `config_stale` (round 27) is an ADAPTER-side observability flag,
+  not a contract field: the admin adapter keeps a per-line
+  write-behind marker in its own bookkeeping and surfaces it on the
+  admin diagnostics stream — neither `LineAssignment` nor
+  `LineSummary` carries it, because the kernel never observes
+  store-write outcomes.
 - **Drain discipline (round 25, clarification):** whichever adapter
   called the kernel, the drained outbox items feed the SHARED
   EventBus and provider-command executor — never the draining
@@ -769,9 +778,13 @@ removed.
   `GetCalls()` with EMPTY memory — it cannot echo `lease_id`. To
   prevent the call degrading to an unkillable `external_call` while
   the agent's lease still waits, TWO rules apply: (a) the provider
-  MUST keep a small durable state file (`/run/phonebridge/<line_id>
-  .json`, atomic write on every call mint/transition) mapping
-  `lease_id` → D-Bus object path, so a restart re-binds ids exactly;
+  MUST keep a small process-restart state file
+  (`/run/phonebridge/<line_id>.json`, atomic write on every call
+  mint/transition) mapping
+  `lease_id` → D-Bus object path, so a restart re-binds ids exactly
+  — the file survives a provider-process restart only: `/run` is
+  tmpfs (round 27), so a container/host reboot legitimately finds
+  it absent and falls back to rule (b);
   (b) when the file is absent/cold, the kernel applies the 1:1
   ambiguity rule — a snapshot call with `lease_id:null` on a line
   holding EXACTLY ONE orphaned lease binds to that lease (at most
@@ -780,7 +793,7 @@ removed.
 - Provider-side teardown commands are idempotent: a Hangup racing a
   remote teardown may surface as "method doesn't exist" — that is
   treated as already-gone success, verified via GetCalls/HangupAll.
-- Missed-call path emits `event.missed_call{reason, voicemail_ref?}`.
+- Missed-call path emits `event.missed_call{reason}` — `voicemail_ref` removed (round 27): no producer ever minted it.
 
 ### §5.5 Audio attach semantics
 
