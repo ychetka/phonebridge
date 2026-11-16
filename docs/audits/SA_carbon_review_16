@@ -1,0 +1,278 @@
+# SA_carbon_review_16 — blind full-slice architecture audit, v0.0.20 baseline
+
+Date: 2026-11-15
+Scope: independent verification of the post-`SA_carbon_review_15` (round 25) consolidation on
+`issue_63_v0.0.20` / commit `9f9c05c`. Sources audited: every file under `src/phonebridge/`
+(`__init__.py`, `domain/__init__.py`, `domain/contract.py` — 4 235 lines, `py.typed`), all of
+`tests/` (`test_domain_contract.py` 3 043 lines, `test_smoke.py`, `test_tooling_baseline.py`),
+`docs/api-contract.md`, `docs/phone-bridge-service-design.md`, `docs/hci-agent.md`,
+`docs/specs/{README,line-manager}.md`, `docs/CODING_HAZARDS.md`, `CHANGELOG.md` (0.0.20 section),
+`.changes/`, all `tools/*.sh`, all `.github/workflows/*`, `pyproject.toml`, `.devin/`.
+Method: read-only audit. No source, documentation, test, tooling or CI file was modified.
+The only artifact written is this report.
+
+## 0. Baseline statement — what v0.0.20 actually is
+
+`src/phonebridge/` contains a domain contract only: package docstrings, Pydantic models,
+constant tables, and two abstract kernel interfaces (`LineManager`, `LineAdminKernel`) whose
+methods are `...` bodies plus normative docstrings. There is no concrete `InMemoryLineManager`,
+no adapter, no SQLite store, no LineProvider, no MediaRouter, no hci-agent, no deployment code —
+the roadmap deliberately defers these to milestones M1–M5. `tests/test_smoke.py` is a
+two-line `assert True` placeholder. The 80 non-e2e unit tests exercise model validation,
+enum/table parity and documentation parsing only.
+
+Consequence for severity ranking: no finding can be a *runtime* defect — everything below is
+either (a) a contract/model defect that would be inherited by the M1 implementation,
+(b) a contract-vs-spec/doc drift, or (c) a tooling/infra issue. There are no Blockers: the
+Phase-0 contract freeze is internally consistent enough to proceed, with the two Major items
+closed first.
+
+Verification executed: `pytest -x -q -m "not e2e" --timeout=60` → 80 passed, 1 deselected;
+`ruff check` + `ruff format --check` → clean; `mypy -p phonebridge` → clean;
+`tools/check_spec_anchors.sh` → pass; `tools/check_version_tag.sh` → pass
+(`v0.0.20` is an ancestor of HEAD); `tools/check_changes_entry.sh` → pass.
+Two candidate defects were additionally verified by constructing the models in a live
+interpreter (see M1 and m1).
+
+## 1. Findings
+
+### MAJOR-1 — `EventEnvelope` validates `(name → audience.scope)` but never `(name → payload type)`: the review-15 item-31 PII/broadcast guard is bypassable at runtime.
+
+Evidence: `src/phonebridge/domain/contract.py:2389-2416` (`EventEnvelope` +
+`_audience_scope_legal_for_event`), `contract.py:2342-2386` (`EVENT_AUDIENCE_SCOPES`).
+
+The scope table is keyed on `EventName`; the payload binds to the name only through the
+`Generic[PayloadT]` annotation, which Python does not enforce at runtime. Verified live:
+
+```python
+EventEnvelope(
+    name=EventName.LINE_STATE_CHANGED,
+    audience=BroadcastAudience(),
+    payload=IncomingCallEvent(call_token="tok-secret", caller_id="+37377777111", ...),
+)  # constructs without error
+```
+
+The result is a broadcast envelope carrying a one-shot `call_token` and caller PII — exactly
+the accident class the docstring claims is now unconstructible ("a PII-bearing event must
+never be constructible with BroadcastAudience", contract.py:2408-2409; api-contract.md:241-247).
+Any kernel bug that stamps the wrong `name` silently widens a scoped payload; the static
+generic is the only guard and mypy does not see kernel-internal dynamic construction.
+Fix direction: a model validator asserting `type(payload)` against a name→payload-class
+table (e.g. `EVENT_PAYLOAD_MODELS`), or making `payload` a discriminated union keyed by
+`name`. This is a contract-model defect that M1 would inherit.
+
+### MAJOR-2 — the 8-hop transitive `forward_via_line` cycle check is normative in three documents but absent from the contract surface.
+
+Required by: `docs/specs/line-manager.md:158-168` (explicit Requirement),
+`docs/api-contract.md:519-525` ("a transitively cyclic forward chain (`A → B → … → A`) is
+detected by walking the stored policies — bounded at 8 hops — and rejected INVALID_ARGUMENT"),
+`docs/phone-bridge-service-design.md:703-705`.
+
+Present in `contract.py`: only the *self-loop* ban — the `LineAssignment` model validator at
+contract.py:1660-1664 and the `configure_line` docstring at contract.py:4163-4184, which
+enumerates fallback-policy validation at length (E.164 pair, target-line allowlist, self-loop)
+without mentioning the transitive walk. No other contract text carries the requirement.
+
+Consequence: an implementer coding M1 from `contract.py` docstrings alone — the file the
+freeze designates as the implementer-facing truth — ships `configure_line` without cycle
+detection, and `A → B → A` forwarding loops become constructible through the admin surface.
+Drift class: normative requirement silently dropped on the contract surface.
+
+### MINOR-1 — `ProviderCallStateUpdate` accepts `reason` on non-disconnected states.
+
+`contract.py:2959-2961` declares `reason: ProviderDisconnectReason | None` with no scoping
+validator, while the egress model `CallStateChangedEvent` enforces reason-only-on-
+`"disconnected"` (`contract.py:2466-2482`), and the wire document scopes the vocabulary to
+`disconnected` updates (`docs/api-contract.md:190`). Verified live:
+`state="active", reason=ProviderDisconnectReason.NORMAL` constructs. Ingress laxity only —
+the kernel can still ignore the field — but the same scoping validator belongs here for
+symmetry.
+
+### MINOR-2 — `ProviderRegistration.profile` / `ProviderCapabilityUpdate.profile` are unbounded external strings.
+
+`contract.py:2830` and `contract.py:3021`: `profile: str | None = None` with no length cap.
+`meta` on the same registration model was explicitly bounded under CODING_HAZARDS rule 7
+(`contract.py:2831-2874`), but `profile` — also provider-controlled wire input — was not:
+a 10 000-char value validates. A cap consistent with `MAX_PROVIDER_META_*` belongs here.
+
+### MINOR-3 — `ErrorData.free_lines` / `AcquireRefused.free_lines` skip the `_check_id` hygiene applied to every other line-id field.
+
+`contract.py:1049` and `contract.py:1907` use bare `tuple[LineId, ...]`; all other line-id
+positions use `_CheckedLineId`. Output-only, kernel-produced data, so impact is consistency
+rather than exposure — but a `line_id:"default"` alias or a colon-bearing id would pass
+validation on these two fields while being rejected everywhere else.
+
+### MINOR-4 — `send_dtmf` docstring lags the wire ALERTING allowance.
+
+`contract.py:3453-3460` states "INVALID_STATE when the lease has no ACTIVE call".
+`docs/api-contract.md:217` documents INVALID_STATE *unless* the lease is ACTIVE-with-
+`audio_ready` **or ALERTING** (early-media IVR, round 25 — the 0.3–0.6 s
+`State=active`→SCO-up gap would otherwise swallow tones). An implementer following the
+docstring would falsely gate ALERTING-phase DTMF.
+
+### MINOR-5 — `acquire` docstring omits the `reissued_ticket_id` delivery channel.
+
+`contract.py:3297-3301` says a preempted `enqueue=True` immediate grant's session "learns
+its `ticket_id` inside the `event.queue_updated` notification". The authoritative delivery
+channel is `event.call_state_changed.reissued_ticket_id` (`contract.py:2450-2457`,
+`docs/api-contract.md:237`) — the queue_updated is only the confirmation. Docstring lag on
+a round-23 item.
+
+### MINOR-6 — media-credential reissue has no supersede semantics: stale-token replay window.
+
+`call.reattach_media` (`contract.py:3464-3476`), `ProviderReattachMediaCommand`
+(`contract.py:2173-2187`) and `register_provider` reissue (`contract.py:3550-3557`) mint a
+fresh `(media_endpoint, media_token)` per live lease, but nothing requires the
+MediaRouter/MediaAllocator to invalidate the *previous* credential for the same
+`(lease_id, role)`. The docstring claim "the burned `provider_media_token` … can never
+authenticate" holds only when the old token was actually consumed: a token that was minted
+but never delivered (a `line.dial` that died with the socket) or never used (media socket
+dropped before `media.auth`) remains valid for the full 30 s `MEDIA_PAIR_TTL_SEC` alongside
+its reissued successor — two live credentials for one role, one leakable. Fix direction:
+state that reissue atomically supersedes the prior pair entry for the role.
+
+### MINOR-7 — commands drained against a dead provider binding are unspecified (reregister × in-flight `line.dial` race).
+
+After `provider.reregister` mints a fresh binding `assignment_id`, any outbox command still
+undelivered on the dropped channel (`line.dial`, `line.answer`, `line.reattach_media`)
+addresses the superseded binding. The contract does not state whether the shared
+provider-command executor drops such commands or treats them as transport errors. If dropped
+silently, a lease in `DIALING` wedges: saga compensation (`contract.py:3397-3407`) fires only
+on an adapter-observed `{accepted:false}`/timeout/transport error, and "command never
+sendable because its binding died" is not spelled out as one. Fix direction: declare that the
+executor feeds `ingest_call_state(DISCONNECTED, NETWORK_ERROR)` for commands whose target
+binding no longer exists, matching the `ProviderLiveness` superseded-id drop rule at
+`contract.py:2888-2897`.
+
+### MINOR-8 — design-doc vocabulary drift (stale pre-round-25 terms in `docs/phone-bridge-service-design.md`).
+
+- `:1149-1154` — "`idle_revoke_after:null` in the PATCH disables the idle clock entirely"
+  contradicts `contract.py:4115/4136-4144` (`None` = unchanged; only
+  `clear_idle_revoke_after:true` disables) and `api-contract.md:516-518`. The same paragraph
+  correctly describes the flag, so the sentence is self-contradictory.
+- `:1157-1160` — the `timeouts` enumeration omits `clear_max_call_duration?`
+  (present at `api-contract.md:502`).
+- `:392-395` — the `line.*` down-channel list omits `line.reattach_media` (round 25).
+- `:500` — "revoking a `ProviderBinding` drops the line to DOWN"; `:243-244` — "missed N
+  pings -> line `DEGRADED` -> `DOWN`": stale flat-`LineState` vocabulary after the
+  occupancy/liveness split (should read `unreachable`/health axis).
+- `:53` (decision log, round-12 row) — still asserts "container is isolated-netns" with no
+  superseded marker, contradicted by `§2.1:155-163` which ratified `--network=host` on the
+  ground that `AF_BLUETOOTH` is `init_net`-only.
+- `:613` — `line.dial{assignment_id, lease_id, number}` omits the round-14/25
+  `media_endpoint`/`media_token` pair (looks normative, is shorthand).
+- `:1194` — the line-onboarding lifecycle lists `DEGRADED` as a state name, ambiguous
+  post-split (borderline; it is not the `LineState` enum but reuses retired vocabulary).
+
+### MINOR-9 — `.changes/README.md` scope vocabulary is copied from devin-telegram.
+
+`.changes/README.md` lists `scope` values `cli, daemon, state, acp, mailbox, wake, ingress,
+tooling, docs, deploy` — a module taxonomy that does not exist in this repository
+(no `cli`/`daemon`/`state`/`acp`/`mailbox`/`wake`/`ingress` packages; the actual tree is
+`domain`/`contract`/`adapters`/`tooling`/`docs`/`deploy`). Fragments written against this
+list carry meaningless scopes.
+
+### MINOR-10 — `.devin/roadmap.md` is absent.
+
+`.windsurfrules` mandates that the root session maintain `.devin/roadmap.md`; the file does
+not exist (`.devin/` contains `project.json`, `config.json`, `cycle_log.jsonl`, `agents/`,
+`scripts/` only). The audit item "read `.devin/roadmap.md`" resolves to: nothing to review.
+Infra inconsistency, not a code defect.
+
+### MINOR-11 — `LineSummary.liveness` defaults to `REACHABLE` for unbound lines.
+
+`contract.py` `LineSummary` (`liveness` default `LivenessState.REACHABLE`): a line with no
+provider binding reads as healthy on the health axis; `caps == ()` is the only signal that
+nothing is attached. Documented choice, but a consumer keying "line is usable" off
+`liveness` alone is misled — worth one sentence in the docstring or a derived
+`UNREACHABLE`-for-unbound convention.
+
+### MINOR-12 — `admin.assign_line` is not explicitly barred from minting a `system:*` owner.
+
+`SYSTEM_AGENT_PREFIX`/`is_system_agent` (`contract.py:372-391`) and the external-socket
+rejection (`contract.py:3220-3227`, api-contract.md:111/210) cover `agent_id` at
+`register_intent` and the API-key issuance rule. `LineAssignment.owner_agent_id` is
+`_CheckedAgentId`, which deliberately *permits* `system:*` internally (needed for the
+fallback worker session). But `assign_line(line_id, owner_agent_id)` (admin surface,
+`contract.py:3968+`) never states that a `system:*` owner is rejected — a durable exclusive
+assignment owned by `system:anything` is constructible through the admin path. Trusted
+surface, so Minor; one docstring line closes it.
+
+## 2. Remediation verification — prior round-25 items confirmed correct
+
+| Item (from the audit brief) | Verdict | Evidence |
+|---|---|---|
+| `assignment_id` delivery: approved claim / admin assign | OK | `ClaimResolvedEvent._assignment_id_iff_approved` validator (contract.py:2589-2597); `assign_line`/`approve_claim` mint fresh rotated ids and emit `AssignmentGrantedEvent` agent-scoped (contract.py:3991-4017, 2538+); `event.assignment_granted`/`claim_resolved` in `EVENT_WIRE_NAMES` (contract.py:824-825) and `EVENT_AUDIENCE_SCOPES` (`{agent}`/`{session}`, 2354-2356) |
+| `assignment_id` on immediate grant | OK | Pool leases carry no durable assignment by design; the ephemeral `lease_id`+`expires_at` in `AcquireGranted` is correct |
+| `assignment_id` on preemption | OK | `reissued_ticket_id` restricted to `preempted_by_incoming` (contract.py:2466-2482); queue-origin grants keep the same `ticket_id` (contract.py:3291-3302, api-contract.md:308-326) |
+| Ring redelivery after reconnect | OK (specified) | `register_intent` docstring (contract.py:3234-3243): same `call_token`, original `expires_at`, fresh `SessionAudience` envelope; api-contract.md:210; design §5.2:644-650 |
+| Ring trigger/dedup/ordering | OK (specified) | `ingest_ring` idempotent on `RINGING_LOCKED` with same `call_token` (contract.py:3633-3636); full glare matrix incl. in-flight-dial race (contract.py:3638-3659+); events appended in emission order inside the mutation, drained in order (contract.py:3783-3834, 3629-3632) |
+| Provider state-file restart reconciliation + 1:1 ambiguity + multiple orphans | OK (specified) | design §5.4:758-770 (per-line `/run/phonebridge/<line_id>.json`, 1:1 rule, zero/ambiguous → `external_call`); `ProviderActiveCall`/`state_snapshot` carriers (contract.py:2844-2849, 2900-2906); `ProviderLiveness.assignment_id` required + superseded-id fact drop (contract.py:2888-2897) |
+| Media reissue race / stale-token replay | GAP | Reissue specified but no supersede semantics (MINOR-6); dead-binding command fate unspecified (MINOR-7) |
+| Numeric JSON-RPC error mapping | OK | `ERROR_CODE_WIRE` (contract.py:727-742): 14 codes, all inside -32099..-32000, unique; pinned by `test_error_code_wire_map`; wire layout documented (api-contract.md:115-120, design §3.2:332-344) |
+| `ErrorCode`/`ErrorReason`/`ErrorData.reason` collisions | OK | Sub-codes travel only in `error.data.reason` (contract.py:755-784, design §3.2:341-344); `GRANT_TTL_EXPIRED` exists in both `ErrorReason` and `CallEndReason` — different domains (error.data vs event payload), documented; no enum name collides across the wire layers |
+| `system:*` hygiene across identifier fields | Mostly OK | Reserved-prefix check centralized (`contract.py:372-391`); external rejection at `register_intent` (contract.py:3220-3227); `AgentAudience` system-suffix validator (contract.py:439-450); fallback-worker exemptions scoped to acquire/accept (contract.py:3281-3289, 3421-3426). Residual: `admin.assign_line` owner unguarded (MINOR-12) |
+| Queue `seq` minting/monotonicity/restart | OK | Global monotonic `seq` minted at acquire ingress incl. immediate grants; preempted grants reuse original seq (contract.py:3304-3311, QueueTicket ~1821-1869); tickets are memory-only and die on disconnect (design §4.5:573-578) so a restarted seq epoch cannot collide — correct by construction |
+| Finite-float + timeout bounds + clear/set XOR | OK | `ContractModel` `allow_inf_nan=False`, `frozen`, `extra="forbid"`, `hide_input_in_errors`; `LineTimeouts` ≤86400 s ceiling, `heartbeat_interval_sec` ≥0.001 floor; atomic `apply_patch` merge with ladder check on merged values (contract.py:4186-4196); `clear_idle_revoke_after`/`clear_max_call_duration` XOR rules (contract.py:4136-4146, TimeoutConfig); api-contract.md:494-518 |
+| SQLite write-through + `last_seen_at` | OK (specified) | design §4.5:556-601 — `line_assignments.last_seen_at` required since round 25, every `LineAssignment` mutation (incl. agent `call.release{assignment_id}`) serialized under `asyncio.Lock` through the same write-through, `config_stale` observability on failure; mutation points enumerated at contract.py:1601-1609 (every line op + last-session `drop_session`) |
+| hci-agent: `sco_data_packet_len`, `air_mode`, altsetting, H2 counter, prefill | OK | `docs/hci-agent.md` + design §6.3:864-888 — `sco_data_packet_len=60` (mSBC, feeder answers buffer-size itself behind `/dev/vhci`), numeric `air_mode` `0x03` from the `0x2c` event (never string), altsetting selection per BT Core Vol 4 Part B §2.1.1 with `SCO_PEER_MISMATCH`/`SCO_SESSION_MISMATCH` counters, continuous 2-bit H2 counter `0x08→0x38→0xC8→0xF8` rewritten on all outbound mSBC incl. silence, 2-packet (~2 ms) playout prefill, `0x16 SCO_STATE` carries `handle` |
+| Deployment Variant-A consistency / doctor / bind addresses | OK | design §2.1:155-195 + §9:1062-1066 — `--network=host` + `/dev/vhci` ratified with kernel-level justification (`bt_sock_create` → `EAFNOSUPPORT`), host `bluetoothd` masked, `phonebridge doctor` pre-flight (`/dev/vhci`, `hci_vhci`, host-bluetoothd absence), listeners on `127.0.0.1`/UDS and `wg0` IP only, feeder zero-caps bound to `wg0` IP, UDS `0660`/`0700`; no remaining isolated-netns normative text (only the unmarked stale decision-log row, MINOR-8) |
+| Tooling shell edge cases (`>-` folding, `#requirement-` slugging, `[project]` matching) | OK | `tools/release_notes.sh` handles `>`/`>-`/`>+`/`\|`/`|-`/`\|+` block scalars + comment lines (verified by `test_tooling_baseline.py`); `check_spec_anchors.sh` slugifies the full `Requirement:` heading incl. prefix → `#requirement-*` anchors matching docs/specs/README.md convention; `check_version_tag.sh` `awk` section-matches `[project]` and polls for the ancestor tag; all three scripts pass on this tree; `check_changes_entry.sh` rename-aware (`parts[-1]`) |
+| CI workflows | OK | lint.yml (ruff/format/mypy/spec-anchors/changes-entry, fetch-depth 0 for base diff), tests.yml (py 3.10–3.13, `-m "not e2e" --timeout=60` matching pyproject), version-tag.yml — consistent with the documented gates |
+
+## 3. Over-engineering assessment (explicit)
+
+- **Parallel registries.** `EventName` (14 members) ↔ `EVENT_WIRE_NAMES` ↔ `EVENT_AUDIENCE_SCOPES`
+  ↔ per-payload `Literal` fields, and again `ProviderCommand` discriminators ↔
+  `PROVIDER_COMMAND_WIRE_NAMES`. Four tables that must move together on every new event —
+  MAJOR-1 shows they are not cross-validated (name↔payload is the missing leg). The drift
+  tests cover enum↔wire parity but not payload↔name. This is the one place where structure
+  has already outrun enforcement.
+- **Dual timeout models.** `TimeoutConfig` (patch) + `LineTimeouts` (effective) + `apply_patch`
+  + stamped `ProviderBinding` values — four representations of one concept. Each is justified
+  (patch semantics, atomic merge, next-reregister cadence), but M1 must keep them coherent.
+- **Two-outbox, drain-after-every-call discipline.** A transactional event + provider-command
+  outbox on an in-memory kernel with a mandatory drain contract is substantial ceremony for
+  milestone M1; the risk is ritual compliance rather than misuse.
+- **`PhonebridgeError` pickle/deepcopy args ceremony** (`args=(code, data)`) — correct, but
+  it exists to serve a test, not an observed need, on an abstract contract.
+- **`RedactedString` + `NewType` layering.** The non-str fail-closed container is justified by
+  PII rules; `CallToken`/`MediaToken`/`AssignmentId` NewTypes are runtime identities, so the
+  "type safety" is annotation-deep — acceptable, but readers should not over-trust it.
+- **Triple validation of `forward_via_line`** (model constructor + `configure_line` + dial-time
+  target allowlist) plus a bounded 8-hop transitive walk — consistent with the fail-closed
+  posture; the walk itself is not implemented anywhere yet (MAJOR-2).
+- **Bounded-everything taxonomy** (`MAX_*` constants, `_Checked*` aliases on every field) —
+  mechanical, cheap, and uniformly applied; keep.
+
+## 4. Summary table
+
+| # | Severity | Finding | Primary citation |
+|---|---|---|---|
+| 1 | Major | EventEnvelope does not bind `name`↔payload type; broadcast can carry PII/`call_token` payloads (verified live) | contract.py:2389-2416, 2342-2386 |
+| 2 | Major | 8-hop transitive forward-cycle check normative in 3 docs, absent from contract surface | specs/line-manager.md:158-168; api-contract.md:519-525; design:703-705 vs contract.py:4163-4184, 1660-1664 |
+| 3 | Minor | `ProviderCallStateUpdate` accepts `reason` on non-disconnected states (verified live) | contract.py:2959-2961 vs 2466-2482, api-contract.md:190 |
+| 4 | Minor | `ProviderRegistration.profile`/`ProviderCapabilityUpdate.profile` unbounded external strings | contract.py:2830, 3021 |
+| 5 | Minor | `ErrorData`/`AcquireRefused.free_lines` skip `_check_id` hygiene | contract.py:1049, 1907 |
+| 6 | Minor | `send_dtmf` docstring lags the wire ALERTING allowance | contract.py:3453-3460 vs api-contract.md:217 |
+| 7 | Minor | `acquire` docstring omits `reissued_ticket_id` channel | contract.py:3297-3301 vs 2450-2457 |
+| 8 | Minor | Media-token reissue lacks supersede semantics → stale-token replay window (≤30 s) | contract.py:3464-3476, 2173-2187, 3550-3557 |
+| 9 | Minor | Commands drained against a dead binding unspecified (reregister × in-flight dial) | contract.py:3397-3407, 2888-2897 |
+| 10 | Minor | Design-doc stale vocabulary / contradictions (8 items) | design:53, 243-244, 392-395, 500, 613, 1149-1160, 1194 |
+| 11 | Minor | `.changes/README.md` scope list copied from devin-telegram | .changes/README.md |
+| 12 | Minor | `.devin/roadmap.md` absent though mandated | .devin/ |
+| 13 | Minor | `LineSummary.liveness` defaults `REACHABLE` for unbound lines | contract.py `LineSummary` |
+| 14 | Minor | `admin.assign_line` does not exclude `system:*` owners | contract.py:372-391, 3968+, 3220-3227 |
+
+## 5. Bottom line
+
+The v0.0.20 consolidation is in good shape: every previously-remediated item in the audit
+brief verified as correctly specified or correctly modeled, and all gates (pytest 80,
+ruff, mypy, spec anchors, version tag, changes entry) pass. Two items deserve closure
+before M1 begins rather than after: the missing `name`↔payload binding on `EventEnvelope`
+(MAJOR-1 — one model validator plus a lookup table) and the transitive-forward-cycle
+requirement that exists only in the spec/docs but not in the contract docstrings
+(MAJOR-2 — docstring amendment; the enforcement lands in M1). The Minor set is dominated
+by docstring lag and consistency gaps, plus two genuine specification holes in the
+reregister/reissue race (MINOR-6/7) that should be pinned now while the semantics are
+still cheap to state.

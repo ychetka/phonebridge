@@ -1,0 +1,233 @@
+## 1. Контекст, допущения и оценка текущего состояния (`v0.0.18`)
+
+### Базовый контекст и прогресс Round 23
+Проект **phonebridge** обновлён до версии `0.0.18` (применён пакет правок Round 23 / `SA_carbon_review_12`). Все четыре блокирующих дефекта предыдущей ревизии закрыты качественно:
+* `ProviderHangupCommand` (`line.hangup`) переведён на строгий XOR `{lease_id? | call_token?}` — политика `RejectFallback` теперь исполнима на уровне проводов и ядра;
+* `ForwardViaLineFallback` дополнен полями `target_number` и `target_country`;
+* `MediaAllocator` получил синхронный идемпотентный `revoke(lease_id)` и корректный момент вызова (`dial`/`accept`);
+* `_mask_for_log()` сериализует `datetime`, `timedelta` и `Enum`, обеспечивая безопасность `json.dumps(model.to_log_dict())`;
+* добавлены `IdleAlertEvent` + `AdminAudience`, двухуровневая модель переполнения outbox (`SOFT_CAP`), маркер `py.typed` и каталог живых спецификаций `docs/specs/`.
+
+### Главный вывод ревью `v0.0.18`
+Архитектура и доменный контракт достигли высокой степени зрелости (~95% готовности к коду). Вместе с тем аудит самой дельты Round 23 и межмодульных стыков выявил:
+1. **Одно критическое противоречие, внесённое в Round 23** между `docs/phone-bridge-service-design.md` (§6.6) и `docs/api-contract.md`, которое **полностью сломает `0x02` barge-in flush** при реализации `MediaRouter` (M3).
+2. **Один критический пробел в выходных DTO ядра** (`ProviderBinding` / `LineAssignment`), из-за которого адаптеры M2 не смогут вернуть `heartbeat_interval_ms` провайдеру при `provider.register` и выполнить write-through сохранение `TimeoutConfig` в SQLite.
+3. **Один аппаратно-протокольный дефект аудио в `hci-agent`** (генерация пакетов тишины при underrun без знания `sco_handle` и фазы 2-битного счётчика mSBC H2).
+4. **Ряд точечных поведенческих лакун M1–M4** (glare при встречном вызове в фазе `DIALING`, истечение `fallback_accept_ttl_sec`, обновление `last_seen_at` для онлайн-сессий, ротация `AssignmentId`, расхождение синтаксиса `-` vs `- none` в `docs/specs/README.md`).
+
+> **Прагматичная рекомендация (анти-оверинжиниринг):** проекту **не нужен** ещё один масштабный пересмотр архитектуры. Достаточно выпустить один компактный финальный патч заморозки (`v0.0.19`), закрывающий расхождения контракта/доков, а поведенческие детали зафиксировать как `additional_acceptance_notes` для задач M1–M5.
+
+---
+
+## 2. Архитектура верхнего уровня и визуализация узких мест
+
+### 2.1. Конфликт пейсинга в `MediaRouter` и физика пакетов тишины в `hci-agent`
+
+```mermaid
+sequenceDiagram
+    participant Ag as "AI Agent"
+    participant Sock as "OS Socket Buffer (SO_RCVBUF)"
+    participant MR as "MediaRouter (M3)"
+    participant LP as "LineProvider (M4)"
+    participant VF as "vhci-feeder (M4)"
+    participant HA as "hci-agent (Dongle Host)"
+
+    Note over Ag,MR: ❌ ОШИБКА в design.md §6.6: «пейсить чтение из сокета агента по 20 мс»
+    Ag->>Sock: 300x PCM (6 с речи) + 0x02 FLUSH (barge-in!)
+    Note right of Sock: При чтении 1 фрейм/20мс флаг 0x02 застрянет<br/>в SO_RCVBUF на 6 секунд! Кольцо 1500 фреймов пустует.
+
+    Note over Ag,LP: ✅ ПРАВИЛЬНО (api-contract.md): мгновенное чтение в кольцо + пейсинг ЗАПИСИ
+    Sock->>MR: Вычитывание на скорости сокета (<1 мс):<br/>0x01 -> в кольцо (1500), 0x02 -> мгновенный drain кольца!
+    loop Монотонный таймер 20 мс
+        MR->>LP: Запись 1 фрейма (640 B) в сокет провайдера
+    end
+
+    Note over VF,HA: ⚠️ ПРОБЕЛ в hci-agent.md §2: генерация тишины при underrun
+    VF->>HA: 0x16 SCO_STATE {open:true, air_mode:"msbc"} (НЕТ sco_handle!)
+    Note right of HA: До прихода 1-го UDP пакета hci-agent не знает<br/>12-bit sco_handle и сбивает H2-счётчик (08/38/C8/F8)!
+```
+
+### 2.2. Поток конфигурации и чтения таймаутов между SQLite (M2) и `InMemoryLineManager` (M1)
+
+```mermaid
+flowchart LR
+    SQLite[("SQLite DB<br/>lines + timeouts_json")]
+    Admin["Admin Adapter (M2)<br/>configure_line()"]
+    Kernel["InMemoryLineManager (M1)<br/>LineAssignment + TimeoutConfig"]
+    Mgr["Manager Adapter (M2)<br/>provider.register / reregister"]
+    Prov["LineProvider"]
+
+    SQLite -->|"1. Hydration (startup)"| Kernel
+    Admin -->|"2. Patch timeouts"| Kernel
+    Kernel -->|"3. Возвращает LineAssignment<br/>⚠️ [R24-C2] Нет поля timeouts для записи в SQLite!"| Admin
+    Admin -->|"4. Upsert"| SQLite
+    Prov -->|"5. provider.register"| Mgr
+    Mgr -->|"6. register_provider()"| Kernel
+    Kernel -->|"7. Возвращает ProviderBinding<br/>⚠️ [R24-C2] Нет heartbeat_interval_sec для ответа!"| Mgr
+```
+
+---
+
+## 3. Полный реестр выявленных недостатков `v0.0.18`
+
+### Категория CRITICAL (блокируют корректную реализацию M1/M2/M3)
+
+#### [R24-C1] Прямое противоречие `design.md §6.6` и `api-contract.md` по механике пейсинга `MediaRouter` (ломает barge-in `0x02`)
+* **Локализация:** `docs/phone-bridge-service-design.md:581-590` vs `docs/api-contract.md:400-410`.
+* **Проблема:** В `api-contract.md` записана верная модель: `MediaRouter` принимает TTS-пачку от агента в свой 1500-фреймовый буфер и тактирует **отправку** в `LineProvider` по 20 мс. Однако в новом разделе `design.md §6.6` написано прямо противоположное: *"the MediaRouter MUST pace **reads from the media socket** — consume ONE 640 B frame per 20 ms tick"*.
+* **Последствие:** Если исполнитель M3 ограничит чтение из WebSocket агента скоростью 1 фрейм / 20 мс, вся 6–10-секундная пачка TTS застрянет в ядерном буфере ОС `SO_RCVBUF`. Отправленный агентом управляющий фрейм `0x02` (сброс речи при перебивании человеком) или `0x03` keepalive не будет прочитан роутером, пока не вычитаются все 300 предыдущих аудиофреймов (через 6 секунд!). При этом 1500-фреймовый буфер роутера всегда будет иметь глубину `<= 1`.
+* **Исправление:** Переписать `design.md §6.6`: роутер вычитывает сокет агента **немедленно (non-blocking drain)**, мгновенно обрабатывая `0x02` (очистка кольца) и складывая `0x01` в 1500-фреймовое кольцо, а тактирование **1 фрейм / 20 мс** применяется строго на **выходе** из кольца в сокет `LineProvider`.
+
+#### [R24-C2] Потеря эффективных таймаутов (`TimeoutConfig`) на выходе `register_provider` и `configure_line`
+* **Локализация:** `src/phonebridge/domain/contract.py:570-613, 1445-1480, 1515-1545`, `docs/phone-bridge-service-design.md:§4.5`, `docs/api-contract.md:198`.
+* **Проблема:**
+  1. На проводе `provider.register` / `provider.reregister` обязан вернуть `{assignment_id, heartbeat_interval_ms, ...}`. В Round 23 зафиксировано, что изменённый в админке `heartbeat_interval_sec` вступает в силу при следующем `reregister`. Но `LineManager.register_provider()` возвращает `ProviderBinding`, в котором **нет поля `heartbeat_interval_sec` (или `heartbeat_interval_ms`)**! Менеджер-адаптер M2 физически не может узнать актуальный интервал линии из ответа ядра.
+  2. По схеме персистентности `design.md §4.5` админ-адаптер после `configure_line(...)` берёт возвращённый иммутабельный `LineAssignment` и сохраняет его в SQLite (`lines.timeouts_json`). Но `LineAssignment` **не содержит поля `timeouts`**, а `TimeoutConfig` — это patch-модель с `None`-полями (не содержащая дефолтов). Кроме того, в `TimeoutConfig` отсутствует `@model_validator`, проверяющий заявленный в docstring инвариант `heartbeat_down_after > heartbeat_degraded_after`.
+* **Исправление:**
+  1. Ввести иммутабельную модель полных значений `LineTimeouts` (с дефолтами: `grant_ttl_sec=5.0`, `orphan_grace_sec=10.0`, `heartbeat_interval_sec=5.0`, `heartbeat_degraded_after=2`, `heartbeat_down_after=3`, `fallback_accept_ttl_sec=10.0` и валидатором `heartbeat_down_after > heartbeat_degraded_after`) и включить `timeouts: LineTimeouts = Field(default_factory=LineTimeouts)` в `LineAssignment`.
+  2. Добавить `heartbeat_interval_ms: int = Field(gt=0)` в `ProviderBinding` (фиксирует интервал, согласованный для текущей сессии провайдера, что автоматически решает задачу «не применять новый интервал к живой сессии до `reregister`»!).
+  3. Добавить валидатор `heartbeat_down_after > heartbeat_degraded_after` (если оба заданы) в `TimeoutConfig`.
+
+---
+
+### Категория HIGH (приведут к сбоям аудио, зависанию колец или конфликтам в M1–M4)
+
+#### [R24-H1] Дефект генерации тишины в `hci-agent`: отсутствие `sco_handle` в `0x16 SCO_STATE` и разрыв фазы H2 в mSBC
+* **Локализация:** `docs/hci-agent.md:62, 167-184`.
+* **Проблема:** Round 23 добавил в `hci-agent` 30–45 мс playout-буфер перед USB isoc OUT с генерацией пакетов тишины при underrun. Однако USB isoc эндпоинт принимает **полные HCI SCO пакеты** (`2 B handle/flags + 1 B len + payload`):
+  1. Пока от `vhci-feeder` по UDP не дошёл хотя бы один реальный пакет (начальный прогрев буфера), тупой `hci-agent` **не знает 12-битный `sco_handle`**, так как событие `0x2c` парсит `vhci-feeder`, а в команде `0x16 SCO_STATE {open, air_mode, rx_pkt_len, tx_pkt_len}` поле `handle` отсутствует!
+  2. В режиме WBS (`air_mode == "msbc"`, 60 байт) каждый eSCO-пакет начинается с 2-байтного заголовка синхронизации H2 (`0x01`, затем циклический байт счётчика из четвёрки `0x08, 0x38, 0xC8, 0xF8`). Если при underrun `hci-agent` вставит пакет тишины, а затем перешлёт пришедший по UDP пакет от PipeWire без пересчёта байта H2-счётчика, DSP телефона зафиксирует скачок последовательности H2 и вызовет щелчок/мутирование PLC!
+* **Исправление:** Добавить `handle?: uint16` в `0x16 SCO_STATE` (обязателен при `open: true`) и обязать `hci-agent` вести собственный монотонный 2-битный счётчик H2 (`0x08 -> 0x38 -> 0xC8 -> 0xF8`), перезаписывая 2-й байт полезной нагрузки mSBC как для пакетов тишины, так и для транзитных UDP-пакетов.
+
+#### [R24-H2] Неопределённость жизненного цикла `decide_fallback` vs `tick(now)` и финала при истечении `fallback_accept_ttl_sec`
+* **Локализация:** `src/phonebridge/domain/contract.py:846-864, 1353-1364, 1387-1409`, `docs/specs/line-manager.md:48-54`.
+* **Проблема:**
+  1. Формулировка в `docs/specs/line-manager.md` (*"`decide_fallback` MUST wait the full `accept_window_sec`"*) опасна буквально: метод ядра не имеет права делать `await asyncio.sleep()` (нарушение Rule 2 и Rule 4). Кто и когда вызывает `decide_fallback` — внешний адаптер или сам `tick(now)` внутри ядра?
+  2. В Round 23 добавлен дедлайн `FallbackTriggeredEvent.expires_at` (`fallback_accept_ttl_sec`), но **нигде не описано, что делает `tick(now)`, когда `FallbackWorker` мёртв и этот второй таймер тоже истёк!**
+* **Исправление:** Уточнить контракт и спек:
+  * Таймеры двигает **только `tick(now)`**: при `now >= ring.expires_at` ядро внутри `tick(now)` вызывает логику выбора политики; прямой вызов `decide_fallback(line_id, call_token)` до истечения `expires_at` выбрасывает `PhonebridgeError(INVALID_STATE)`.
+  * При истечении `fallback_accept_ttl_sec` без `call.accept` от `FallbackWorker` ядро принудительно деградирует к `no_pickup`: сжигает `fallback_call_token`, снимает блокировку `RINGING_LOCKED -> FREE` и эмитит `MissedCallEvent(reason=CallEndReason.ACCEPT_WINDOW_EXPIRED)`.
+
+#### [R24-H3] Не специфицирована гонка встречного вызова (Glare) в `ingest_ring` на линии в состоянии `BUSY` / `DOWN`
+* **Локализация:** `src/phonebridge/domain/contract.py:1322-1342`.
+* **Проблема:** Сигнатура `ingest_ring(ring) -> IncomingCallEvent` возвращает событие безусловно. Преемпция описана только для неиспользованного гранта (`CallPhase.ACQUIRED`). Но возможен классический телеком-glare: агент только что вызвал `call.dial` (`CallPhase.DIALING`, линия уже `BUSY`), команда `line.dial` ещё летит к провайдеру, а физический телефон в эту же миллисекунду принял входящий вызов с сотовой сети и прислал `provider.call_state{state:"ringing"}` (для провайдера это *первый* звонок на шине, поэтому фильтр Call Waiting не сработает!).
+* **Исправление:** Зафиксировать поведение `ingest_ring` для всех состояний линии:
+  * `FREE` -> переход в `RINGING_LOCKED`, минтинг `call_token`;
+  * `BUSY` с лизом в `CallPhase.ACQUIRED` и `RECEIVE_INBOUND in binding.caps` -> преемпция гранта + `RINGING_LOCKED`;
+  * `RINGING_LOCKED` -> идемпотентный возврат текущего `IncomingCallEvent`;
+  * `BUSY` (включая glare в `DIALING`/`ALERTING`/`ACTIVE` и `external_call`) или `DOWN`, либо отсутствие `RECEIVE_INBOUND` в `binding.caps` -> выброс `PhonebridgeError(INVALID_STATE)` (при получении этой ошибки `LineProvider` отклоняет входящий вызов на шине через `Hangup`, либо не переводит линию в `RINGING_LOCKED`).
+
+#### [R24-H4] Ложные срабатывания `event.idle_alert` на живых подключённых агентах и отсутствие канала подписки `admin`
+* **Локализация:** `src/phonebridge/domain/contract.py:590, 905-926`, `docs/api-contract.md:254-275`.
+* **Проблема:**
+  1. Нигде не определено, когда обновляется `LineAssignment.last_seen_at`. Если обновлять его только при звонках или при `register_intent`, то секретарь-агент, открывший WebSocket-сессию и честно ждущий входящих звонков 25 часов подряд без единого звонка, при `idle_revoke_after = 24h` сгенерирует ложный `event.idle_alert`!
+  2. `event.idle_alert` помещён в таблицу `APICallService -> Agent`, но имеет `AdminAudience`. В `api-contract.md` у `APICallService` нет метода аутентификации/подписки для `admin`-токена (`agent.register_intent` принимает только агентские токены и непустые `intents[]`).
+* **Исправление:**
+  1. Зафиксировать правило активности M1: пока у `owner_agent_id` есть **хотя бы одна открытая сессия** в `LineManager`, линия считается активной (`idle` не тикает); при закрытии последней сессии (`drop_session`) и при любой операции с линией `last_seen_at` обновляется до `now`.
+  2. В `api-contract.md` уточнить, что в v1 `AdminAudience`-события доставляются через `EventBus` в настроенные `escalation_hooks` (Webhook / Telegram / Exec) и админский MCP-стрим (`c_admin`), не требуя `agent.register_intent`.
+
+---
+
+### Категория MEDIUM & LOW (валидация моделей, краевые случаи, CI-харнесс и документация)
+
+| ID | Локализация | Суть замечания | Решение |
+|---|---|---|---|
+| **R24-M1** | `contract.py:546-599` | Самопетля `ForwardViaLineFallback` (`forward.line_id == line_id`) и формат `target_number`/`target_country` проверяются только в `configure_line`, но **не** на уровне конструкторов `ForwardViaLineFallback` и `LineAssignment` (при гидратации битой строки из SQLite/конфига невалидная политика пройдёт без ошибки). Кроме того, проверка `allowed_number_types` при `configure_line` должна смотреть на **целевую** линию `forward.line_id`, а не на конфигурируемую! | Вынести чистую функцию `validate_e164_country(number, country)` в домен и вызывать её в `@model_validator` модели `ForwardViaLineFallback`; в `LineAssignment` запретить `fallback_policy.line_id == self.line_id`; проверку `allowed_number_types` для `forward.line_id` уточнить в `configure_line`. |
+| **R24-M2** | `contract.py:1244-1261` | При мутации `SHARED_POOL <-> EXCLUSIVE` в `assign_line` / `approve_claim` / `release_assignment` переиспользование одного `assignment_id` приводит к коллизии: старый владелец при ретрае `release_assignment` получит `OWNER_MISMATCH` вместо обещанного идемпотентного no-op (либо чужой агент получит `{ok}`). | Выпускать **новый `AssignmentId`** при каждой смене владельца/режима `LineAssignment`, сохраняя старый в ограниченном LRU-кольце `_closed_assignments` (аналогично `_closed_leases`). |
+| **R24-M3** | `contract.py:1265`, `api-contract.md:237, 310` | Неоднозначность фильтра `call.get_lines {session_id, intent: "exclusive_line"}`: у `ProviderBinding.caps` провайдер заявляет телеком-возможности (`dial_out`, `receive_inbound`), тогда как доступность эксклюзива определяется полями `LineAssignment.claimable` и `mode`. | Явно зафиксировать: `ProviderBinding.caps` содержит только `dial_out`/`receive_inbound`; вызов `get_lines(intent=EXCLUSIVE_LINE)` возвращает линии, где `assignment.claimable is True and assignment.mode == AssignmentMode.SHARED_POOL`. |
+| **R24-M4** | `design.md:459`, `contract.py:554` | Условие для `AnswerAndAnnounceFallback` (*"only if an agent is registered for inbound"*) неоднозначно для `EXCLUSIVE`-линии со спящим владельцем и не задаёт fallback по умолчанию, если условие не выполнено. | Считать условие истинным, если `assignment.mode == EXCLUSIVE` ИЛИ есть живая сессия с `RECEIVE_INBOUND`; иначе `decide_fallback` возвращает `NoPickupFallback`. Исключить `system:fallback_worker` из подсчёта обычных inbound-сессий. |
+| **R24-M5** | `docs/specs/README.md:33` vs `harness.md:111` | В `harness.md` отсутствие поведенческого импакта в `.changes/<slug>.md` кодируется строкой **bare `-`**, а в новом `docs/specs/README.md` указано **`- none`**. При строгом парсере в `tools/check_spec_anchors.sh` / `verify_constraints.sh` одна из форм сломает CI при мерже! Кроме того, в `docs/specs/line-manager.md` требования уже записаны до кода M1 — в PR этапа M1 нужно будет указывать `modifies:`, а не `adds:`, чтобы не получить дубликаты якорей. | Сверить регулярное выражение в `tools/check_spec_anchors.sh` и привести `docs/specs/README.md` и `harness.md` к единому литералу; добавить памятку про `modifies:` для M1. |
+| **R24-L1** | `contract.py:1487-1525`, `api-contract.md:229` | В `LineAdminKernel` для неизвестных `claim_id` / `assignment_id` указан общий `PhonebridgeError` без конкретного `ErrorCode`; для `call.release` с 0 или 2 параметрами не назван `INVALID_ARGUMENT`. | Зафиксировать маппинг кодов: неизвестный `claim_id` -> `INVALID_STATE` + `CLAIM_NOT_FOUND`; неизвестный `assignment_id` в `revoke_assignment`/`release_assignment` -> `STALE_TOKEN`; `call.release` без XOR -> `INVALID_ARGUMENT`. |
+| **R24-L2** | `api-contract.md:3`, `design.md:257, 513, 683`, `*.html` | Мелкий остаточный дрейф текста: шапка `api-contract.md` (`rounds 1-21` вместо `1-23`); в `design.md §9` написано *"The kernel re-resolves... D-Bus chain"* (это делает `LineProvider`, а не ядро); в `interaction-flow.html` пропущены `expires_at` в `AcquireGranted`, `ticket_id` в `line_acquired` и `event.idle_alert`; два файла харнесса (`harness.md` и `development-cycle.md`) не проверяются в CI на побайтовое совпадение тела. | Поправить формулировки в рамках финального патча документации и добавить 3-строчную проверку `tail` совпадения файлов харнесса в скрипт линтера. |
+
+---
+
+## 4. Аудит данных, API, масштабируемости и безопасности
+
+* **Хранение данных (Data Storage):** Разделение Round 23 (§4.5) между SQLite (`WAL`) для конфигурации/ключей и чистой памятью для звонков/очередей оптимально для масштаба `1..20` линий. Единственное необходимое дополнение — возврат полного `LineTimeouts` внутри `LineAssignment` (**[R24-C2]**), чтобы write-through сохранение в SQLite не теряло настройки таймаутов, и запрет хранения сырого `ProviderRegistration.token` внутри памяти `InMemoryLineManager` после регистрации.
+* **Протоколы и консистентность (Communication & APIs):** Связка синхронного `InMemoryLineManager` + двухуровневого outbox (`SOFT_CAP`) + асинхронной Saga-компенсации (`~2 с` дедлайн на `{accepted}`) полностью закрывает проблему распределённых гонок между агентом и D-Bus без блокировок event loop.
+* **Масштабируемость и надёжность (Scalability & Reliability):** Уточнение чтения сокета на полной скорости и пейсинга записи в `MediaRouter` (**[R24-C1]**) гарантирует задержку реакции на перебивание (barge-in) `< 20 мс` при потреблении памяти `~960 КБ` на активный звонок (менее `20 МБ` RAM при 20 одновременных звонках).
+* **Безопасность (Security):** Матрица capabilities в `design.md §9` (нулевые capabilities у `vhci-feeder`, привязка к IP `wg0`, `execve` + `stdin` для хуков, двухфакторная проверка `agent.token` + WireGuard `/32` pubkey) соответствует лучшим индустриальным практикам контейнеризации системных сервисов.
+
+---
+
+## 5. Ключевые архитектурные решения (ADR)
+
+### ADR-24.1: Немедленное вычитывание сокета агента и пейсинг записи в `MediaRouter`
+* **Контекст:** В `design.md §6.6` попало требование тактировать *чтение* из сокета агента по 20 мс, что блокирует чтение управляющего фрейма `0x02` (flush) за очередью аудиоданных в ядерном буфере ОС `SO_RCVBUF`.
+* **Решение:** `MediaRouter` читает WebSocket агента непрерывно без искусственных задержек: фреймы `0x01` кладутся в 1500-фреймовое кольцо (`drop-newest`), фрейм `0x02` мгновенно очищает это кольцо, а фоновая задача-пейсер отправляет по одному фрейму каждые 20 мс в WebSocket `LineProvider`.
+* **Последствия:** (+) Время реакции на `0x02` barge-in `< 1 мс` на уровне роутера; (+) честная телеметрия `media.uplink_overflow`; (−) буферизация до 960 КБ на звонок происходит в памяти процесса Python вместо `SO_RCVBUF` ядра ОС.
+
+### ADR-24.2: Разделение модели патча (`TimeoutConfig`) и эффективного состояния (`LineTimeouts`)
+* **Контекст:** Адаптерам нужны конкретные эффективные значения таймаутов (`heartbeat_interval_ms` для ответа на `provider.register`, полный снимок для записи в SQLite), тогда как `TimeoutConfig` содержит `None` для неизменённых полей.
+* **Решение:** Оставить `TimeoutConfig` входным патчем `configure_line`, но хранить и возвращать внутри `LineAssignment.timeouts` конкретизированную модель `LineTimeouts` (без `None`), а зафиксированный на момент регистрации интервал штамповать в `ProviderBinding.heartbeat_interval_ms`.
+* **Последствия:** (+) Полная детерминированность адаптеров M2 без дублирования дефолтов вне ядра; (+) автоматическая защита текущей сессии провайдера при смене `heartbeat_interval_sec` в рантайме.
+
+### ADR-24.3: Непрерывность счётчика H2 и передача `handle` для генератора тишины `hci-agent`
+* **Контекст:** Bluetooth WBS (`mSBC`) требует валидного `sco_handle` и непрерывного циклического счётчика заголовка H2 (`0x08, 0x38, 0xC8, 0xF8`); вставка пакетов тишины при сетевом джиттере без пересчёта H2 вызывает артефакты декодера телефона.
+* **Решение:** Передавать 12-битный `handle` внутри `0x16 SCO_STATE(open=true)` и вести единый монотонный счётчик H2 на выходе playout-буфера `hci-agent`, переписывая байт последовательности H2 во всех уходящих в USB mSBC-пакетах.
+* **Последствия:** (+) Бесшовные переходы между тишиной и голосом при джиттере на WAN; (−) минимальное усложнение функции формирования пакета в `hci-agent` (~10 строк кода).
+
+---
+
+## 6. Документ по исправлению недостатков (ТЗ на финальный патч `v0.0.19` и гейты M1–M5)
+
+Данный раздел оформлен как готовая спецификация задач для закрытия всех найденных пробелов без повторных циклов ревью.
+
+### Блок А. Финальный микро-патч заморозки контракта и спеки (`v0.0.19`, перед стартом M1)
+
+1. **`src/phonebridge/domain/contract.py` (+ `tests/test_domain_contract.py`):**
+   * **Модель `LineTimeouts` и `TimeoutConfig` (`[R24-C2]`):**
+     * Добавить frozen-модель `LineTimeouts(ContractModel)` с конкретными значениями по умолчанию (`grant_ttl_sec: float = 5.0`, `orphan_grace_sec: float = 10.0`, `heartbeat_interval_sec: float = 5.0`, `heartbeat_degraded_after: int = 2`, `heartbeat_down_after: int = 3`, `fallback_accept_ttl_sec: float = 10.0`) и `@model_validator`, проверяющим `heartbeat_down_after > heartbeat_degraded_after`.
+     * Добавить такой же `@model_validator` в `TimeoutConfig` (когда оба поля не `None`).
+     * Добавить поле `timeouts: LineTimeouts = Field(default_factory=LineTimeouts)` в `LineAssignment`.
+     * Добавить поле `heartbeat_interval_ms: int = Field(default=5000, gt=0)` в `ProviderBinding`.
+   * **Валидация `ForwardViaLineFallback` на уровне моделей (`[R24-M1]`):**
+     * Добавить публичный хелпер `validate_e164_country(number: RedactedString, country: str) -> str` (строгий regex `^\+[1-9]\d{6,14}$` + `phonenumbers.parse` + `is_valid_number_for_region`) и вызывать его в `@model_validator` класса `ForwardViaLineFallback` (чтобы невалидный номер/страна не могли попасть в модель даже из БД).
+     * В `LineAssignment._owner_matches_mode` (переименовать в `_validate_assignment_invariants`) добавить проверку: `if isinstance(self.fallback_policy, ForwardViaLineFallback) and self.fallback_policy.line_id == self.line_id: raise ValueError("forward_via_line cannot target the same line_id")`.
+   * **Валидация `ProviderRegistration.caps` / `ProviderCapabilityUpdate.caps` (`[R24-M3]`):**
+     * Запретить пустой `caps` и наличие `Intent.EXCLUSIVE_LINE` в `caps` провайдера (эксклюзивность — свойство `LineAssignment.claimable`, а не аппаратного провайдера).
+   * **Уточнение docstrings для M1 (`[R24-H2, H3, H4, M2, L1]`):**
+     * В `ingest_ring`: явно прописать выброс `PhonebridgeError(ErrorCode.INVALID_STATE)` при звонке на линию в состоянии `BUSY` (кроме преемпции `CallPhase.ACQUIRED` при наличии `RECEIVE_INBOUND` в `caps`) или `DOWN`.
+     * В `decide_fallback` и `tick`: зафиксировать, что истечение `accept_window_sec` и `fallback_accept_ttl_sec` обрабатывается внутри `tick(now)`; при истечении `fallback_accept_ttl_sec` линия переходит в `FREE` с `MissedCallEvent(reason=ACCEPT_WINDOW_EXPIRED)`; вызов `decide_fallback` до `expires_at` бросает `INVALID_STATE`.
+     * В `LineAdminKernel` и `release_assignment`: зафиксировать коды ошибок (`CLAIM_NOT_FOUND` под `INVALID_STATE`; неизвестный `assignment_id` -> `STALE_TOKEN`) и ротацию `AssignmentId` при смене владельца.
+
+2. **`docs/phone-bridge-service-design.md` и `docs/api-contract.md`:**
+   * **`design.md §6.6` (`[R24-C1]`):** заменить *"pace reads from the media socket"* на немедленное чтение из сокета агента в 1500-фреймовое кольцо и **пейсинг записи (`MediaRouter -> LineProvider`) по 1 фрейму / 20 мс**.
+   * **`design.md §6.3` / `§9` / `§3.6` (`[R24-L2]`):** добавить в §6.3 перекрёстную ссылку на uplink playout-буфер `hci-agent`; в §9 заменить *"The kernel re-resolves"* на *"Each LineProvider re-resolves"*; в §3.6 добавить `reissued_ticket_id?` в сигнатуру `event.call_state_changed`; в шапке `api-contract.md` обновить `rounds 1-21` -> `rounds 1-24`.
+   * **`api-contract.md` (`[R24-H4, L1]`):** уточнить доставку `event.idle_alert` через `escalation_hooks` и админ-поверхность; явно указать `INVALID_ARGUMENT` при нарушении XOR в `call.release`.
+
+3. **`docs/hci-agent.md` (`[R24-H1]`):**
+   * В `0x16 SCO_STATE` добавить поле `handle?: uint16` (12-битный хэндл синхронного соединения из события `0x2c`, обязателен при `open: true`).
+   * В раздел **Uplink playout jitter buffer** добавить требование формирования 3-байтного заголовка HCI SCO с этим `handle` и поддержания непрерывного 2-битного счётчика заголовка H2 (`0x08, 0x38, 0xC8, 0xF8`) для всех исходящих в USB пакетов в режиме `msbc`.
+
+4. **Инфраструктура спецификаций и диаграмм (`[R24-M5, L2]`):**
+   * Проверить `tools/check_spec_anchors.sh` и синхронизировать запись отсутствия импакта (`-` vs `- none`) между `docs/specs/README.md` и `controller-manager/harness.md`; исправить формулировку про ожидание в `docs/specs/line-manager.md#accept-window-always-elapses-before-fallback`.
+   * Обновить `docs/interaction-flow.html` (`expires_at`, `ticket_id`, `event.idle_alert`) и `docs/architecture-unified.html` (`admin` audience).
+
+---
+
+### Блок Б. Обязательные критерии приёмки (`additional_acceptance_notes`) для этапов реализации M1–M5
+
+Чтобы субагенты-исполнители (`code_writer`) с узким контекстом не допустили ошибок на стыках, прикрепите следующие инварианты к соответствующим пунктам `.devin/roadmap.md`:
+
+* **Для M1 (`InMemoryLineManager`):**
+  1. Никогда не сохранять `ProviderRegistration.token` во внутреннем состоянии менеджера.
+  2. Держать два ограниченных кольца идемпотентности (LRU `OrderedDict`, cap = 1024): `_closed_leases: dict[LeaseId, SessionId]` (делает повторные `hangup` и `release` после `disconnected` идемпотентными `{ok}` для владельца и возвращает `OWNER_MISMATCH` для чужих сессий) и `_closed_assignments: dict[AssignmentId, str]` (для идемпотентности `release_assignment` после ротации `AssignmentId`).
+  3. Не считать эксклюзивную линию `idle`, пока у `owner_agent_id` есть хотя бы одна живая сессия; штамповать `last_seen_at = now` при `drop_session` последней сессии владельца и при любой операции с линией.
+  4. Для `get_lines(session_id, intent=Intent.EXCLUSIVE_LINE)` фильтровать по `assignment.claimable and assignment.mode == AssignmentMode.SHARED_POOL`.
+  5. В `.changes/` фрагменте PR M1 указывать `modifies:` (а не `adds:`) для уже существующих якорей в `docs/specs/line-manager.md`.
+
+* **Для M2 (`Gateway JSON-RPC + SQLite + EventBus`):**
+  1. Обернуть каждый вызов мутации `LineManager` / `LineAdminKernel` в единый хелпер `_run_and_drain()`, который **до первого `await`** синхронно вызывает `drain_events()` и `drain_provider_commands()`.
+  2. На `line.dial` и `line.answer` запускать задачу ожидания `{accepted}` с `asyncio.timeout(2.0)`; при `False`, `TimeoutError` или закрытии сокета вызывать `ingest_call_state(DISCONNECTED, NETWORK_ERROR)`.
+  3. Проверку `allowed_number_types` для `ForwardViaLineFallback` в `configure_line` выполнять против целевой линии `forward.line_id` (если она уже зарегистрирована в хранилище), а также при фактическом вызове `dial()` от `FallbackWorker`.
+
+* **Для M3 (`MediaRouter`):**
+  1. Читающий цикл `agent_ws` **никогда не спит на таймере**: `0x02` мгновенно делает `uplink_ring.clear()`, `0x01` пишет в `uplink_ring` (1500 фреймов, при полноте отбрасывает **новый** фрейм и инкрементирует `media.uplink_overflow`).
+  2. Отдельный `asyncio.Task` с монотонным шагом `t_next += 0.020` перекладывает по одному фрейму из `uplink_ring` в `provider_ws`.
+  3. Любой `0x02`, пришедший со стороны `provider_ws`, очищает `uplink_ring` и поглощается роутером (не пересылается в `agent_ws`).
+
+* **Для M4–M5 (`LineProvider`, `vhci-feeder`, `hci-agent`, `FallbackWorker`):**
+  1. При получении `PhonebridgeError(INVALID_STATE)` (или `{ok: false}`) в ответ на `provider.call_state{state:"ringing"}` (случай glare в фазе `DIALING`) `LineProvider` вызывает `VoiceCall.Hangup` на входящем объекте oFono и инкрементирует счётчик `glare_inbound_rejected`.
+  2. В `hci-agent` при `air_mode == "msbc"` переписывать второй байт полезной нагрузки (`H2 sync sequence`) сквозным счётчиком как для сгенерированных пакетов тишины, так и для UDP-пакетов из туннеля.

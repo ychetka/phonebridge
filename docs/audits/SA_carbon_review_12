@@ -1,0 +1,284 @@
+## 1. Контекст, допущения и сильные стороны проекта
+
+### Контекст и базовые допущения
+Проект **phonebridge** (`v0.0.17`) находится на этапе финализации архитектурной спецификации и заморозки доменного контракта (`src/phonebridge/domain/contract.py`) перед стартом реализации этапов **M1–M5**.
+* **Целевая нагрузка и масштаб (NFR):** от 1 до ~10–20 физических телефонных линий (BT-донглов + смартфонов) на инстанс контейнера; десятки конкурентных сессий AI-агентов; бюджет задержки медиатракта моста `< 100 мс` (20 мс фреймы PCM 16 кГц `S16_LE` mono); целевой деплоймент — единый изолированный Docker-контейнер + легковесные выносные релеи `hci-agent`.
+* **Допущение ревью:** поскольку контракт уже прошёл 22 раунда итеративной полировки, базовые инварианты проверены. Фокус данного ревью — **глубокие межкомпонентные стыки, физика real-time аудио, распределённые гонки состояний и блокирующие пробелы контракта**, которые не позволят чисто реализовать M1–M5 без очередного `PLAN_DELTA`.
+
+### Сильные стороны текущей архитектуры
+1. **Вынос USB/BT-железа за пределы контейнера (`hci-agent` + `/dev/vhci`):** блестящее архитектурное решение (раунды 12–13). Отказ от `--device` USB-passthrough в пользу userspace `libusb` + `vhci` устраняет зависимость от хостового `bluetoothd`, унифицирует локальные и удалённые линии (Raspberry Pi) и позволяет детерминированно уничтожать зависшие адаптеры.
+2. **Контрактная дисциплина и drift-тесты:** двусторонние тесты паритета (`test_error_codes_match_contract_doc`, `test_event_wire_name_parity`, `test_provider_command_wire_parity`, `test_call_phase_wire_state_parity`) — эталонная защита от расхождения документации и кода.
+3. **Fail-closed защита PII и изоляция привилегий в API:** `RedactedString` без наследования от `str`, раздельные одноразовые `MediaCredentials` по ролям (`agent` vs `provider`), разделение `LineManager` и `LineAdminKernel`, а также явная маршрутизация `EventAudience` на уровне конверта.
+4. **Эмпирическая верификация стека (Phase-0 / Live probes):** раннее выявление сломанного `oFono.SendTones` и эхо-петли автомаршрутизации `WirePlumber` сэкономило недели отладки на этапе M4.
+
+---
+
+## 2. Архитектура верхнего уровня и карта узких мест
+
+Ниже представлена актуальная схема контейнеров и потоков данных с локализацией обнаруженных архитектурных разрывов (**[C1]–[C4]**, **[H1]–[H6]**).
+
+```mermaid
+flowchart TB
+    subgraph AgentZone["AI Agents (Devin, Secretary, Campaigns)"]
+        AG["AI Agent<br/>(Control JSON-RPC + Media WS)"]
+        FW["FallbackWorker<br/>(system:fallback_worker)"]
+    end
+
+    subgraph DongleHost["Dongle Host (Local or Remote Pi)"]
+        USB["USB BT Dongle<br/>(libusb, btusb detached)"]
+        HA["hci-agent<br/>⚠️ [C4] Нет uplink jitter-буфера перед USB isoc OUT<br/>⚠️ [H4] Конфликт single-use token и reconnect"]
+        USB <--> HA
+    end
+
+    subgraph Container["Docker Container: phonebridge-gateway"]
+        subgraph PrivZone["Privileged Boundary (/dev/vhci, Tunnel)"]
+            WG["WireGuard / mTLS Tunnel"]
+            VF["vhci-feeder (xN)<br/>Jitter Buffer (RX only) + SCO Gate<br/>⚠️ [M3] Лишний CAP_NET_ADMIN"]
+            VHCI["Kernel /dev/vhci (hci0..hciN)"]
+        end
+
+        subgraph SharedStack["Shared Telephony & Audio Daemons"]
+            BZD["bluetoothd (System D-Bus)<br/>Managed Agent1"]
+            PW["PipeWire + WirePlumber (Session D-Bus)<br/>⚠️ [H5] Нет маппинга phone_mac -> agN и фильтра Call Waiting"]
+        end
+
+        subgraph WorkerBundles["Per-Line Worker Bundles (xN)"]
+            LP["LineProvider<br/>In-band DTMF + PCM Pump"]
+        end
+
+        subgraph GatewayDaemon["Gateway Process (unprivileged: phonebridge)"]
+            LM["InMemoryLineManager + LineAdminKernel<br/>⚠️ [C1] RejectFallback без lease_id<br/>⚠️ [C2] ForwardViaLine без номера<br/>⚠️ [H2] Outbox overflow без rollback"]
+            MR["MediaRouter (WS/UDS)<br/>⚠️ [C3] Нет teardown от LineManager<br/>⚠️ [C4] Буфер 10с без 20мс пейсинга"]
+            EB["EventBus<br/>(WS / Webhook / Exec)"]
+            DB[("SQLite Store<br/>Keys + LineAssignments")]
+        end
+    end
+
+    HA <==>|"ctrl-TCP + media-UDP"| WG
+    WG <--> VF
+    VF <--> VHCI
+    VHCI <--> BZD
+    BZD <--> PW
+    PW <--> LP
+    LP <==>|"provider.* / line.*"| LM
+    LP <==>|"20ms PCM + 0x02"| MR
+    LM -.->|"Outbox Drain"| EB
+    LM <-->|"⚠️ Нет порта гидратации/sync"| DB
+    AG <==>|"agent.* / call.*"| LM
+    AG <==>|"20ms PCM + 0x02"| MR
+    EB ==>|"event.*"| AG
+    EB ==>|"event.fallback_triggered"| FW
+    FW <==>|"call.accept / call.acquire"| LM
+```
+
+---
+
+## 3. Критические узкие места и белые пятна (по приоритету)
+
+### Уровень CRITICAL (блокируют реализацию M1/M3/M4/M5 или требуют правки замороженного контракта)
+
+#### [C1] `RejectFallback` невозможно выполнить: у `ProviderHangupCommand` (`line.hangup`) нет `call_token`
+* **Где:** `src/phonebridge/domain/contract.py:649-659`, `docs/api-contract.md:214`, `docs/phone-bridge-service-design.md:§5.3`.
+* **Суть проблемы:** Входящий звонок переводит линию в `RINGING_LOCKED` и выпускает одноразовый `call_token`. Никакого `lease_id` до вызова `call.accept` (`line.answer`) **не существует** ни в ядре, ни у `LineProvider`. Когда истекает `accept_window_sec` на линии с core-политикой `RejectFallback`, `LineManager` обязан отклонить вызов (`VoiceCall.Hangup` на звонящем объекте oFono). Однако единственная команда сброса в outbox — `ProviderHangupCommand` (`line.hangup {assignment_id, lease_id}`), где `lease_id: LeaseId` **обязателен**, а поле `call_token` отсутствует.
+* **Последствие:** Исполнитель M1 не сможет реализовать `RejectFallback` без генерации фиктивного `lease_id`, который `LineProvider` на этапе M4 не сможет сматчить с входящим звонком.
+* **Решение:** Расширить `ProviderHangupCommand` и wire-метод `line.hangup` до XOR-контракта `{assignment_id, lease_id?, call_token?}` с `@model_validator` (ровно один из идентификаторов обязателен), либо ввести отдельную команду `ProviderRejectCommand` (`line.reject {assignment_id, call_token}`). Первый вариант минималистичнее, так как в oFono и отбой активного, и сброс входящего звонка вызываются одним методом `VoiceCall.Hangup`.
+
+#### [C2] `ForwardViaLineFallback` невыполним: модель политики не содержит целевого номера переадресации
+* **Где:** `src/phonebridge/domain/contract.py:471-475`, `docs/api-contract.md:315`.
+* **Суть проблемы:** В раунде 22 для `AnswerAndAnnounceFallback` справедливо добавили `announcement_ref`, так как `FallbackWorker` работает через обычный агентский API (ADR-01) и не имеет `admin`-скоупа для чтения БД конфигурации. Но у соседней модели `ForwardViaLineFallback` есть только `line_id: LineId` (линия, *через которую* нужно звонить наружу), и **нет ни `target_number: RedactedString`, ни `target_country: str`** (куда именно переадресовывать звонок)! В `FallbackTriggeredEvent` воркер получит только `caller_id` звонящего снаружи абонента и `line_id` второй линии.
+* **Последствие:** Политика `forward_via_line` на этапе M5 не может совершить `call.dial`. Кроме того, в `configure_line` не запрещена петля переадресации линии самой на себя (`forward.line_id == line_id`).
+* **Решение:** Добавить в `ForwardViaLineFallback` поля `target_number: RedactedString` и `target_country: str` (с предвалидацией E.164 + ISO alpha-2 при `configure_line`) и запретить `forward.line_id == line_id`. Формат строки конфига: `forward_via_line:<line_id>:<e164_number>:<country>`.
+
+#### [C3] Разрыв жизненного цикла между `LineManager` и `MediaRouter` (тайминг аллокации и отсутствие teardown)
+* **Где:** `src/phonebridge/domain/contract.py:955-963`, `docs/api-contract.md:389-393`.
+* **Суть проблемы:**
+  1. **Ошибка момента вызова в docstring `MediaAllocator`:** указано *"The kernel calls `allocate` at grant/accept time"*. Но на этапе гранта (`AcquireGranted` / `QueueReadyEvent`) токены медиа **никуда не передаются** — агент и провайдер получают их только в `call.dial` (`DialResult` + `ProviderDialCommand`) и `call.accept`! Поскольку Pair TTL в `MediaRouter` составляет `~5 с`, а `grant_ttl_sec` тоже `~5 с`, аллокация в момент `grant` приведёт к протуханию `media_token` к моменту вызова `call.dial`, а при преемпции или истечении `grant_ttl_sec` оставит висячие токены в `MediaRouter`.
+  2. **Отсутствие сигнала закрытия медиа-сессии:** правило контракта гласит *"No socket may outlive its `lease_id`"*. Но когда звонок завершается (`hangup`, `drop_session`, `dongle_lost`, `provider_lost`, `revoke_assignment`), `LineManager` кладёт события только в агентский outbox (с `SessionAudience`) и провайдерский outbox (`ProviderCommand`). У `MediaRouter` нет ни метода `release(lease_id)` в `MediaAllocator` (переименовать в `MediaPort`), ни собственного канала уведомлений о закрытии `lease_id`.
+* **Решение:** Исправить контракт `MediaAllocator`: вызов `allocate()` происходит строго в **`dial()` и `accept()`**; добавить синхронный идемпотентный метод `revoke(lease_id: LeaseId) -> None` (или список закрытых `lease_id` в outbox), вызываемый ядром на каждом переходе `CallLease` в `ENDED`.
+
+#### [C4] Физика real-time аудио: несогласованность буфера 10 с, двунаправленного `0x02` flush и отсутствие uplink jitter-буфера в `hci-agent`
+* **Где:** `docs/api-contract.md:379-398`, `docs/phone-bridge-service-design.md:§6.3, §6.4`, `docs/hci-agent.md:§2`.
+* **Суть проблемы:** Здесь сплелись три критических дефекта медиатракта:
+  1. **TTS-пачка против буфера `MediaRouter` без 20 мс пейсинга:** AI-агенты генерируют речь пачками (например, 8 секунд аудио = 400 фреймов за 150 мс) и сбрасывают их в WebSocket. Если `MediaRouter` пересылает фреймы в `LineProvider` со скоростью сокета (без 20 мс таймера), его 500-фреймовый кольцевой буфер **всегда пуст** — все 8 секунд оседают в буфере PipeWire внутри `LineProvider`, делая `0x02` flush в `MediaRouter` бесполезным! А если агент пришлёт 12 секунд речи (600 фреймов) в 500-фреймовый буфер с политикой `drop oldest`, `MediaRouter` молча удалит **первые 2 секунды фразы** (начало ответа бота)!
+  2. **Инверсия направления `0x02` flush при DTMF:** в раунде 22 записано, что после синтеза DTMF сам `LineProvider` шлёт `0x02` в сторону `MediaRouter`, чтобы тот сбросил *встречную* (uplink) очередь агента. Не специфицировано: глотает ли `MediaRouter` этот `0x02` от провайдера (иначе он улетит агенту как ложный flush downlink!) и зачем вообще дропать речь агента во время DTMF вместо паузы чтения из буфера.
+  3. **Пропущен uplink jitter-буфер на стороне `hci-agent` (WAN -> USB isoc OUT):** в `design.md §6.3` сказано, что jitter-буфер живёт *только* на входе `vhci-feeder` в контейнере. Но при звонке через Raspberry Pi по WAN пакеты голоса бота (`vhci-feeder -> UDP -> hci-agent`) испытывают такой же сетевой джиттер **по пути к донглу**! Изохронный USB OUT эндпоинт донгла требует жёсткой подачи URB по микрофреймам шины USB (каждые 1 мс / 7.5 мс eSCO). Без симметричного playout jitter-буфера (40–80 мс + вставка тишины при опустошении) внутри `hci-agent` любой скачок RTT на WAN превратит голос AI-агента в треск из-за USB isoc underrun.
+
+```mermaid
+sequenceDiagram
+    participant Ag as AI Agent (TTS Burst)
+    participant MR as MediaRouter (Gateway)
+    participant LP as LineProvider (PipeWire)
+    participant VF as vhci-feeder
+    participant HA as hci-agent (Remote Pi)
+    participant USB as BT Dongle (USB Isoc)
+
+    Note over Ag,MR: Узкое место 1: Агент шлёт 300 фреймов (6с речи) за 100мс
+    Ag->>MR: Burst: 300x Binary PCM (0x01)
+    Note over MR,LP: Решение: Пейсинг 20мс (1 фрейм / тик) на выходе MR -> LP<br/>(буфер живёт в MR, где работает 0x02 barge-in flush!)
+    loop Каждые 20 мс (monotonic timer)
+        MR->>LP: 1x PCM frame (640B)
+    end
+    LP->>VF: PipeWire -> BlueZ SCO -> /dev/vhci
+    VF->>HA: UDP 0x03 SCO (подвержен WAN Jitter!)
+    Note over HA,USB: Узкое место 2: Без playout-буфера (40-80мс) в hci-agent<br/>джиттер WAN ломает жёсткий тайминг USB Isoc OUT!
+    HA->>USB: Пейсинг URB в altsetting 2/6 (+ silence fill при голодании)
+```
+
+---
+
+### Уровень HIGH (приведут к авариям в рантайме, утечкам PII или гонкам состояний)
+
+#### [H1] Ловушка `to_log_dict()` / `safe_dump()`: падение `json.dumps` на `datetime`/`timedelta` и провокация утечки PII
+* **Где:** `src/phonebridge/domain/contract.py:354-385, 419-428`.
+* **Суть проблемы:** `ContractModel.to_log_dict()` вызывает `_mask_for_log(self.model_dump())` в режиме `"python"`. `_mask_for_log` маскирует `RedactedString`, но оставляет `AwareDatetime` и `timedelta` Python-объектами. Любой стандартный JSON-логгер (`json.dumps(event.to_log_dict())`) упадёт с `TypeError: Object of type datetime is not JSON serializable`. Если же разработчик вызовет `model_dump(mode="json")`, сработает сериализатор `when_used="json"`, вызывающий `.to_wire()`, и **сырой номер телефона / токен утечёт в лог**!
+* **Решение:** В `_mask_for_log` конвертировать `datetime` -> `.isoformat()`, `timedelta` -> `.total_seconds()`, `Enum` -> `.value` (либо добавить `safe_dump_json() -> str`), и закрепить в тесте инвариант: `json.dumps(model.to_log_dict())` всегда проходит без ошибок и не содержит сырых секретов.
+
+#### [H2] Отсутствие транзакционного отката при переполнении bounded outbox (`RESOURCE_EXHAUSTED` на путях teardown)
+* **Где:** `src/phonebridge/domain/contract.py:1265-1289` (`CODING_HAZARDS` Rules 4 & 7).
+* **Суть проблемы:** Контракт требует ограниченного (bounded) outbox'а, выбрасывающего `RESOURCE_EXHAUSTED` при переполнении. Но в Python-памяти нет автоматического отката состояния:
+  1. Если мутация в `InMemoryLineManager` изменила словари (`_leases`, `_lines`), а затем на 3-м событии outbox переполнился и выбросил `RESOURCE_EXHAUSTED`, состояние ядра останется наполовину изменённым (сломанные инварианты).
+  2. События жизненного цикла **освобождения ресурсов** (`drop_session`, `ingest_call_state(DISCONNECTED)`, `hangup`, `tick` teardowns) **физически нельзя отклонять с `RESOURCE_EXHAUSTED`** — отказ обработать дисконнект навсегда заблокирует линию в состоянии `BUSY`!
+* **Решение:** Разделить лимиты: проверять свободную ёмкость outbox **до начала мутации** (pre-flight check) только на операциях *создания нагрузки* (`acquire`, `dial`, `claim_exclusive`), а для teardown-путей (`drop_session`, `hangup`, `disconnected`, `tick`) разрешать запись в резервный хвост буфера (soft/hard watermark) либо требовать синхронного вызова `drain_*()` адаптером после *каждой* мутации в рамках одного тика event loop.
+
+#### [H3] Разрыв состояния при ошибке или `{accepted: false}` от провайдера на `line.dial` / `line.answer`
+* **Где:** `docs/api-contract.md:212-213`, `src/phonebridge/domain/contract.py:1063-1097`.
+* **Суть проблемы:** По правилу 4 `LineManager.dial()` и `accept()` не делают сетевых `await`: они синхронно переводят `CallLease` в `DIALING`/`ACTIVE`, кладут `ProviderDialCommand`/`ProviderAnswerCommand` в outbox и сразу возвращают `DialResult`/`AcceptResult`. Только *после* этого адаптер отправляет `line.dial` по WSS провайдеру. Не определено:
+  1. Отвечает ли шлюз агенту на `call.dial` **до** или **после** получения `{accepted: true}` от `LineProvider`?
+  2. Если `LineProvider` вернул `{accepted: false}` (например, модем oFono отверг вызов синхронно) или соединение оборвалось при отправке `line.dial`, в `LineManager` нет метода отката/провала команды — лиз зависнет в `DIALING` навечно!
+* **Решение:** Зафиксировать асинхронную компенсацию (паттерн Saga): шлюз ждёт `{accepted}` от `LineProvider` с жёстким дедлайном (например, 2 с); при `{accepted: false}` или ошибке транспорта адаптер обязан вызвать `ingest_call_state(state=DISCONNECTED, reason=NETWORK_ERROR)` (или специальный `fail_provider_command`), чтобы атомарно закрыть лиз и освободить линию.
+
+#### [H4] Конфликт одноразового `agent.token` в `0x10 HELLO` и реконнекта `hci-agent`
+* **Где:** `docs/hci-agent.md:§2 (строки 55-56), §4 (строки 193, 239), §6 (строка 265)`.
+* **Суть проблемы:** Спецификация утверждает, что `token` из `/etc/phonebridge-agent/agent.token` — это **одноразовый (single-use)** bootstrap-токен, сгорающий после первого `HELLO_ACK`. Одновременно `hci-agent` обязан автоматически переподключаться с backoff при любом разрыве TCP-сессии (`CTRL_DESYNC`, рестарт контейнера, флап сети), снова отправляя `0x10 HELLO` с содержимым того же файла `agent.token`. Если токен сгорел при первом подключении, **первый же сетевой сбой навсегда отрезает удалённую линию**!
+* **Решение:** Развести понятия: либо `agent.token` — это **долгоживущий per-line pre-shared токен** (по аналогии с `LineProviderConfig.token`), проверяемый в паре с идентичностью туннеля (WireGuard `/32` pubkey или mTLS CN), либо при `wireguard`/`direct_mtls` аутентификация целиком опирается на криптографию туннеля, а `token` в `HELLO` используется только один раз на этапе `PROVISIONING` для обмена на клиентский сертификат/ключ. Первый вариант (долгоживущий токен + привязка к WG `/32`) радикально проще и надёжнее (KISS).
+
+#### [H5] Пробелы в мульти-линейной маршрутизации D-Bus (`phone_mac -> agN`) и коллизия Call Waiting (`+CCWA`)
+* **Где:** `docs/phone-bridge-service-design.md:§1 (строки 82-95), §6.4 (строка 514)`.
+* **Суть проблемы:**
+  1. Цепочка детерминированного разрешения линии обрывается на `phone_mac -> PipeWire nodes bluez_input.<phone_mac>`, **не объясняя, как `LineProvider` находит свой объект управления вызовами `/org/pipewire/Telephony/agN`** среди `ag1..agN`! Кроме того, если на адаптере в `/var/lib/bluetooth/<adapter_mac>` остались ключи от старого телефона, фильтр `Device1.Adapter == hciX` вернёт >1 устройства.
+  2. **Call Waiting (второй входящий звонок на занятую линию):** если у оператора на SIM-карте включён Call Waiting, во время активного разговора телефон пришлёт по HFP второй звонок (`State=waiting` или `incoming`). Если `LineProvider` пробросит его в `ingest_ring`, линия попытается перейти из `BUSY` в `RINGING_LOCKED`, разрушив текущий `CallLease`.
+* **Решение:**
+  1. Дополнить цепочку в §1: фильтр `Device1` по `Adapter == hciX AND Connected == true` (плюс опциональный пиннинг `paired_phone_mac` в конфиге линии) -> сопоставление с объектом `agN` через свойство устройства/адреса `AudioGateway` в `org.pipewire.Telephony`.
+  2. Явно зафиксировать политику Call Waiting для v1: `LineProvider` при активном звонке на линии немедленно отклоняет (`Hangup`) вторичные `waiting`/`incoming` объекты oFono (или игнорирует их до `no_pickup`) и эмитит телеметрию, никогда не отправляя `ringing` поверх активного `lease_id`.
+
+#### [H6] Тройное противоречие вокруг `idle_revoke_after`, wake-and-grant при спящем агенте и runtime-обновления `heartbeat_interval_sec`
+* **Где:** `src/phonebridge/domain/contract.py:506, 778, 922, 1295`, `docs/api-contract.md:201, 253`.
+* **Суть проблемы:**
+  1. **`idle_revoke_after`:** в `design.md §10/§12` и `LineAssignment` указано, что это **строго alert-only** (эксклюзивная линия никогда не отбирается автоматически). Но в `api-contract.md:253` и docstring `AssignmentRevokedEvent` написано, что `assignment_revoked` эмитится при *"idle escalation"*, при этом никакого `IdleAlertEvent` в `EventName` нет (и нет поля `idle_alerted_at` для защиты от спама на каждом `tick(now)`).
+  2. **Wake-and-grant против немедленного fallback:** docstring `decide_fallback` гласит *"when the accept window expires (or no subscribed/owner agent exists)"*. Если M1 проверит «сейчас 0 живых WS-сессий» и сразу вызовет fallback в `ingest_ring`, сломается ключевая фича **wake-and-grant** — пробуждение спящего агента через Webhook/Exec в течение 30-секундного окна!
+  3. **Смена `heartbeat_interval_sec` в рантайме:** `LineAdminKernel.configure_line` позволяет уменьшить `heartbeat_interval_sec` без рестарта, но в протоколе `line.*` нет команды для сообщения нового интервала уже подключённому `LineProvider` (он узнаёт `heartbeat_interval_ms` только из ответа на `provider.register`). Уменьшение интервала в админке гарантированно «убьёт» живой `LineProvider` по таймауту пингов!
+
+---
+
+### Уровень MEDIUM & LOW (инженерные пробелы, безопасность хуков, упаковка и дрейф доков)
+
+| ID | Область | Описание узкого места / белого пятна | Рекомендуемое решение |
+|---|---|---|---|
+| **M1** | `contract.py` (`hangup`/`release`) | Идемпотентный повтор `call.release` и гонка взаимного отбоя (`call.hangup` приходит через 5 мс после `provider.call_state{disconnected}`) требуют отличить «свой недавно закрытый `lease_id`» (`{ok}`) от «чужого/выдуманного `lease_id`» (`OWNER_MISMATCH`), не храня закрытые лизы бесконечно (Rule 7). | Зафиксировать в спецификации M1 хранение bounded LRU-кольца закрытых лизов (`_closed_leases: OrderedDict[LeaseId, SessionId]`, cap = 1024). Сделать `hangup` на уже закрытом своём лизе таким же идемпотентным no-op, как и `release`. |
+| **M2** | `contract.py` (`acquire` preemption) | При преемпции **немедленного** гранта, взятого с `enqueue=True`, ядро создаёт *новый* `ticket_id` и шлёт `QueueUpdatedEvent{session_id, ticket_id, position: 1}`. Если у одной сессии 2 параллельных звонка, агент не может понять, какой из прерванных `lease_id` превратился в этот `ticket_id` (нет связующего поля!). | Добавить опциональное поле `reissued_ticket_id: TicketId \| None = None` в `CallStateChangedEvent` (или `preempted_lease_id` в `QueueUpdatedEvent`), либо отказаться от авто-постановки немедленных грантов в очередь (клиент сам повторяет `acquire`). |
+| **M3** | `design.md §9` & `hci-agent.md §4` | 1) `vhci-feeder` (парсящий внешний сетевой трафик!) наделён `CAP_NET_ADMIN`, хотя для `/dev/vhci` нужны только права на char-устройство, а `CAP_NET_ADMIN` + `CAP_NET_RAW` реально нужны `bluetoothd` (который в §9 забыт) и `wg-supervisor`.<br/>2) Порты `7300/tcp` и `7301/udp` при профиле `wireguard` не должны биндиться на `0.0.0.0`. | 1) Убрать `CAP_NET_ADMIN` у `vhci-feeder` (выдать доступ через группу `vhci` на `/dev/vhci`); выдать `CAP_NET_ADMIN`/`CAP_NET_RAW` только `bluetoothd` и `wg-supervisor`.<br/>2) Обязать `vhci-feeder` биндиться строго на внутренний IP `wg0` контейнера. |
+| **M4** | `design.md §6.4` (PipeWire) | При деградации радиоканала до narrowband CVSD (8 кГц) вместо mSBC (16 кГц) PipeWire может переключить граф в 8 кГц или `F32LE`, сломав контракт фрейма `640 B = 20 ms @ 16 kHz S16_LE`. | Явно прописать в §6.4 жёсткую фиксацию формата виртуальных узлов `phonebridge_uplink/downlink`: `audio.rate=16000, audio.channels=1, audio.format=S16LE` (ресэмплинг 8↔16 кГц выполнит PipeWire). |
+| **M5** | `design.md §7` (`EventBus`) | 1) `Exec`-хуки опасны шелл-инъекциями и утечкой `caller_id`/`call_token` через `argv` (`ps aux`).<br/>2) Ретраи вебхуков `incoming_call` без учёта `expires_at` разбудят агента уже после истечения 30-секундного окна. | 1) Только `execve` (без shell), передача JSON-пейлоада исключительно через `stdin` + жёсткий таймаут процесса.<br/>2) Ограничить дедлайн ретраев `incoming_call` величиной `expires_at - 1s`. |
+| **M6** | `contract.py` (`FallbackTriggeredEvent`, `Profile`) | 1) У `FallbackTriggeredEvent` нет `expires_at`, а в `TimeoutConfig` нет `fallback_accept_ttl_sec` (что будет, если `FallbackWorker` упал?).<br/>2) Пресеты `profile` (`"secretary"`, `"outbound_campaign"`) — нетипизированные строки, хотя от них в доках зависит преемпция очереди при входящем звонке. | 1) Добавить `expires_at: AwareDatetime` в `FallbackTriggeredEvent` и `fallback_accept_ttl_sec: float \| None` (дефолт ~10 с) в `TimeoutConfig`.<br/>2) Определять допуск входящих и преемпцию строго через `Intent.RECEIVE_INBOUND in binding.caps`, оставив `profile` чисто информационной меткой/пресетом конфигурации в админке. |
+| **L1** | Упаковка, тесты и документация | 1) Отсутствует маркер `src/phonebridge/py.typed` (PEP 561) — сломает `mypy --strict` в клиенте `devin-telegram`.<br/>2) Дрейф в `docs/interaction-flow.html` (`call.hangup -> call.release`, `expires_in_ms`), `docs/architecture-unified.html` (`exclusive_line` в `register_intent`) и `docs/api-contract.md:57` (`line_id:"default"` в `call.get_lines`, где нет параметра `line_id`).<br/>3) Отсутствует каталог `docs/specs/` для якорей `.changes` (`harness.md §3`).<br/>4) Дубликат `development-cycle.md` / `harness.md` без CI-проверки идентичности; запуск тяжёлого подпроцесса `mypy` внутри `pytest` (`test_tooling_baseline.py`). | 1) Добавить пустой `src/phonebridge/py.typed`.<br/>2) Синхронизировать оба HTML-файла и строку 57 `api-contract.md`.<br/>3) Инициализировать `docs/specs/` до первого поведенческого PR (M1).<br/>4) Добавить проверку идентичности файлов харнесса в CI; при росте кодовой базы вынести медленные self-check тесты линтеров под отдельный маркер или оставить `mypy` только шагом CI. |
+
+---
+
+## 4. Хранение данных и моделирование состояния (M1 ↔ M2)
+
+Сейчас между чисто in-memory ядром M1 (`InMemoryLineManager`) и SQLite-хранилищем M2 зияет архитектурный пробел: **как долговечные объекты (`LineAssignment`, `TimeoutConfig`) попадают в память при старте и сохраняются при вызовах `LineAdminKernel` без нарушения `CODING_HAZARDS` Rule 4** (запрет I/O внутри критической секции мутации).
+
+**Рекомендуемая модель хранения и консистентности:**
+* **Разделение по времени жизни:**
+  * **SQLite (`WAL` mode, `synchronous=NORMAL`):** хранит *только* долговечную конфигурацию и ключи: таблицы `api_keys` (SHA-256/HMAC хэши токенов + `scope` + `subject_id`), `lines` (`line_id`, `adapter_mac`, `paired_phone_mac`, `transport_profile`, `claimable`, `accept_window_sec`, `fallback_policy_json`, `allowed_number_types_json`, `timeouts_json`), `line_assignments` (`assignment_id`, `line_id`, `owner_agent_id`, `mode`, `idle_revoke_after_sec`) и `escalation_hooks`.
+  * **Только в памяти (`InMemoryLineManager`):** `ProviderBinding`, `CallLease`, `QueueTicket`, `PendingClaim`, кольцо `_closed_leases`. При рестарте контейнера активные звонки восстанавливаются не из БД, а через протокол двусторонней сверки `GetCalls()` / `state_snapshot` (design §9) — это исключает рассинхрон БД с реальным состоянием модема!
+* **Паттерн синхронизации без I/O в ядре:**
+  1. При старте демона Gateway читает `lines` + `line_assignments` из SQLite и передаёт их как `initial_lines: Sequence[LineAssignment]` в конструктор `InMemoryLineManager`.
+  2. На админских мутациях (`assign_line`, `approve_claim`, `revoke_assignment`, `configure_line`) админ-адаптер сериализует эти редкие операции через `asyncio.Lock`: сначала обновляет `InMemoryLineManager`, получает иммутабельный `LineAssignment` snapshot и сразу коммитит его в SQLite (`upsert` по `line_id`). Так как `InMemoryLineManager` остаётся чистым от I/O, Rule 4 соблюдается на 100%.
+
+---
+
+## 5. Коммуникации, API и модели консистентности
+
+| Канал | Протокол / Транспорт | Модель консистентности и доставки | Ключевой инвариант |
+|---|---|---|---|
+| **Agent ↔ Gateway (Control)** | JSON-RPC 2.0 поверх UDS / WSS (+ MCP adapter) | Строгая консистентность команд (single event-loop writer); at-least-once / socket-ordered события из outbox | Идемпотентность `acquire` по `(session_id, idempotency_key)` (непустой ключ `1..128` символов) и идемпотентность `hangup`/`release` через tombstone LRU |
+| **Gateway ↔ LineProvider** | JSON-RPC 2.0 поверх loopback WSS | Асинхронный outbox команд + Saga-компенсация при `{accepted: false}` | Каждая мутация ядра синхронно дренируется рантаймом (`drain_events` + `drain_provider_commands`) до возврата управления в event loop |
+| **Agent ↔ MediaRouter ↔ LineProvider** | Binary Frames поверх WS-over-UDS / WSS | Изохронный real-time поток (bounded ring, 20 мс тик пейсинга) | **Пейсинг 20 мс на выходе `MediaRouter -> LineProvider`**, чтобы весь буфер предзагрузки TTS жил в `MediaRouter` и мгновенно очищался флагом `0x02` |
+| **hci-agent ↔ vhci-feeder** | Control: TCP (`ctrl_seq`)<br/>Media: UDP (`session_nonce` + `media_seq`) | Control: **Strictly Lossless** (любой разрыв `ctrl_seq` = полный сброс адаптера)<br/>Media: **Best-effort isochronous** (дроп устаревших пакетов) | Двусторонний playout jitter-буфер: на входе `vhci-feeder` (downlink) **и** на входе USB isoc OUT в `hci-agent` (uplink) |
+
+---
+
+## 6. Масштабируемость, надёжность и безопасность
+
+1. **Единые точки отказа (SPOF) внутри контейнера и радиус поражения:**
+   * Общие демоны `dbus-daemon`, `bluetoothd` и `PipeWire` разделяются всеми `N` линиями. Падение `PipeWire` кратковременно затронет аудио всех активных звонков, но звонки в телефоне (HFP AG) при этом не рвутся (аудио временно возвращается на телефон и переподключается при рестарте PipeWire + сверке по `adapter_mac` из §9).
+   * Нагрузочный потолок одного контейнера определяется Python GIL в `MediaRouter` (при 20 одновременных звонках = `20 * 50 * 2 = 2000` WS-фреймов/сек — для `asyncio` + `websockets` с C-ускорением это `< 5%` одного ядра CPU, узким местом не станет).
+2. **Матрица привилегий контейнера (исправленная):**
+   * `wg-supervisor`: `CAP_NET_ADMIN` (настройка `wg0` и `/32` peer isolation).
+   * `bluetoothd`: `CAP_NET_ADMIN`, `CAP_NET_RAW` (работа с kernel Bluetooth Management API).
+   * `vhci-feeder`: **0 Linux capabilities**, непривилегированный пользователь с доступом по группе к `/dev/vhci`, сокеты привязаны строго к IP интерфейса `wg0`.
+   * `gateway`, `LineProvider`, `pipewire`, `wireplumber`: непривилегированный UID `phonebridge`, общий `XDG_RUNTIME_DIR`.
+3. **Наблюдаемость (Observability):**
+   * Ввести структурные метрики/счётчики для детекции деградации до жалоб пользователей: `media.buffer_underrun`, `media.dropped_overflow`, `sco.rx_starvation`, `sco.framing_error`, `sco.peer_mismatch`, `outbox.high_watermark`, а также гистограмму задержки цикла `MediaRouter` (цель `< 20ms ± 2ms`).
+
+---
+
+## 7. Ключевые архитектурные решения (Trade-offs & ADRs)
+
+### ADR-A: Пейсинг uplink-аудио (20 мс) внутри `MediaRouter` и policy переполнения
+* **Контекст:** AI-агенты синтезируют речь быстрее реального времени (пачками по 5–15 секунд). Если `MediaRouter` пересылает фреймы без таймера, буфер переезжает в PipeWire и ломает `0x02` barge-in flush; а буфер на 10 с с политикой `drop oldest` отрезает начало длинных реплик бота.
+* **Решение:**
+  1. `MediaRouter` вычитывает uplink-буфер агента строго по монотонному таймеру **1 фрейм / 20 мс** в сторону `LineProvider`. Downlink (`LineProvider -> Agent`) пересылается сразу по приходу (он уже тактируется часами PipeWire/SCO).
+  2. Увеличить ёмкость uplink-кольца до **1500 фреймов (30 с = ~960 КБ на активный звонок)** для приёма длинных TTS-ответов и изменить политику переполнения uplink на **`drop newest` + счётчик `media.uplink_overflow`** (сохранение начала фразы критичнее хвоста; для downlink оставить 100 фреймов / 2 с с `drop oldest`).
+  3. Во время синтеза in-band DTMF `LineProvider` сам замещает 20 мс фреймы тонами локально, не требуя встречного `0x02` в `MediaRouter`.
+* **Последствия:** (+) Мгновенный barge-in при `0x02` от агента (очистка очереди в `MediaRouter`); (+) отсутствие обрезанных начал фраз TTS; (−) +1 `asyncio` таймер-задача на каждый активный звонок (~960 КБ RAM на лиз).
+
+### ADR-B: Симметричный playout jitter-буфер на стороне `hci-agent`
+* **Контекст:** Поток голоса от контейнера к удалённому BT-донглу идёт по UDP через WAN и попадает на жёстко тактируемый аппаратный USB isochronous OUT эндпоинт.
+* **Решение:** Встроить в `hci-agent` компактный адаптивный playout-буфер (3–6 пакетов eSCO, ~30–45 мс) перед отправкой URB в USB Interface 1. Пока буфер заполняется при открытии `SCO_STATE(open=true)` или при кратковременном провале сети, `hci-agent` подставляет валидные фреймы тишины (mSBC silence frame / CVSD `0x55`), не прерывая цепочку USB URB.
+* **Последствия:** (+) Стабильный голос бота даже на географически удалённых Raspberry Pi с джиттером 20–40 мс; (−) добавляется ~30 мс задержки на WAN-плече (укладывается в бюджет `< 100 мс`), `hci-agent` должен знать константу silence-пакета для `cvsd` и `msbc`.
+
+### ADR-C: Жизненный цикл медиа-токенов и двухуровневая защита Outbox
+* **Контекст:** Вызов `MediaAllocator` при гранте приводит к протуханию токенов до `dial`, а отсутствие вызова `revoke(lease_id)` оставляет открытые медиа-сокеты; жёсткий `RESOURCE_EXHAUSTED` на переполнении outbox ломает инварианты teardown-операций.
+* **Решение:** Переименовать/расширить `MediaAllocator` до `MediaPort` (`allocate` вызывается строго в `dial`/`accept`, `revoke(lease_id)` — при завершении лиза). В `InMemoryLineManager` ввести двухуровневый лимит outbox: `SOFT_CAP` (отклоняет новые `acquire`/`dial`/`claim` до начала мутации) и неограниченный приём событий завершения (`hangup`, `disconnected`, `drop_session`, `tick`) с обязательным синхронным `drain_*()` на границе каждого вызова адаптера.
+* **Последствия:** (+) Нулевой риск зависших в `BUSY` линий и висячих WS-сокетов; (+) соблюдение Rule 4 и Rule 7 без сложного MVCC-отката памяти.
+
+---
+
+## 8. Пошаговый план исправлений (Remediation Roadmap)
+
+Чтобы не застрять в бесконечных раундах правок документации, рекомендуется выполнить **один консолидированный PR заморозки контракта (Round 23 / Pre-M1 Freeze)**, после чего сразу переходить к коду M1–M5.
+
+### Фаза 0: Финальная заморозка контракта и документации (1 PR — до старта M1)
+1. **Правки в `src/phonebridge/domain/contract.py` (+ drift-тесты в `tests/test_domain_contract.py`):**
+   * **[C1]** Добавить `call_token: CallToken | None = None` и сделать `lease_id: LeaseId | None = None` (с XOR `@model_validator`) в `ProviderHangupCommand` (и обновить таблицу `line.hangup` в `docs/api-contract.md`).
+   * **[C2]** Добавить `target_number: RedactedString` и `target_country: str` в `ForwardViaLineFallback`.
+   * **[C3]** Исправить docstring `MediaAllocator` (аллокация на `dial`/`accept`, не на `grant`) и добавить метод `revoke(self, lease_id: LeaseId) -> None`.
+   * **[H1]** Научить `_mask_for_log()` сериализовать `datetime` (ISO UTC), `timedelta` (секунды) и `Enum` (`.value`), добавив тест `json.dumps(model.to_log_dict())`.
+   * **[H6 / M6]** Добавить `expires_at: AwareDatetime` в `FallbackTriggeredEvent` и `fallback_accept_ttl_sec` в `TimeoutConfig`; убрать упоминание *"idle escalation"* из `AssignmentRevokedEvent` (добавить отдельный `EventName.IDLE_ALERT` / `IdleAlertEvent` с `AdminAudience` либо зафиксировать обработку вне агентского `EventBus`); уточнить в `decide_fallback`, что при 0 живых сессий система всё равно ждёт `accept_window_sec` для wake-and-grant хуков.
+   * **[M2]** Добавить валидацию `idempotency_key` (`min_length=1, max_length=128` при передаче) и опциональный `reissued_ticket_id: TicketId | None = None` в `CallStateChangedEvent` (или отменить авто-очередь для немедленных грантов).
+2. **Гигиена пакета и документации (в том же или соседнем docs-PR):**
+   * Добавить `src/phonebridge/py.typed`; создать каркас `docs/specs/` под требования `harness.md §3`.
+   * Синхронизировать `docs/interaction-flow.html`, `docs/architecture-unified.html`, строку 57 `docs/api-contract.md` (`call.get_lines`), матрицу `CAP_NET_ADMIN` в `design.md §9` и статус `agent.token` + uplink jitter-буфера в `docs/hci-agent.md`.
+
+### Фаза 1: Реализация M1 (`InMemoryLineManager`) с защитой от гонок
+* Реализовать pre-flight проверку `SOFT_CAP` outbox'а только на входных операциях захвата ресурсов (**[H2]**).
+* Внедрить bounded tombstone LRU `_closed_leases` (1024 записи) для идемпотентности запаздывающих `call.hangup` и `call.release` (**[M1]**).
+* Запретить self-loop (`forward.line_id == line_id`) и валидировать `target_number`/`target_country` через `phonenumbers` прямо в `configure_line` (**[C2]**).
+* Определять допуск входящих и преемпцию гранта исключительно по `Intent.RECEIVE_INBOUND in provider_binding.caps` (**[M6]**).
+
+### Фаза 2: Реализация M2 (SQLite + JSON-RPC Gateway + EventBus)
+* Реализовать загрузку начальных `LineAssignment`/`TimeoutConfig` из SQLite при старте и write-through сохранение в админ-адаптере под `asyncio.Lock`.
+* Реализовать Saga-компенсацию при `{accepted: false}` / таймауте `line.dial` и `line.answer` (**[H3]**).
+* При изменении `heartbeat_interval_sec` в `admin.configure_line` применять новый интервал со следующей перерегистрации провайдера (либо отправлять уведомление), не убивая текущую сессию ложным таймаутом (**[H6]**).
+* В `EventBus` реализовать `Exec`-хуки строго через `asyncio.create_subprocess_exec` с передачей JSON в `stdin` и ограничить ретраи вебхуков `incoming_call` дедлайном `expires_at - 1s` (**[M5]**).
+
+### Фаза 3: Реализация M3 (`MediaRouter`)
+* Реализовать 20 мс монотонный пейсер отправки `MediaRouter -> LineProvider` с буфером 30 с (`drop newest`) на uplink и 2 с (`drop oldest`) на downlink (**ADR-A**).
+* Подключить вызов `media_port.revoke(lease_id)` для мгновенного закрытия обоих WebSocket'ов при любом завершении звонка (**[C3]**).
+
+### Фаза 4: Реализация M4–M5 (`LineProvider`, `vhci-feeder`, `hci-agent`, Docker)
+* В `hci-agent` реализовать uplink playout jitter-буфер (30–45 мс + заполнение тишиной для mSBC/CVSD) перед USB isoc OUT (**ADR-B**) и долгоживущий `agent.token` в паре с WireGuard `/32` проверкой пира (**[H4]**).
+* В `LineProvider` жёстко зафиксировать аудиоформат виртуальных узлов PipeWire (`16000 Hz, S16_LE, mono`) для прозрачного fallback'а на CVSD (**[M4]**), дописать детерминированный маппинг `phone_mac -> /org/pipewire/Telephony/agN` и авто-отклонение вторичных звонков Call Waiting (**[H5]**).
+* В `Dockerfile` / `supervisord` развести Linux capabilities (`CAP_NET_ADMIN` только у `wg-supervisor` и `bluetoothd`, `vhci-feeder` без capabilities с биндингом на IP `wg0`) (**[M3]**).

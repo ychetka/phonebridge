@@ -1,0 +1,40 @@
+### Verdict
+
+**`src/phonebridge/domain/contract.py`, `docs/api-contract.md`, `docs/hci-agent.md`, and `tests/test_domain_contract.py` are CLEAN and ready to stay FROZEN for M1–M5 implementation.**
+
+All Round 23 fixes (C1–C4, H1–H6, M2–M7) are verified intact in code and tests. There are **zero defects in `contract.py`**, and only **1 MEDIUM prose contradiction** in `docs/phone-bridge-service-design.md` §6.6 that should be corrected in docs before M3 (`MediaRouter`) is implemented.
+
+---
+
+### Verification of Round 23 Fixes
+
+| Area | Verification Status |
+|---|---|
+| **C1: `RejectFallback` / `line.hangup` XOR target** | **VERIFIED.** `ProviderHangupCommand` enforces `lease_id` XOR `call_token` via `_exactly_one_target`, matching `line.hangup {assignment_id, lease_id?, call_token?}` in `api-contract.md` and `test_provider_command_wire_parity`. |
+| **C2: `ForwardViaLineFallback` dial target** | **VERIFIED.** Carries `target_number: RedactedString` and `target_country: str` with PII masking verified in `safe_dump()` and config-time validation + self-loop rejection specified on `LineAdminKernel.configure_line`. |
+| **C3: `MediaAllocator` port lifecycle** | **VERIFIED.** `allocate(lease_id, line_id)` is restricted to `dial()`/`accept()` (avoiding the ~5 s pair-TTL vs `grant_ttl_sec` race) and paired with synchronous idempotent `revoke(lease_id)` on every `CallLease -> ENDED` transition. |
+| **H1: `to_log_dict()` JSON & PII invariant** | **VERIFIED.** `_mask_for_log` normalizes `datetime` ($\rightarrow$ ISO-8601 UTC), `timedelta` ($\rightarrow$ `total_seconds()`), `Enum` ($\rightarrow$ `.value`), and `set`/`frozenset` ($\rightarrow$ sorted `list`) while keeping `RedactedString` masked. |
+| **H2: Outbox `SOFT_CAP` pre-flight vs teardown** | **VERIFIED.** Resource-creating operations check capacity pre-flight before mutating state; teardown paths (`hangup`, `release`, `drop_session`, `disconnected`, `tick`) use reserve tail capacity and never raise `RESOURCE_EXHAUSTED`. |
+| **H3: Saga compensation on `line.dial` / `line.answer`** | **VERIFIED.** ~2 s `{accepted}` deadline + compensating `ingest_call_state(DISCONNECTED, NETWORK_ERROR)` prevents leases from wedging in `DIALING`/`RINGING`. |
+| **H4: Long-lived `agent.token` + WG `/32` binding** | **VERIFIED.** `docs/hci-agent.md` (§2, §4, §6) consistently specifies `agent.token` as a long-lived per-line pre-shared secret validated in conjunction with the tunnel peer identity. |
+| **H5: Deterministic `phone_mac -> agN` + Call Waiting** | **VERIFIED.** Design §1 filters `Device1` by `Adapter == hciX AND Connected == true` (plus optional `paired_phone_mac`), resolves `agN` by `phone_mac`, and auto-rejects secondary `+CCWA` call-waiting objects with `call_waiting_rejected` telemetry. |
+| **H6 / M2 / M6: `IdleAlertEvent`, `AdminAudience`, `fallback_accept_ttl_sec`, `reissued_ticket_id`, `idempotency_key` bounds** | **VERIFIED.** Covered by `EVENT_WIRE_NAMES`, `EVENT_PAYLOAD_MODELS`, and `test_round23_event_schema_freeze`. |
+
+---
+
+### Remaining Finding (Doc-Only — Does Not Touch `contract.py`)
+
+#### MEDIUM-1: Contradiction on agent-originated `0x02` barge-in flush between `docs/api-contract.md` and `docs/phone-bridge-service-design.md` §6.6
+* **Where:** `docs/phone-bridge-service-design.md` §6.6 (lines 642–646) vs. `docs/phone-bridge-service-design.md` §5.5 (line 532) and `docs/api-contract.md` ("Binary media protocol" items 2 & 3, lines 275, 285–289).
+* **Defect:**
+  * `docs/api-contract.md` (lines 285–289) and design §5.5 state that the MediaRouter paces agent $\rightarrow$ provider uplink at 1 frame / 20 ms specifically *"so the whole TTS preload buffer [1500 frames = 30 s] lives inside the router where a `0x02` barge-in flush can actually clear it"*, and that agent `clear_uplink_buffer` / `flush_audio_out` map to in-band flag `0x02` on the media socket.
+  * However, `docs/phone-bridge-service-design.md` §6.6 (line 646) states: *"the agent cannot (and must not be able to) inject `0x02` into the uplink media socket."*
+* **Impact on M3 (`MediaRouter`):** If the M3 implementer follows §6.6 literally and forbids `0x02` frames from the `"agent"` role media socket, an agent that preloads 30 s of TTS audio into the MediaRouter's 1500-frame ring has **no way to execute a barge-in flush** (`clear_uplink_buffer`) when the human interrupts, because there is no JSON-RPC control method for flushing.
+* **Fix (1-sentence doc edit in `docs/phone-bridge-service-design.md` §6.6):** Clarify that **both** roles may send `0x02` to the `MediaRouter` to drain its 1500-frame uplink ring buffer—the **agent** on barge-in (`clear_uplink_buffer`) and the **LineProvider** after an in-band DTMF segment—and that in both cases `MediaRouter` **consumes** `0x02` by clearing the uplink ring buffer and never forwards `0x02` downlink to the agent.
+
+---
+
+### Next Steps
+
+1. Fix the single sentence in `docs/phone-bridge-service-design.md` §6.6 so M3 handles `0x02` uplink flushes from both `agent` (barge-in) and `provider` (post-DTMF).
+2. Keep `src/phonebridge/domain/contract.py` **FROZEN** as-is and proceed directly to **M1 (`InMemoryLineManager`)**.

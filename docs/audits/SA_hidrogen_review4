@@ -1,0 +1,54 @@
+Ниже представлена проверка текущего среза репозитория (с добавлением `pyproject.toml` и повторной сверкой `src/phonebridge/domain/contract.py` с документацией раундов 11–14) по стандартам `CODING_HAZARDS.md` и `REVIEW_HAZARDS.md`.
+
+*(Примечание: статический анализ проведён по тексту предоставленных файлов — запуск `pytest`/`mypy`/`ruff` локально не выполнялся.)*
+
+---
+
+### 1. Оценка `pyproject.toml` и совместимости с `contract.py`
+
+Настройка тулинга сделана строго и грамотно:
+* **Строгая типизация и лимиты:** `mypy` с `strict = true` + `plugins = ["pydantic.mypy"]`, а также глобальный `timeout = 60` в `[tool.pytest.ini_options]` напрямую поддерживают `CODING_HAZARDS.md` (Rule 2 — никаких зависших тестов/ожиданий).
+* **Совместимость с Python 3.10 (`requires-python = ">=3.10"`):** Код в `src/phonebridge/domain/contract.py` аккуратно выдержан под 3.10: используется `timezone.utc` (а не `datetime.UTC` из 3.11) и `class ...(str, Enum)` (вместо `StrEnum` из 3.11).
+* **Точки внимания в `pyproject.toml`:**
+  1. **Будущая зависимость `phonenumbers`:** В `docs/api-contract.md` (Dial validation, Round 12) зафиксирована валидация через `libphonenumber` / `phonenumbers`. Сейчас её нет в `dependencies` (что нормально на этапе `0.0.5`), но при реализации issue `#25` под `mypy strict = true` нужно не забыть добавить сам пакет (с проверкой имени/версии по Rule 11) и его тайп-стабы (`types-phonenumbers` или override в `[tool.mypy.overrides]`).
+  2. **Версионирование vs `CHANGELOG.md`:** В `pyproject.toml` указана `version = "0.0.5"`, тогда как `CHANGELOG.md` обрывается на `[0.0.2] - 2026-11-12` (до появления Rounds 11–14, `hci-agent.md` и `contract.py`).
+
+---
+
+### 2. Незакрытые расхождения в `src/phonebridge/domain/contract.py`
+
+Файл `src/phonebridge/domain/contract.py` остался без изменений с прошлого среза, поэтому перед переходом к написанию реализации M1 в нём нужно закрыть **4 расхождения с актуальным контрактом (Rounds 12–14)**:
+
+1. **В `LineManager.dial()` отсутствует обязательный аргумент `country`:**
+   * *Сейчас (строки 602–604):* `async def dial(self, session_id: SessionId, lease_id: LeaseId, number: RedactedString) -> DialResult`
+   * *По контракту (`docs/api-contract.md`, Dial validation):* `call.dial` принимает `{session_id, lease_id, number, country}` и проверяет `UNSUPPORTED_NUMBER_TYPE` против allowlist конкретной линии. Без `country: str` в `LineManager.dial()` (и политики разрешённых типов номеров в конфиге линии) доменное ядро не сможет провести эту проверку.
+2. **Нет метода закрытия сессии агента (`drop_session`):**
+   * *Проблема:* В `contract.py` задокументированы сокетная привязка тикетов очереди (Rule 7) и dead-man switch для активных лизов (§5.4), но в абстрактном `LineManager` отсутствует метод, который транспортный слой должен вызвать при обрыве соединения агента (например, `async def drop_session(self, session_id: SessionId) -> None`).
+3. **Неполный набор событий Round 14 в `LineManager`, `EventName` и `FallbackDecision`:**
+   * В `api-contract.md` (Round 14) появились `provider.audio_ready` → `event.audio_ready` и `event.fallback_triggered`, а также `event.line_state_changed` и `event.missed_call`.
+   * В `contract.py`:
+     * в `EventName` есть только 4 события (`incoming_call`, `call_state_changed`, `queue_ready`, `assignment_revoked`) — отсутствуют `audio_ready`, `fallback_triggered`, `line_state_changed`, `missed_call`;
+     * в `LineManager` нет метода ингресса `ingest_audio_ready(...)`;
+     * в `FallbackDecision` не хватает поля `fallback_call_token: CallToken | None = None`, без которого `FallbackWorker` не сможет вызвать `accept()` по истечении `accept_window_sec`.
+4. **Явная JSON-сериализация `RedactedString` в Pydantic v2:**
+   * В `RedactedString.__get_pydantic_core_schema__` используется `core_schema.no_info_after_validator_function(cls, core_schema.str_schema())` без явного `serialization`. Чтобы `model_dump_json()` гарантированно и независимо от минорных версий `pydantic-core` отдавал сырое wire-значение через `.to_wire()`, стоит явно прописать `serialization=core_schema.plain_serializer_function_ser_schema(lambda v: v.to_wire(), return_schema=core_schema.str_schema(), when_used="json")`.
+
+---
+
+### 3. Тонкие несостыковки в документации
+
+1. **Потерянное поле `answer_confidence` на уровне wire-контракта:**
+   * В `docs/phone-bridge-service-design.md` (§5.5 и §12.2) и в `CallLease` (`contract.py`) явно указано: *"`answer_confidence` remains in the contract as a hedge"*.
+   * Однако в `docs/api-contract.md` это поле нигде не описано (ни в `event.call_state_changed`, ни в `provider.call_state`). Нужно добавить `answer_confidence?: "provisional" | "confirmed"` в payload `event.call_state_changed` (или зафиксировать в `api-contract.md`, где именно оно передаётся агенту).
+2. **Устаревшие фрагменты в `docs/phone-bridge-service-design.md`:**
+   * **§3.5 (`Provider namespace`):** не добавлен новый метод `provider.audio_ready` из Round 14 (хотя в §5.5 он уже описан).
+   * **§3.6 (`Events`):** не упомянут `event.fallback_triggered` из Round 14.
+   * **§13 (`Implementation roadmap (round 11)`):** шаги M4–M5 в §13 всё ещё описывают `LocalLine` с привязкой к физическому донглу и не отражают переход на `hci-agent` + `vhci-feeder` (Rounds 12–13), хотя `README.md` уже ссылается на `.devin/roadmap.md`.
+3. **Защита парсера `hci-agent` (Rule 7):**
+   * В `docs/hci-agent.md` (§2, Control channel — TCP) заголовок кадра имеет 16-битную длину (`uint16 BE len`). При реализации парсера (и желательно в самой спеке) стоит явно ограничить максимальный размер управляющего фрейма (например, `MAX_CTRL_FRAME_LEN = 4096`), чтобы при рассинхронизации потока не аллоцировать буферы до 64 КБ.
+
+---
+
+### Итог
+
+Тулинг (`pyproject.toml`) и архитектурный базис (`docs/*`) полностью готовы к разработке. Единственный реальный блокер перед стартом кода M1 — довести `src/phonebridge/domain/contract.py` до паритета с Rounds 12–14 (`country` в `dial()`, `drop_session()`, события `audio_ready`/`fallback_triggered` и `answer_confidence` в `api-contract.md`).

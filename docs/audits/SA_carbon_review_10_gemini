@@ -1,0 +1,115 @@
+### Verdict
+
+The domain contract (`contract.py`) is **NOT yet safe to freeze** for M1–M5 implementation. While the core architectural patterns (transactional outbox, fail-closed `RedactedString`, dual-role media tokens, socket-bound FIFO tickets) are exceptionally well-engineered, this fresh pass uncovered **2 CRITICAL**, **6 HIGH**, and **6 MEDIUM** defects. Most critically, `LineManager` is missing an ingress method for a live wire RPC (`provider.capability_update`), and `CallLease` lacks `session_id` ownership, creating a multi-session security and teardown ambiguity that will force incompatible ad-hoc workarounds in M1 and M2.
+
+---
+
+### CRITICAL Findings (Must unfreeze & fix before M1/M2)
+
+#### CRITICAL-1: Missing `LineManager` ingress method for `provider.capability_update`
+* **Where:** `docs/api-contract.md` ("Manager namespace — `provider.*`"), `docs/phone-bridge-service-design.md` (§3.5), `src/phonebridge/domain/contract.py` (`LineManager`).
+* **Defect:** Both wire and design docs declare `provider.capability_update {line_id, assignment_id, caps, profile?} -> {ok}` as a first-class upward RPC on the Manager surface. However, `LineManager` has **no method** (nor DTO) to ingest a capability/profile update on an active `ProviderBinding`.
+* **Impact:** In M2, the Manager JSON-RPC adapter cannot mutate `ProviderBinding` directly (DTOs are `frozen=True` and state lives inside `LineManager`). Without a kernel method (e.g., `update_provider_capabilities(...)`), M2 either cannot implement the wire method or must abuse `register_provider` (which requires the shared secret `token` that `capability_update` does not carry).
+
+#### CRITICAL-2: `CallLease` omits `session_id`, breaking session-scoped routing, `OWNER_MISMATCH`, and `drop_session`
+* **Where:** `src/phonebridge/domain/contract.py` (`CallLease`, `SessionAudience`, `LineManager.drop_session`), `docs/api-contract.md` ("Event audience routing").
+* **Defect:** A single `agent_id` (e.g., an agent with parallel workers, or a Control MCP session alongside an audio-worker session) can open multiple concurrent sessions (`register_intent` -> distinct `SessionId`s). Yet `CallLease` stores **only** `owner_agent_id: str` and **no `session_id: SessionId`**.
+  * `EventAudience` specifies that `event.audio_ready` and `event.call_state_changed` use `SessionAudience(session_id=...)` ("the owning session only").
+  * `drop_session(session_id)` states: *"run the dead-man switch on every CallLease owned by it [the session]"*.
+  * `dial`, `hangup`, `release`, `send_dtmf` authenticate ownership via `(session_id, lease_id)`.
+* **Impact:** Two incompatible M1 implementations are currently valid: (A) `InMemoryLineManager` tracks a shadow `_lease_to_session: dict[LeaseId, SessionId]` hidden from the DTO/admin views, or (B) it resolves ownership by `session.agent_id == lease.owner_agent_id`, which causes one session disconnecting to kill sibling sessions' active calls and makes `SessionAudience` routing uncomputable when an agent has >1 session. Add `session_id: SessionId` to `CallLease`.
+
+---
+
+### HIGH Findings (Wire drift, state-machine gaps, & security leaks)
+
+#### HIGH-1: Undocumented field-name & type drift between `EventName` models and `docs/api-contract.md`
+* **Where:** `src/phonebridge/domain/contract.py` (`IncomingCallEvent`, `MissedCallEvent`, `FallbackTriggeredEvent`, `CallStateChangedEvent`, `QueueReadyEvent`) vs. `docs/api-contract.md` ("APICallService → Agent — `event.*`") vs. `tests/test_domain_contract.py` (`test_event_wire_name_parity`).
+* **Defect:** `test_event_wire_name_parity` only checks event *names*, missing four payload schema mismatches that will break naive `model_dump(mode="json")` serialization in M2:
+  1. **`caller` vs `caller_id`:** `IncomingCallEvent`, `MissedCallEvent`, and `FallbackTriggeredEvent` define `caller: RedactedString | None`, whereas `api-contract.md` specifies `caller_id?`.
+  2. **`expires_at` vs `expires_in_ms`:** `IncomingCallEvent` carries `expires_at: AwareDatetime`, whereas `api-contract.md` specifies `expires_in_ms` (relative integer ms). Computing relative `expires_in_ms` in the EventBus adapter after outbox drain introduces queue-delay skew unless computed against `emitted_at`—or the wire spec should use `expires_at` (RFC 3339) like `event.line_acquired` does.
+  3. **`phase` vs `state`:** `CallStateChangedEvent` has `phase: CallPhase` (`ended`), whereas the wire specifies `state` (`disconnected`).
+  4. **Extra `ticket_id`:** `QueueReadyEvent` includes `ticket_id: TicketId`, which is absent from `event.line_acquired {session_id, line_id, lease_id, intent, expires_at}` in `api-contract.md` (violating strict client schemas).
+
+#### HIGH-2: Inbound preemption of an undialed `AcquireGranted` lease silently drops the agent instead of re-queueing or defining semantics
+* **Where:** `docs/api-contract.md` ("Queue semantics — Grant vs incoming-ring race"), `src/phonebridge/domain/contract.py` (`AcquireGranted`, `QueueTicket`).
+* **Defect:** `api-contract.md` states: *"a physical `ingest_ring` on a line in the granted-but-undialed window PREEMPTS the grant: the unused lease ends with `event.call_state_changed{state: 'disconnected', reason: 'preempted_by_incoming'}`; a queue-origin ticket is reissued at the head (`position=1`, same `seq` retained)."*
+  1. If the agent received `event.line_acquired` (queue-origin), its `ticket_id` was already consumed. When reissued at head, how does the agent learn its ticket is live again? `event.queue_updated{session_id, ticket_id, position: 1}` reuses a `ticket_id` the client already closed.
+  2. What if the undialed grant came from an **immediate** `AcquireGranted` where the caller passed `enqueue=True`? No `ticket_id` was ever returned to the agent, so reissuing a ticket produces an orphan `QueueUpdatedEvent` for an unknown `ticket_id`, whereas *not* reissuing violates the caller's `enqueue=True` request.
+
+#### HIGH-3: `release()` vs `hangup()` lifecycle contradiction leaks lines or prematurely kills calls
+* **Where:** `src/phonebridge/domain/contract.py` (`LineManager.release`, `LineManager.hangup`), `docs/phone-bridge-service-design.md` (§4.2, §5.1), `docs/api-contract.md` ("Intent / allocation semantics").
+* **Defect:** Two contradictory mental models exist across the files:
+  * Design §4.2 table says **LineAssignment** ends by *"release / `line.revoke` / idle escalation"* and *"Release = future calls only; an in-flight call finishes"*.
+  * `LineManager.release(session_id, lease_id)` takes a **`lease_id`** (not an `assignment_id`!) yet copies the §4.2 docstring: *"end the lease (future calls only; an in-flight call finishes, §4.2)"*. Meanwhile §5.1 says: *"`call.hangup` + `call.release` -> lease ends, queue advances"*.
+* **Impact:**
+  1. If an agent calls `hangup()` and *forgets* to call `release()`, does the line stay `BUSY` forever? (Violates bounded resources / Rule 7—unless `hangup` or `DISCONNECTED` auto-releases the ephemeral `CallLease`).
+  2. Conversely, if an agent calls `release(lease_id)` *during* an `ACTIVE` call ("an in-flight call finishes") and never calls `hangup()`, the call stays up with no owning lease! And how does an exclusive line owner ever voluntarily release its durable `LineAssignment` if `call.release` only accepts `lease_id`?
+
+#### HIGH-4: PII leak on shared-pool lines via `BroadcastAudience`
+* **Where:** `src/phonebridge/domain/contract.py` (`BroadcastAudience`, `AgentAudience`), `docs/api-contract.md` ("Event audience routing").
+* **Defect:** On a `SHARED_POOL` line, `event.incoming_call` and `event.missed_call` use `BroadcastAudience` ("every live agent session sees the event").
+  1. An agent registered **only** with `Intent.DIAL_OUT` (e.g., a cold-calling campaign bot with no `receive_inbound` permission/intent) receives raw E.164 `caller_id` PII over the wire AND receives the live one-shot `call_token`!
+  2. Furthermore, `LineManager.accept(session_id, call_token)` does **not** document checking `Intent.RECEIVE_INBOUND` on the accepting session—so a `dial_out`-only agent can hijack inbound calls on shared lines.
+* **Fix:** Scope shared-pool `incoming_call`/`missed_call` to sessions that registered `Intent.RECEIVE_INBOUND` (or add an `IntentAudience`), and require `Intent.RECEIVE_INBOUND` (or `system:fallback_worker`) in `accept()`.
+
+#### HIGH-5: `LineAdminKernel` lacks `assign_exclusive` and runtime timeout configuration promised by the specs
+* **Where:** `src/phonebridge/domain/contract.py` (`LineAdminKernel`), `docs/api-contract.md` ("Admin surface", "Decisions #3"), `docs/phone-bridge-service-design.md` (§4.2, §10).
+* **Defect:**
+  1. Design §4.2 & `api-contract.md` state exclusive ownership is granted via *"claim + moderator approval **or admin assign** (override path)"*. `LineAdminKernel` only has `approve_claim(claim_id)`—there is no direct `assign_line(line_id, owner_agent_id)` method for provisioning an exclusive line before an agent connects and files a claim.
+  2. Design §10 & §5.4 state: *"ALL timeouts and windows are admin-configurable without a daemon restart: accept window, queue grant TTL, ping/DEGRADED/DOWN thresholds, orphan grace, idle_revoke_after."* `LineAdminKernel.configure_line` only exposes `accept_window_sec`, omitting `idle_revoke_after` (which is already on `LineAssignment`!) and leaving no kernel surface to update `grant_ttl`, `orphan_grace`, or heartbeat thresholds at runtime.
+
+#### HIGH-6: `EventBus` crashes or drops `AssignmentRevokedEvent` when revoking a `ProviderBinding` or pool assignment
+* **Where:** `src/phonebridge/domain/contract.py` (`AssignmentRevokedEvent`, `AgentAudience`, `LineAdminKernel.revoke_assignment`), `docs/api-contract.md` ("Event audience routing").
+* **Defect:** `api-contract.md` states under `event.assignment_revoked`: *"Delivered ONLY to the revoked owner's session(s); `owner_agent_id` is absent for a pool/provider attachment (no agent to notify)."* Yet `AssignmentRevokedEvent` explicitly supports `owner_agent_id: str | None = None` *"when the revoked binding was a pool/provider attachment"*, and `EventEnvelope.audience` is **mandatory** (`broadcast | agent | session`—there is no `NoAudience` / internal-only scope).
+* **Impact:** If `revoke_assignment` emits `AssignmentRevokedEvent` for a `ProviderBinding`, what `EventAudience` does it stamp? It cannot stamp `AgentAudience` (`agent_id` is `None`), and stamping `BroadcastAudience` leaks admin revocations to all agents, contradicting `api-contract.md`. Clarify that `AssignmentRevokedEvent` is emitted **only** when revoking an `EXCLUSIVE` `LineAssignment` (where `owner_agent_id` is non-None, making `owner_agent_id: str` non-optional on the event), whereas revoking a `ProviderBinding` emits `ProviderRevokeCommand` + `LineStateChangedEvent(new_state=DOWN, reason=ADMIN_REVOKED)`.
+
+---
+
+### MEDIUM Findings ( Edge cases, M3–M5 hazards, & doc contradictions)
+
+#### MEDIUM-1: DTMF execution location contradicts between `contract.py` and `phone-bridge-service-design.md`
+* **Where:** `src/phonebridge/domain/contract.py` (`ProviderSendDtmfCommand`), `docs/api-contract.md` (`call.send_dtmf`), `docs/phone-bridge-service-design.md` (§5.5, §6.4).
+* **Defect:** Live probes (§5.5) proved oFono `SendTones` is **broken** on PipeWire Telephony. Design §6.4 says: *"In-band DTMF is generated by mixing synthesized tones into the uplink endpoint [PipeWire]. While tones are synthesized the agent's uplink PCM is MUTED... A flush (`0x02`) after a DTMF segment never replays buffered stale audio."*
+  * Who synthesizes the PCM tones and mutes uplink—`MediaRouter` (gateway process, M3) or `LineProvider` (per-line worker process, M4)?
+  * `ProviderSendDtmfCommand` docstring still says *"Synthesized DTMF tones on a bound provider (oFono SendTones)"*, which will fail at runtime if M4 calls D-Bus `SendTones`. Furthermore, `0x02` flush frames terminate in `MediaRouter` or `LineProvider`? If `LineProvider` synthesizes tones into `phonebridge_uplink_<line_id>` while `MediaRouter` holds the 500-frame ring buffer, muting at the provider without draining/pausing `MediaRouter` causes 2–3 seconds of queued agent speech to play *delayed* after DTMF finishes, or get swallowed during mute! Specify explicitly whether `LineProvider` owns PCM tone injection + uplink drop during tone playback.
+
+#### MEDIUM-2: `FallbackWorker` deadlocks on `answer_and_announce` and `forward_via_line` without admin policy parameters or multi-acquire privileges
+* **Where:** `src/phonebridge/domain/contract.py` (`AnswerAndAnnounceFallback`, `FallbackTriggeredEvent`), `docs/phone-bridge-service-design.md` (§5.3).
+* **Defect:**
+  1. `AnswerAndAnnounceFallback` has **no fields** (`policy: Literal["answer_and_announce"]`). When `FallbackWorker` (connecting *only* via the standard agent API per ADR-01) receives `FallbackTriggeredEvent`, it has neither the announcement text/WAV reference nor admin scope to query line config. Add `announcement_ref: str` (or `text: str`) to `AnswerAndAnnounceFallback`.
+  2. `ForwardViaLineFallback(line_id=...)` requires `FallbackWorker` to dial out on a *second* line (`call.acquire(line_id=target)`). What if `target` is an `EXCLUSIVE` line owned by the human/secretary? A standard agent gets `LINE_EXCLUSIVE_NOT_OWNER`. Does `system:fallback_worker` also bypass `LINE_EXCLUSIVE_NOT_OWNER` on `acquire`? Document this in `LineManager.acquire`.
+  3. Both `api-contract.md` and design §5.3 still contain hedged phrasing: *"delivers `event.incoming_call{call_token: fallback_call_token}` — **or** `event.fallback_triggered`"*. Pick **one** (`event.fallback_triggered`, since the worker needs `policy`!).
+
+#### MEDIUM-3: `LineProvider` cannot mint `CallToken` safely on `ingest_ring` vs `provider.call_state` wire specification
+* **Where:** `docs/api-contract.md` (`provider.call_state`, Identifier taxonomy), `src/phonebridge/domain/contract.py` (`IncomingRingIngress`, `ProviderCallStateUpdate`).
+* **Defect:** Look at the Identifier Taxonomy in `api-contract.md`: **`call_token` is issued by `LineManager`**. Yet in the `provider.call_state` wire table: `provider.call_state {line_id, assignment_id, call_token?, lease_id?, state, reason?}` has **no `caller` / `caller_id` parameter**!
+  * How does the provider report a new incoming ring's caller ID over the wire if `provider.call_state` has no `caller` field?
+  * And if `LineManager` mints `call_token`, why does `IncomingRingIngress` require `call_token: CallToken` as an *input* to `LineManager.ingest_ring()`, and how does the provider learn that `call_token` so it can later send `provider.call_state{call_token, state: "disconnected", reason: "normal"}` when the caller hangs up before anyone answers? Either `provider.call_state` returns `{ok, call_token?}` (or the adapter mints `call_token`? No, provider initiated the RPC!), or the provider mints an inbound `ring_id` / `call_token` itself. Right now M2/M4 cannot wire an unanswered caller-hangup!
+
+#### MEDIUM-4: `PendingClaim` leaks orphaned claims on `drop_session` or line removal
+* **Where:** `src/phonebridge/domain/contract.py` (`PendingClaim`, `LineManager.drop_session`, `LineAdminKernel.approve_claim`).
+* **Defect:** `PendingClaim` records `session_id: SessionId` alongside `requester_agent_id: str`. Because `LineAssignment` is durable (`agent_id`-bound), does `drop_session(session_id)` cancel a `PendingClaim` or keep it alive? And is there a bounded cap on pending claims per agent/line (CODING_HAZARDS rule 7)? Without an explicit rule and per-agent/total bound, a buggy agent can spam `claim_exclusive` until memory exhausts, or an approved claim on a disconnected session has undefined notification routing.
+
+#### MEDIUM-5: `ProviderRegistration.meta` breaks `ContractModel` immutability and has no size bound (Rule 7 & Rule 10)
+* **Where:** `src/phonebridge/domain/contract.py` (`ProviderRegistration.meta`).
+* **Defect:**
+  1. `meta: dict[str, str]` has no length cap on keys, values, or entry count—violating CODING_HAZARDS Rule 7 (bounded resources) on an external JSON-RPC ingress model.
+  2. Any stray PII or token placed in `meta` is logged in plaintext by `safe_dump()` because values are plain `str`. Add a bounded validator (e.g. max 16 keys, max 256 chars/val) or tuple-of-pairs representation.
+
+#### MEDIUM-6: Stale documentation drift inside `docs/phone-bridge-service-design.md` (§3.2, §3.3, §4.1)
+* **Where:** `docs/phone-bridge-service-design.md` (§3.2, §3.3, §4.1).
+* **Defect:** Several normative sections in the design doc still contradict Round 20/21 contract rules:
+  * **§3.2** lists only 8 error codes (omitting `INVALID_STATE`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`).
+  * **§3.3** `call.acquire` omits `idempotency_key?` in params and `expires_at` in `{granted: true, ...}`.
+  * **§4.1** states *"Agents self-register `INTENT` sets `{dial_out|receive_inbound|exclusive_line}` via `agent.register_intent`"*, directly contradicting Round 21 (`contract.py` & `api-contract.md`), where passing `exclusive_line` to `register_intent` raises `INVALID_INTENT`.
+
+---
+
+### Summary Checklist for Unfreezing (v0.0.17 Patch)
+
+1. **Fix `LineManager` & `CallLease` (CRITICAL-1, CRITICAL-2):** Add `update_provider_capabilities` to `LineManager`; add `session_id: SessionId` to `CallLease`.
+2. **Fix Inbound Ring Wire Protocol (MEDIUM-3):** Add `caller?: RedactedString` to `provider.call_state` in `api-contract.md`, and either return `{ok, call_token?}` on `state: "ringing"` or let the provider pass a provider-minted `ring_id` so early caller hangups can correlate with `IncomingRingIngress`.
+3. **Align Event Wire Schemas + Drift Test (HIGH-1, HIGH-6):** Reconcile `caller` vs `caller_id`, `expires_at` vs `expires_in_ms`, `phase` vs `state`, and `QueueReadyEvent.ticket_id`; make `AssignmentRevokedEvent.owner_agent_id` required `str` (only emitted for agent assignments); extend `test_event_wire_name_parity` to parse `{...}` field names in the `event.*` markdown table just like `test_provider_command_wire_parity` does!
+4. **Resolve Lifecycle & Preemption Ambiguities (HIGH-2, HIGH-3, HIGH-4):** Define auto-release of `CallLease` on call termination (separating ephemeral lease release from durable assignment release); define `AcquireGranted` preemption behavior; restrict inbound events/accepts on shared pools to `RECEIVE_INBOUND` sessions.
+5. **Close Admin & Fallback Gaps (HIGH-5, MEDIUM-1, MEDIUM-2, MEDIUM-4, MEDIUM-5, MEDIUM-6):** Add `assign_exclusive` + timeout fields to `LineAdminKernel`; add announcement parameter to `AnswerAndAnnounceFallback`; pin in-band DTMF synthesis + uplink muting to one component (`LineProvider` or `MediaRouter`); bound `ProviderRegistration.meta` and `PendingClaim` queues; clean up §3.2/§3.3/§4.1 in `phone-bridge-service-design.md`.

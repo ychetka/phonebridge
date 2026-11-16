@@ -1,0 +1,90 @@
+Ниже представлены результаты верификации версии **`0.0.10`**, разбор оставшихся «белых пятен» (зон неопределённости, с которыми столкнутся исполнители на этапах M1–M5) и конкретные предложения по их закрытию.
+
+*(Дисклеймер по `REVIEW_HAZARDS.md`: проверка выполнена статическим анализом текста репозитория; команды `pytest`, `mypy`, `ruff` локально ревьюером не запускались.)*
+
+---
+
+### 1. Верификация текущего среза (v0.0.10, Rounds 17–18)
+
+Все замечания из предыдущих итераций ревью **полностью и корректно устранены**:
+
+1. **Полнота доменного контракта (`src/phonebridge/domain/contract.py`):**
+   * Добавлены `EventName.QUEUE_UPDATED` и модель `QueueUpdatedEvent`.
+   * В `QueueReadyEvent` добавлены `session_id: SessionId` и `intent: Intent` — транспортный адаптер в M2 теперь может маршрутизировать `event.line_acquired` без хранения дублирующей таблицы тикетов.
+   * Функция `_mask_for_log` защищена от `set`/`frozenset` с детерминированной сортировкой `sorted(value, key=str)` (ключ `str` вызывает `RedactedString.__str__`, то есть сортирует по маске, не светя сырой PII).
+2. **Покрытие контрактных тестов (`tests/test_domain_contract.py`):**
+   * В `test_line_manager_async_surface()` теперь реально вызываются все **18 из 18** абстрактных методов `LineManager` (включая `ingest_audio_ready` и `drop_session`), проверен `decision.fallback_call_token is None`.
+   * Все 9 доменных событий (`IncomingCallEvent`, `CallStateChangedEvent`, `QueueReadyEvent`, `QueueUpdatedEvent`, `AssignmentRevokedEvent`, `AudioReadyEvent`, `FallbackTriggeredEvent`, `LineStateChangedEvent`, `MissedCallEvent`) и дефолт `allowed_number_types` (`"FIXED_LINE_OR_MOBILE"`) покрыты ассертами, плюс добавлен `test_mask_for_log_set_and_frozenset()`.
+3. **Протокольная и сетевая спецификация (`docs/api-contract.md`, `docs/hci-agent.md`, `docs/phone-bridge-service-design.md`):**
+   * Зафиксирован **WebSocket поверх Unix-сокета** (`unix://` = WS handshake over `AF_UNIX`), что исключает рассинхрон потока на коротких 8-байтных фреймах `flush`/`keepalive`.
+   * В `docs/hci-agent.md` добавлен `0x04 MEDIA_PING` (сразу после `HELLO_ACK` и каждые ~15 с) для привязки обратного UDP-порта агента и правило `/32` изоляции пиров WireGuard на сервере.
+   * В `docs/phone-bridge-service-design.md` (§12.3) закрыт статус эксперимента с `vhci` (*PASSED, issue #29*). *(Микро-штрих: в таблицу `Decision log` в начале `phone-bridge-service-design.md` при случае стоит добавить строку про `round 17-18`, сейчас таблица заканчивается на `round 15-16`, а `CHANGELOG.md` — на `0.0.8` до свёртки `.changes` для `0.0.10`).*
+
+---
+
+### 2. Белые пятна (Blind Spots перед стартом M1–M5)
+
+Документация и контракт основного пути («звонок туда / звонок сюда») вычищены отлично. Однако при переходе к написанию реального кода в **M1–M5** исполнители упрутся в **6 неописанных стыков**:
+
+#### Белое пятно №1 (M1 — Контракт `LineAssignment`): Коллизия смысла `owner_agent_id` и отсутствие admin-мутаций на ядре
+* **Где:** `src/phonebridge/domain/contract.py`, строки 424–448 и 666–676.
+* **Суть проблемы:**
+  1. В модели `LineAssignment` поле `owner_agent_id: str` является **обязательным** (`not None`). Но метод `LineManager.register_provider(registration) -> LineAssignment` вызывается, когда к шлюзу подключается *провайдер линии* (до того, как линию кто-либо занял, например для обычной пуловой линии `mode = SHARED_POOL`). Что `InMemoryLineManager` должен записать в `owner_agent_id: str` для общей линии из пула, у которой нет владельца-агента? Магическую строку `""` / `"__pool__"`?
+  2. Смешаны два разных биндинга под одним именем `assignment_id`: в `api-contract.md` `provider.register` возвращает `assignment_id` как сессию провайдера, а в §4.2 `LineAssignment` описывает владение линией со стороны агента.
+  3. В `LineManager` есть `claim_exclusive() -> ClaimResult(status="pending_approval")`, но нет **ни одного метода для модератора/админки**, чтобы одобрить этот `claim_id`, отозвать эксклюзив (`line.revoke`) или обновить конфиг линии (`fallback_policy`, `accept_window_sec`, `allowed_number_types`) в рантайме без рестарта демона.
+
+#### Белое пятно №2 (M1 — Конечный автомат очереди): Гонка между `Grant TTL` и входящим звонком + арбитраж Per-line vs Global очереди
+* **Где:** `docs/phone-bridge-service-design.md` §2.4, §3.4, §5.2.
+* **Суть проблемы:**
+  1. Агент стоял в очереди, линия освободилась, шлюз выдал ему `QueueReadyEvent` (`event.line_acquired`) с окном реакции `grant_ttl` (~5 с). Прошло 2 секунды (агент ещё не вызвал `call.dial`), и в этот момент на телефон приходит физический входящий вызов (`ingest_ring`). Кто побеждает? Если входящий звонок переводит линию в `RINGING_LOCKED`, что происходит с уже выданным `lease_id` агента из очереди — он отзывается, а тикет возвращается в голову очереди (`position=1`), или агент получает ошибку при попытке `dial`?
+  2. В спеке заявлены «per-line + global pool» очереди. Не зафиксировано правило честности (fairness): если освободилась `line-A`, кто получает её первым — тикет, ждущий конкретно `line-A`, или тикет из глобального пула, пришедший раньше?
+
+#### Белое пятно №3 (M4 — Мульти-линии в одном контейнере): Маппинг `adapter_mac` → динамический D-Bus путь `/org/pipewire/Telephony/agN`
+* **Где:** `docs/phone-bridge-service-design.md` §1 и §2.1.
+* **Суть проблемы:** Внутри контейнера работают **общие (shared)** `bluetoothd`, `PipeWire` и `dbus-daemon` поверх `N` виртуальных адаптеров `vhci` (`hci0..hciN`).
+  В §1 указан путь `/org/pipewire/Telephony/ag1`. Это работает на **одном** телефоне, но когда в контейнере подняты 2–3 линии, PipeWire/oFono-shim экспортирует несколько объектов AudioGateway (`ag1`, `ag2`...), номера которых зависят от порядка реконнекта телефонов.
+  В спеке пока не описано, по какой цепочке свойств D-Bus процесс `LineProvider` конкретной линии (знающий только свой `adapter_mac`) однозначно находит **свой** модем/AG в PipeWire и **свои** ноды `bluez_input.<phone_mac>` / `bluez_output.<phone_mac>`, не перепутав их с соседней линией.
+
+#### Белое пятно №4 (M4 — `hci-agent` USB Isochronous TX): Переключение USB Alternate Setting для SCO без ядерного `btusb`
+* **Где:** `docs/hci-agent.md` §1–2.
+* **Суть проблемы:** В `hci-agent.md` детально разобран приём SCO (`isoc IN -> реассемблинг -> UDP`), но опущена критическая деталь отправки SCO в донгл (`UDP -> libusb isoc OUT`) и управления самим USB-интерфейсом:
+  * По стандарту Bluetooth USB Transport (Interface 1 — SCO Audio), в покое активен `Alternate Setting 0` с нулевой полосой (`wMaxPacketSize = 0`). Чтобы изохронные пакеты SCO вообще ходили через `libusb`, при открытии голосового канала агент обязан переключить USB Interface 1 в рабочий `Alternate Setting` (например, `altsetting 2` или `6` для mSBC / 16-bit transparent SCO), а при закрытии звонка — вернуть `altsetting 0` (иначе USB-контроллер навечно зарезервирует изохронную полосу даже без звонка!).
+  * Поскольку `vhci` в контейнере общается по H4 и ничего не знает про USB altsettings, `hci-agent` (или обёртка вокруг Bumble USB transport) обязан делать `libusb_set_interface_alt_setting` по событиям открытия/закрытия синхронного соединения (либо по явной команде от `vhci-feeder` в `control-TCP`). Кроме того, при отправке `isoc OUT` агент должен нарезать HCI SCO пакеты под `wMaxPacketSize` выбранного altsetting.
+
+#### Белое пятно №5 (M4/M5 — Headless Pairing): Как спарить смартфон внутри изолированного контейнера?
+* **Где:** `docs/hci-agent.md` §5 (`PROVISIONING → PAIRING → READY`) и `docs/phone-bridge-service-design.md` §10.
+* **Суть проблемы:** Спаривание выполняется `bluetoothd` внутри контейнера. Современные Android/iOS используют Secure Simple Pairing (Numeric Comparison — 6-значный код + подтверждение на обеих сторонах). Если внутри контейнера не зарегистрирован программный D-Bus `org.bluez.Agent1` и нет команд управления спариванием в `phonebridgectl` / Admin MCP (`pair_start`, `pair_confirm`, список видимых устройств на конкретном `adapter_mac`), оператору придётся каждый раз заходить в контейнер руками через `docker exec -it ... bluetoothctl` и вручную выбирать нужный `select <adapter_mac>`.
+
+#### Белое пятно №6 (M2/M5 — MCP-адаптер для агентов): Как MCP-клиент работает с аудио и push-событиями?
+* **Где:** `docs/api-contract.md` (введение, Round 12).
+* **Суть проблемы:** Заявлено, что агентская поверхность `agent.*`/`call.*` доступна как MCP tools. Но стандартный MCP клиент (например, LLM-сессия) не умеет открывать бинарный WebSocket на `media_endpoint` и стримить туда/оттуда 50 PCM-фреймов в секунду, равно как и спать в ожидании входящего звонка без внешнего медиа-воркера (STT/TTS bridge). Если не очертить границу MCP-адаптера заранее, разработчик этого модуля столкнётся с архитектурным тупиком: кто держит медиа-сокет, когда `call.dial` вызван через MCP tool?
+
+---
+
+### 3. Предложения по улучшению (Actionable Proposals)
+
+Ниже — точечные, прагматичные решения для каждого из 6 пятен, не раздувающие скоуп:
+
+1. **Разделить сессию провайдера и владельца линии + описать Admin-интерфейс ядра (к М1/М2):**
+   * В `LineAssignment` сделать `owner_agent_id: str | None = None` (для `SHARED_POOL` линий владелец `None` — это сразу убирает магические строки в M1).
+   * Для админских операций (`approve_claim`, `revoke_assignment`, `configure_line`) не раздувать публичный агентский интерфейс `LineManager`, а завести рядом в `domain/contract.py` (или в M2 через `PLAN_DELTA`) узкий абстрактный интерфейс `LineAdminKernel` (реализуемый тем же классом `InMemoryLineManager`), методы которого доступны только с токеном скоупа `admin`.
+
+2. **Зафиксировать единый `seq` и правило вытеснения гранта в M1:**
+   * **Честность очереди:** Использовать единый монотонный счётчик `seq` на весь `LineManager`. Когда линия `L` переходит в `FREE`, она отдаётся первому тикету с минимальным `seq`, у которого `preferred_line_id in (None, L)` (с учётом `AssignmentMode` линии). Это исключает голодание как per-line, так и пуловых запросов.
+   * **Гонка `ingest_ring` vs неиспользованный грант:** Если на линию в фазе ожидания `call.dial` (грант выдан, звонок ещё не начат) прилетает физический `ingest_ring` (и профиль линии разрешает входящие), входящий звонок **прерывает грант**: лиз закрывается с `CallStateChangedEvent(phase=ENDED, reason="preempted_by_incoming")`, а если грант был из очереди — агенту перевыпускается тикет в голове очереди.
+
+3. **Зафиксировать цепочку резолвинга линии в D-Bus (к M4):**
+   * В дизайне M4 явно записать детерминированный алгоритм привязки без опоры на имена `hciN` и `agN`:
+     1. Найти объект `org.bluez.Adapter1`, у которого свойство `Address == config.adapter_mac` (получаем путь `/org/bluez/hciX`).
+     2. Найти спаренный `org.bluez.Device1`, у которого `Adapter == /org/bluez/hciX` (получаем `phone_mac`, например `AA:BB:CC:DD:EE:FF`).
+     3. Сопоставить модем в PipeWire/oFono-shim и ноды `bluez_input.<phone_mac>` / `bluez_output.<phone_mac>` строго по `phone_mac`. Это даст 100% изоляцию линий внутри общего `bluetoothd` и `PipeWire`.
+
+4. **Явная команда управления SCO USB AltSetting в `hci-agent` (к M4):**
+   * Добавить в `docs/hci-agent.md` (§2, Control channel — TCP) маленькую симметричную деталь: либо `hci-agent` (через Bumble) пассивно отслеживает `0x2c Synchronous Connection Complete` / `0x05 Disconnect Complete` для переключения USB Interface 1 `altsetting 0 <-> active_altsetting`, **либо** (что ещё надёжнее и сохраняет агента «тупым») контейнерный `vhci-feeder`, который **уже** парсит события `0x2c` и `0x05` для SCO handle gate, шлёт агенту по `control-TCP` команду `0x16 SCO_STATE {open: true|false, packet_len}`. По `open: true` агент включает нужный USB altsetting и запускает isoc IN/OUT трансферы, по `open: false` — сбрасывает интерфейс обратно в `altsetting 0`.
+
+5. **Автоматизировать Headless Pairing через `phonebridgectl` и встроенный `BlueZ Agent1` (к M4/M5):**
+   * Включить в состав контейнера легковесный D-Bus `org.bluez.Agent1` (управляемый админ-поверхностью), который отвергает любые фоновые попытки спаривания по умолчанию (`PAIRING` выключен), а по админской команде `admin.pair_window(line_id, duration_sec=60)` включает `Pairable` только на одном нужном `adapter_mac` и подтверждает SSP-ключ спаривания.
+
+6. **Очертить роль MCP-адаптера (к M2/M5) и завести `docs/specs/` (к M1):**
+   * В `docs/api-contract.md` уточнить в 2 предложениях: MCP-адаптер для `call.*` либо работает в паре с локальным `MediaSidecar` (предоставляющим высокоуровневые тулы вроде `speak_text` / `listen` поверх бинарного медиа-сокета), либо используется как управляющая плоскость, где `media_endpoint` передаётся выделенному аудио-воркеру агента.
+   * При старте M1 создать первый файл живой спецификации `docs/specs/line-manager.md` с G/W/T сценариями в соответствии с правилами `controller-manager/development-cycle.md` (§3).
