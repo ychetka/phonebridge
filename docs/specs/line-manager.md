@@ -93,7 +93,44 @@ on a `no_pickup`/missed outcome, where the caller already left, and
 never on the handset-answered `external_call` path. Rationale: handing a physically still-
 ringing line to the next `call.dial` would collide with the live
 air-side call, and a later `state_snapshot` would re-register the
-same ring as a NEW `incoming_call`.
+same ring as a NEW `incoming_call`. The drain sub-phase itself is
+KERNEL-INTERNAL bookkeeping (round 29): once `missed_call` is
+emitted the interval awaiting `disconnected` or
+`ring_drain_ttl_sec` carries no wire-visible marker —
+`LineState.RINGING_LOCKED` remains the reported state throughout,
+and implementations MUST track the sub-phase in private kernel
+state; the contract deliberately adds no public enum rung or
+field for it.
+
+### Requirement: Driver methods are kernel-internal (round 29)
+
+`tick`, `decide_fallback`, `drain_events` and
+`drain_provider_commands` are KERNEL-DRIVER methods, not wire
+methods — a transport adapter MUST NOT route any wire RPC to a
+driver method, and the wire surface is exclusively the methods
+mapped in `docs/api-contract.md` (`agent.*`/`call.*`/`provider.*`
+on `LineManager`, `admin.*` on `LineAdminKernel`). The only legal
+invocation of `decide_fallback` is the kernel's own deadline path
+inside `tick`; `tick` is driven by the runtime's clock loop; the
+drains are called by the adapter after kernel calls, never in
+response to a wire request. A wire-facing route named like a
+driver method — or a dispatch table built by iterating the ABC's
+methods — is a contract violation. `tick(now)` additionally
+MUST reject a backwards `now` with
+`PhonebridgeError(INVALID_ARGUMENT)`: monotonicity is a hard
+invariant, not an implementation option.
+
+### Requirement: Fallback eligibility is evaluated at decision time (round 29)
+
+The `answer_and_announce` eligibility predicate MUST be evaluated
+inside `decide_fallback` on LIVE kernel state at decision time —
+it cannot be model-enforced because the policy model cannot see
+sessions. The policy is eligible when the line's
+`assignment.mode == EXCLUSIVE` OR at least one live session holds
+`Intent.RECEIVE_INBOUND` on it (the `system:fallback_worker`
+session itself is excluded from that count); when neither holds,
+`decide_fallback` MUST degrade to `NoPickupFallback` instead of
+dispatching an announcement the worker could never execute.
 
 ### Requirement: Occupancy and liveness are orthogonal axes (round 25)
 
@@ -206,6 +243,12 @@ on). Acquire dedup MUST record the OUTCOME of a keyed request —
 the granted `lease_id` or queued `ticket_id` — so a same-key retry
 returns the recorded outcome while the object lives, and the same
 key with different params MUST be rejected `INVALID_ARGUMENT`.
+The per-session dedup table is BOUNDED (round 29): at most
+`MAX_IDEMPOTENCY_KEYS_PER_SESSION` (256) recorded outcomes per
+live session — a new key beyond the cap MUST be rejected
+`RESOURCE_EXHAUSTED` fail-closed, and the table is never
+LRU-trimmed (evicting a recorded outcome would let a same-key
+retry re-execute an acquire).
 An `acquire(profile?)` label MUST be recorded on the
 `QueueTicket` for a queued acquire, and the `CallLease` minted
 when the ticket is granted MUST inherit the ticket's `profile`
@@ -240,7 +283,11 @@ line plus the forward traversal of the target chain, so a cycle
 cannot be closed from either end; the walk stays bounded at 8 hops
 (contract constant
 `MAX_FORWARD_HOPS = 8`, contract.py — round 26) — a forward loop would
-otherwise spin fallback workers forever. On a SUCCESSFUL policy
+otherwise spin fallback workers forever. Both failure cases are
+`INVALID_ARGUMENT` but MUST carry distinguishing `data.detail`
+text (round 29): "forward cycle" when the walk closes a loop vs
+"forward chain exceeds MAX_FORWARD_HOPS" when it runs out of hops
+on an open chain. On a SUCCESSFUL policy
 mutation every line whose stored chain passes through the changed
 one MUST be revalidated too (round 28 — a `fallback_policy` patch
 or removal must not leave a dangling or over-deep downstream
@@ -274,7 +321,11 @@ idempotent by `lease_id` only while the pair is live (it MUST NOT
 mint credentials on a revoked or never-allocated pair);
 `revoke(lease_id)` is invoked on every `CallLease` → `ENDED`
 transition, is idempotent, and releases the per-lease media
-credentials so no socket outlives its `lease_id`.
+credentials so no socket outlives its `lease_id`. Allocator side
+effects (`reissue`/`revoke`) MUST complete INSIDE the same kernel
+mutation that ends or re-pairs the lease — before the mutating
+method returns — so a drained event can never announce a teardown
+whose media teardown has not run yet (round 29).
 
 ### Requirement: Log projection is JSON-safe
 
@@ -290,7 +341,8 @@ never appear unmasked.
 write it through to SQLite verbatim, and
 `ProviderBinding.heartbeat_interval_ms` MUST stamp the heartbeat
 interval negotiated for the current provider session (default
-`5000`, `> 0`), converted from the effective
+`5000`, `> 0`, `<= 86_400_000` ms — the exact counterpart of
+`heartbeat_interval_sec <= 86400`, round 29), converted from the effective
 `heartbeat_interval_sec` by `heartbeat_interval_ms_from_sec` —
 nearest millisecond (halves up — `int(sec * 1000 + 0.5)`, round 27;
 Python `round()` is banker's) clamped to ≥ 1 ms; `heartbeat_interval_sec`
@@ -360,7 +412,18 @@ normalized to kernel receipt time at ingestion, so a fast
 provider clock can neither freeze nor fast-forward the heartbeat
 ladder; a stamp in the PAST is retained VERBATIM as a
 dedupe/ordering key and MUST NEVER feed elapsed-time or liveness
-math (round-28 fix). `last_seen_at` is always kernel receipt
+math (round-28 fix). The normalization MUST be applied through
+the canonical `clamp_provider_stamp` helper (round 29) so every
+provider-stamp ingress path shares one implementation of the
+rule. Dedup keys are scoped to the binding (round 29): the
+`checked_at` liveness stamp dedupes on `(assignment_id,
+accepted_stamp)` — a ping carries no call correlator — while the
+`observed_at` call-state stamp dedupes on `(assignment_id,
+lease_or_call, accepted_stamp)`; in both scopes a stamp replayed
+by a NEW binding can never collide with a superseded binding's
+recorded dedup entry, so a
+past-skewed stamp stays a harmless verbatim key instead of a
+false duplicate. `last_seen_at` is always kernel receipt
 time and every timer stays kernel-clock.
 
 ### Requirement: Reregister supersedes a live binding, register does not (round 28)
@@ -382,9 +445,25 @@ FRESH `assignment_id` MUST be minted, and live leases MUST be
 preserved — reconciled against `state_snapshot` when present,
 preserved WITHOUT reconciliation when absent (the binding
 hand-over alone does not kill calls). A `state_snapshot` is
-authoritative ONLY for leases in a `dialing`-or-later phase: an
+authoritative ONLY for leases in a `dialing`-or-later phase —
+formally, leases whose phase is a member of the contract constant
+`SNAPSHOT_RECONCILED_PHASES` (`DIALING`/`ALERTING`/`ACTIVE`/
+`TERMINATING`, round 29): an
 undialed `ACQUIRED` grant is pre-dial, so an empty snapshot MUST
-NOT kill it. A `provider.register` on an already-live binding MUST
+NOT kill it, and a `RINGING` lease reached via
+`ACQUIRED -> RINGING` preemption is excluded the same way.
+Reregister is deterministic under a reconnect storm (round 29):
+the supersede applies to the line's CURRENT live binding —
+whatever it is at the instant the mutation runs, including a
+binding minted moments earlier by a racing `provider.reregister`
+— so the outcome is sequential last-writer-wins, never a
+"reregister rejected on an already-reregistered binding" verdict.
+Every `provider.*` fact carrying a SUPERSEDED `assignment_id`
+(ping/liveness, call-state, ring, snapshot, capability update)
+MUST resolve through the closed-assignment ring and be rejected
+`STALE_TOKEN` (round 29), and the adapter MUST close the
+superseded control socket after delivering the supersede reply.
+A `provider.register` on an already-live binding MUST
 be rejected `INVALID_STATE` — reconnect inside the grace window
 uses `provider.reregister`.
 
@@ -424,7 +503,10 @@ the state clears on the later `disconnected` report.
 its default pool shape (`mode=SHARED_POOL`, `owner_agent_id=None`,
 `claimable` defaulting to `True`) and MUST reject an existing
 `line_id` with `INVALID_ARGUMENT`; the new line is visible
-immediately as `unbound` on the listings. `admin.configure_line`
+immediately as `unbound` on the listings. The configured-line
+count is bounded by `MAX_LINES_TOTAL` (256, round 29):
+`admin.provision_line` beyond the cap MUST be rejected
+`RESOURCE_EXHAUSTED`. `admin.configure_line`
 MUST accept `profile?` (the administrative label, ≤128 chars,
 `None` = unchanged, no clear op). `admin.remove_line` MUST refuse
 while another configured line's `forward_via_line` targets it and
