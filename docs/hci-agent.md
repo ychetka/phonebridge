@@ -51,6 +51,16 @@ It does **not** run bluetoothd, does not pair phones itself, and holds
 no telephony state — the container-side `bluetoothd` performs pairing
 through the virtual adapter exactly as it would for a local dongle.
 
+**Bundle audio-stack note (round 28):** inside the container,
+WirePlumber is configured WITHOUT registering an HFP AG
+`Profile1` handler — PipeWire Telephony (the oFono-compatible
+surface behind `org.pipewire.Telephony`, design §9) is the SOLE
+owner of the HFP Audio-Gateway role. WirePlumber's bluez5
+monitoring is scoped by an adapter filter, or its telephony support
+is disabled outright, so it can never double-register the AG and
+race the Telephony plugin — consistent with the static
+`node.autoconnect=false` routing rule of design §6.4.
+
 ## §2. Wire protocol (V1)
 
 Two channels per line, both always dialing *into* the container's
@@ -60,14 +70,17 @@ per-line listener (NAT-safe, consistent with the provider model):
 
 Length-prefixed frames: `uint8 kind · uint16 BE len · uint32 BE
 ctrl_seq · payload`, where `len` counts `ctrl_seq + payload` (all
-bytes after the `len` field itself). `ctrl_seq` is a per-session
+bytes after the `len` field itself). `len >= 4` always (round 28):
+even a payload-less frame carries the 4-byte `ctrl_seq`, so a
+declared `len` below 4 is a framing violation exactly like an
+overlong one. `ctrl_seq` is a per-session
 monotonic counter assigned by each sender independently
 (agent→container and container→agent sequences are separate).
 
 | kind | direction | payload |
 |---|---|---|
 | `0x01` HCI_PASSTHRU | both | HCI packet prefixed with its H4 type byte (`0x01` cmd / `0x02` ACL / `0x04` evt); the byte is synthesized from the USB endpoint class |
-| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the **long-lived per-line pre-shared secret** from `agent_token_file` (round 23 fix — earlier drafts wrongly called it a single-use credential; it is re-presented on EVERY control session, sent inside the authenticated tunnel only). The container validates `token` AND the tunnel peer identity together — WireGuard `/32` peer public key or mTLS client cert CN — both MUST map to the same `line_id`; either check failing rejects the session |
+| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the **long-lived per-line pre-shared secret** from `agent_token_file` (round 23 fix — earlier drafts wrongly called it a single-use credential; it is re-presented on EVERY control session, sent inside the authenticated tunnel only). On WAN profiles the container validates `token` AND the tunnel peer identity together — WireGuard `/32` peer public key or mTLS client cert CN — both MUST map to the same `line_id`; either check failing rejects the session. On a co-located `127.0.0.1` endpoint the peer-identity factor does not exist (loopback is a one-host trust domain, round 28) — the `token` alone authenticates, and a UDS variant may substitute `SO_PEERCRED` (§6) |
 | `0x11` HELLO_ACK | container→ | `{accepted, line_id, heartbeat_interval_ms, server_time, session_nonce}` or reject+close — `session_nonce` is a fresh `uint32` minted per control session (round 20); the agent MUST echo it in every media-UDP datagram of this session |
 | `0x12` HEARTBEAT | agent→ | `{seq, usb_ok, hci_ok}` every `heartbeat_interval_ms` |
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
@@ -156,7 +169,10 @@ live in the vhci experiment. Therefore:
   only flow control.
 - Implementation note (CODING_HAZARDS rule 7): although `len` admits
   up to 65535 bytes, both ends MUST enforce
-  `MAX_CTRL_FRAME_LEN = 4096` when parsing the TCP stream — a
+  `MAX_CTRL_FRAME_LEN = 4096` when parsing the TCP stream — the cap
+  applies to the FULL received frame INCLUDING the 3-byte
+  `kind`/`len` header (round 28), so the declared `len` must
+  satisfy `4 <= len <= MAX_CTRL_FRAME_LEN - 3` — a
   desynchronized stream must fail fast instead of letting the
   allocator chase a garbage length field (HCI ACL/event payloads are
   ≲1 KiB; HELLO/STATUS JSON fits easily).
@@ -261,7 +277,13 @@ SCO buffer geometry a real dongle negotiates over USB descriptors
 does not exist on a virtual adapter — behind `/dev/vhci` the feeder
 IS the controller, so it declares the synchronous geometry itself:
 it answers `HCI_Read_Buffer_Size` (and the synchronous-flow-control
-queries) with `sco_data_packet_len = 60` — the mSBC profile — and
+queries) with `sco_data_packet_len = 60` — the mSBC profile —
+LOCALLY, consuming the command at the feeder and NEVER forwarding it
+to the physical dongle over the tunnel (round 28 — forwarding it
+would produce TWO `0x0e` Command Complete events for one command:
+one from the real controller and one from the feeder's answer, and
+the kernel's `ncmd` accounting would desynchronize the command
+flow-control window) — and
 emits SCO packets of exactly that negotiated length
 (1 mSBC frame per HCI packet), before any sync connection is
 accepted. If the kernel side ever reports a different length (e.g.
@@ -356,7 +378,13 @@ dongle:
   reset:
     on_start: false
     on_watchdog: true                # power-cycle on DONGLE_DEAD
-    command: "uhubctl -l 1-1 -p 4 -a cycle"   # host-specific, optional
+    command: ["uhubctl", "-l", "1-1", "-p", "4", "-a", "cycle"]
+                                             # host-specific, optional;
+                                             # execve-style argv list —
+                                             # NEVER a shell string
+                                             # (round 28: no shell =
+                                             # no injection, no quoting
+                                             # surprises)
                                              # (port 4 of hub 1-1 = usb_path 1-1.4)
 
 transport:
@@ -419,7 +447,9 @@ comparison on both ends) — an operator cannot be expected to
 `docker exec` into bluetoothctl per line. The container therefore
 ships a managed BlueZ `org.bluez.Agent1` that REJECTS every pairing
 attempt by default; `admin.pair_window {line_id, duration_sec}`
-(default 60 s) sets `Pairable` on that line's adapter only and
+(required, `0 < duration_sec <= 300` — `PairWindowRequest` rejects
+out-of-range values, no clamp and no default, round 28) sets
+`Pairable` on that line's adapter only and
 auto-confirms the SSP passkey comparison for the window's duration.
 The window, the adapter (by `adapter_mac`), and any discovered
 devices are exposed through the admin surface (`phonebridgectl` /
@@ -451,9 +481,19 @@ every failure source, because a virtual adapter never wedges the kernel.
   container (design §2.1 requires it to be served by a host-side
   hci-agent "exactly like a remote Pi"), the canonical tunnel
   endpoint is the loopback address `127.0.0.1`: the feeder binds
-  its listener there and the host-local agent dials it — the same
-  authenticated-tunnel rule applies, loopback merely replaces the
-  tunnel interface IP.
+  its listener there and the host-local agent dials it — loopback
+  merely replaces the tunnel interface IP. The AUTHENTICATION model
+  differs though (round 28): loopback is a single trust domain —
+  only processes already on that host can reach `127.0.0.1`, so
+  there is no tunnel peer to authenticate against and the two-factor
+  rule relaxes to the mandatory `agent.token` alone (the
+  HELLO-token → `line_id` binding is still enforced); the peer-key
+  / mTLS-CN second factor applies only to WAN profiles where a
+  foreign host could hold a leaked token. If a co-located variant
+  ever carries the control channel on a Unix socket instead of
+  loopback TCP, `SO_PEERCRED` supplies the equivalent peer check —
+  the same one-host trust domain, expressed as a uid credential
+  rather than an address.
 - WireGuard peer isolation (round 18): the container-side server
   config MUST pin each peer to `AllowedIPs = <peer>/32` and MUST NOT
   forward between peers — a compromised agent host must not be able

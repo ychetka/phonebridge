@@ -22,6 +22,7 @@ this directory are the canonical archived versions referenced by
 | SA_carbon_review_15 | 25 | v0.0.19 → v0.0.20 — blocker-level audit (Bluetooth netns, claim events, token redaction) |
 | SA_carbon_review_16 | 26 | v0.0.20 → v0.0.21 — blind full-slice audit of the round-25 consolidation |
 | SA_carbon_review_17 | 27 | v0.0.21 → v0.0.22 — Phase-0 paranoid audit, 80 findings |
+| SA_carbon_review_18 | 28 | v0.0.22 → v0.0.23 — blind paranoid audit of the post-freeze draft (Gemini 4 Carbon High), 33 findings |
 | SA_argon_review | parallel | early bootstrap/spec-stage review |
 | SA_argon_review3 | parallel | rounds 11–14 slice vs CODING_HAZARDS/REVIEW_HAZARDS |
 | SA_argon_review5 | parallel | v0.0.8 slice review |

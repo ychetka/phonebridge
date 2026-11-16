@@ -106,8 +106,10 @@ referenced sections.
   `bluez_input.*`/`bluez_output.*`, mSBC assumption-checked at call
   setup (warn if CVSD negotiated).
 - Line liveness: per-line transport session + ping; missed pings ->
-  degraded -> down on the LIVENESS axis (reachable /
-  ws_disconnected / unreachable), surfaced as
+  degraded -> down on the LIVENESS axis (reachable / degraded /
+  ws_disconnected / unreachable — `degraded` is the kernel-computed
+  middle rung of the heartbeat ladder `reachable -> degraded ->
+  unreachable`, never a provider-reported fact, round 28), surfaced as
   `event.line_health_changed` (round 25 — call occupancy
   `LineState` and provider health were split into orthogonal axes;
   a missed ping can never overwrite a `BUSY` call fact).
@@ -241,9 +243,13 @@ interface LineProviderConfig {
 - **Reconnect = re-register** (`provider.reregister`, idempotent;
   preserves lease state during the grace window).
 - Liveness: `provider.ping`; missed pings escalate the binding's
-  `LivenessState` `reachable` -> `unreachable` via the
+  `LivenessState` `reachable` -> `degraded` -> `unreachable` via the
   `heartbeat_degraded_after`/`heartbeat_down_after` ladder and
-  surface as `event.line_health_changed` (interval and rungs
+  surface as `event.line_health_changed` — elapsed silence is
+  measured on kernel receipt time (`now - binding.last_seen_at`),
+  the comparison is inclusive (`>=`), and `degraded` is a
+  kernel-computed rung, never a provider-reported fact (round 28;
+  interval and rungs
   admin-configurable; `DEGRADED`/`DOWN` are no longer `LineState`
   members since round 25).
 - Two distinct failure levels (round 20 — resolves the §5.4
@@ -328,7 +334,9 @@ type Intent   = "dial_out" | "receive_inbound" | "exclusive_line";
 // Occupancy axis ONLY (round 25 — RESERVED had no transitions;
 // DEGRADED/DOWN moved to the liveness axis):
 type LineState     = "FREE"|"BUSY"|"RINGING_LOCKED";
-type LivenessState = "reachable"|"ws_disconnected"|"unreachable"|"unbound";
+type LivenessState = "reachable"|"degraded"|"ws_disconnected"|"unreachable"|"unbound";
+// "degraded" is the kernel-computed middle rung of the heartbeat
+// ladder (round 28) — never a provider-reported fact.
 // "unbound" is a LineSummary listing value for provider-less lines —
 // never an event.line_health_changed endpoint (round 26).
 type LineSummary = { line_id: string, caps: Intent[], state: LineState,
@@ -413,7 +421,8 @@ waiting for this reply.
 `event.incoming_call{line_id, call_token, caller_id?,
 expires_at}` (first valid `call.accept` wins),
 `event.line_acquired`, `event.queue_updated`,
-`event.missed_call{line_id, caller_id?, reason, voicemail_ref?}`,
+`event.missed_call{line_id, caller_id?, reason}` (`voicemail_ref`
+removed round 27 — no producer ever minted it),
 `event.line_state_changed{line_id, old_state, new_state, reason?}`,
 `event.audio_ready{lease_id, line_id}` (§5.5),
 `event.call_state_changed{lease_id, line_id, state, reason?,
@@ -575,9 +584,10 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   scope + subject_id), `lines` (`line_id`, `adapter_mac`,
   `paired_phone_mac`, `transport_profile`, `claimable`,
   `accept_window_sec`, `fallback_policy_json`,
-  `allowed_number_types_json`, `timeouts_json`),
+  `allowed_number_types_json`, `timeouts_json`, `profile` — the
+  administrative label carried on the assignment, round 28),
   `line_assignments` (`assignment_id`, `line_id`,
-  `owner_agent_id`, `mode`, `idle_revoke_after_sec`,
+  `owner_agent_id`, `mode`, `idle_revoke_after_sec`, `profile`,
   `last_seen_at` — required since round 25: without it the
   alert-only idle clock restarts from zero on every daemon restart),
   and `escalation_hooks`.
@@ -601,7 +611,16 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   the two writes leaves SQLite one mutation behind — bounded and
   surfaced: the store rows are rehydrated as `initial_lines` on next
   boot, and a failed write-through marks the line `config_stale`
-  in observability until a succeeding write resyncs it.
+  in observability until a succeeding write resyncs it. The same
+  write-through path carries `last_seen_at` refreshes — stamped on
+  `drop_session` closing the owner's last session and on owner line
+  operations (round 28 — a stamp kept only in memory would restart
+  the idle clock on every reboot; a bare `ingest_ring` never stamps
+  it). Line-lifecycle admin ops follow the same kernel-first
+  ordering (round 28): `admin.provision_line` creates the kernel
+  record then upserts the `lines` row; `admin.remove_line` deletes
+  the kernel record then drops the row — a failed precondition
+  never reaches the store.
   `config_stale` (round 27) is an ADAPTER-side observability flag,
   not a contract field: the admin adapter keeps a per-line
   write-behind marker in its own bookkeeping and surfaces it on the
@@ -680,7 +699,10 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
    reports the ring's `disconnected` (caller hangup / carrier
    voicemail timeout) or a bounded `ring_drain_ttl_sec` (~60 s)
    elapses, whichever first — plus a best-effort `line.hangup` may
-   be issued to shorten the drain. Without this the FIFO queue could
+   be issued to shorten the drain ONLY on paths where the gateway
+   rejects the call (the `reject` fallback policy, round 28 — never
+   on `no_pickup`/missed outcomes where the caller already left,
+   and never on the handset-answered `external_call` path). Without this the FIFO queue could
    hand a still-ringing line to the next `call.dial`, and a
    `state_snapshot` would re-register the same physical ring as a
    NEW `incoming_call`.
@@ -773,6 +795,26 @@ removed.
   lease then gets FRESH provider media credentials via
   `line.reattach_media` — media tokens are one-shot and did not
   survive the dropped socket (round 25).
+- **Half-open supersede (round 28):** a `provider.reregister` on a
+  live REACHABLE binding — the provider's fresh control channel
+  arrived before the old socket's death was even detected — is a
+  legal supersede, not an error: the old binding is marked
+  superseded, a FRESH `assignment_id` is minted, and live leases
+  are preserved (reconciled against `state_snapshot` when present,
+  preserved unreconciled when absent — the snapshot is
+  authoritative only for `dialing`-or-later leases, so an undialed
+  `ACQUIRED` grant survives an empty snapshot). A `provider.register`
+  on an already-live binding is `INVALID_STATE`.
+- **Dead-binding cleanup at the mutation (round 28):** commands
+  queued for a binding that dies or is superseded are handled
+  INSIDE the killing/replacing mutation — entries for leases that
+  survive a re-bind (`line.hangup`, `line.send_dtmf`,
+  `line.reattach_media`) are retargeted to the new `assignment_id`,
+  undeliverable in-flight `line.dial`/`line.answer` are dropped
+  fail-closed with lease teardowns minted in the same transaction;
+  `drain_provider_commands` keeps only a defensive drop for a
+  vanished-binding command (`line.revoke` bypasses it while the
+  control channel is still open).
 - **Provider-process restart mid-call (round 25):** a `LineProvider`
   restarted by its supervisor inside the grace window returns from
   `GetCalls()` with EMPTY memory — it cannot echo `lease_id`. To
@@ -964,11 +1006,18 @@ Design consequences:
   split keeps the coordination explicit: muting at the provider
   without the router-side drain would replay 2-3 s of queued agent
   speech delayed after the tones (or swallow it during the mute).
-  **Watermark semantics (round 25):** the post-DTMF `0x02` frame is
-  timestamped — the MediaRouter discards only queued uplink frames
-  whose enqueue timestamp ≤ the flush timestamp, so TTS chunks the
-  agent submitted AFTER `call.send_dtmf` returned survive the flush;
-  a timestamp-less drain would silently eat fresh speech.
+  **Watermark semantics (round 25; clock domain fixed round 28):**
+  the post-DTMF `0x02` frame is timestamped — the MediaRouter
+  discards only queued uplink frames whose `timestamp_ms` ≤ the
+  flush's `timestamp_ms`, so TTS chunks the agent submitted AFTER
+  `call.send_dtmf` returned survive the flush;
+  a timestamp-less drain would silently eat fresh speech. The
+  flush's `timestamp_ms` rides the AGENT'S UPLINK STREAM clock
+  (round 28): the LineProvider stamps the `timestamp_ms` value of
+  the last agent `0x01` frame it consumed before muting uplink for
+  the DTMF segment — `0` when no frame was consumed yet — never a
+  router-local wall-clock stamp, so the two clocks need no
+  alignment for the comparison to be meaningful.
 
 ### §6.5 Remote-line audio transport (round 12)
 
@@ -1010,7 +1059,11 @@ control-TCP. A QUIC/multiplexed-streams unification is a V2 track.
   no `0x02` travelling toward the agent on downlink. Agent-side
   DTMF itself travels exclusively via `call.send_dtmf`, and the
   LineProvider substitutes the tones into the uplink stream
-  locally.
+  locally. The `0x02` watermark clock domain is the sender's stream
+  clock (round 28 — see §6.4): the provider-emitted flush carries
+  the `timestamp_ms` of the last agent `0x01` frame the
+  LineProvider consumed before the DTMF mute, so the router drops
+  exactly the frames the provider never heard.
 
 ## §7. Events and universal fan-out
 
@@ -1030,9 +1083,15 @@ Three primitives only - no broker in v1:
    (default 2 s/5 s), HTTPS only for remote hosts, and an SSRF
    egress guard — configured URLs resolving to loopback/link-local/
    RFC-1918 are rejected at admin-config time unless the admin set
-   `allow_private_webhooks:true` on the hook (the gateway itself
+   `allow_private_webhooks:true` on the hook, AND the check is
+   repeated on the RESOLVED IP at connection time for every POST
+   (round 28 — DNS rebinding: a hostname that resolved publicly at
+   config save can re-resolve to a private address by delivery
+   time, so the config-time check alone is insufficient; the
+   connect path pins and validates the actual peer address). The
+   gateway itself
    binds only loopback/wg0; a webhook is the one daemon-originated
-   egress an operator can point anywhere).
+   egress an operator can point anywhere.
 3. **Exec / file-drop** - thin hook: run a command or drop a file
    per event type (wake mechanisms for sleeping agents). Exec
    hooks are hardened (round 23, review-12 M7; limits round 25):
@@ -1045,8 +1104,11 @@ Three primitives only - no broker in v1:
    per-hook concurrency cap of 1 queued run (later triggers
    coalesce), and cgroup-less memory discipline via a bounded
    stdin payload (≤64 KiB). File-drop hooks write `0600` files into
-   a `0700` spool dir owned by the `phonebridge` group, with a
-   TTL sweep (default 5 min) so stale wake files never pile up.
+   a tmpfs-backed `0700` spool dir owned by the `phonebridge`
+   group, with a
+   TTL sweep (default 5 min) so stale wake files never pile up
+   (tmpfs keeps wake payloads — which can carry caller PII — off
+   durable storage entirely, round 28).
 
 Audience routing (round 23): `event.idle_alert` is `admin`-audience
 only — socket fan-out delivers it to sessions holding the `admin`
@@ -1124,7 +1186,15 @@ human-initiated EXTERNAL call (the owner dialed or answered on the
 handset itself): the line goes `BUSY` with reason `external_call`,
 no agent lease is minted and no PipeWire bridge is attached (audio
 stays on the phone), and the gateway sends NO `Hangup` — the line
-returns to `FREE` when the provider reports the call gone. Each
+returns to `FREE` when the provider reports the call gone. The
+symmetric handset-answered-ring case (round 28): an `active`
+update carrying a `call_token` on a still `RINGING_LOCKED` line
+means a human answered the ringing call on the physical handset
+before any `call.accept` burned the token — the ring closes
+WITHOUT minting a lease and the line goes `BUSY{reason:
+"external_call"}` exactly like a dialed external call (no lease,
+no bridge, no `line.hangup`); it clears on the later
+`disconnected` report. Each
 LineProvider re-resolves its own line's deterministic D-Bus chain
 (`adapter_mac →
 Adapter1.Address → Device1.Adapter → phone_mac → bluez_*` nodes,
@@ -1157,10 +1227,16 @@ status (mirrors the busctl commands used in Phase-0).
     escalation channels;
   - kernel-side the admin surface binds to the narrow
     `LineAdminKernel` interface (round 19; `assign_line` added
-    round 22):
-    `assign_line`/`approve_claim`/`reject_claim`/
-    `revoke_assignment`/`configure_line` — the agent-facing
-    `LineManager` deliberately exposes no privileged mutations;
+    round 22; line lifecycle and listings added rounds 27-28):
+    `provision_line`/`assign_line`/`approve_claim`/`reject_claim`/
+    `revoke_assignment`/`configure_line`/`remove_line`/
+    `list_lines`/`list_leases`/`list_tickets` — the agent-facing
+    `LineManager` deliberately exposes no privileged mutations.
+    `admin.provision_line` (round 28) is the "create" half of the
+    line lifecycle: it mints a configured, quiescent `SHARED_POOL`
+    line (`claimable` default `True`) that appears immediately as
+    `unbound` on the listings until a provider attaches —
+    `configure_line` could only patch an existing row;
   - **headless pairing** (round 19): an in-container BlueZ
     `org.bluez.Agent1` rejects all pairing by default;
     `admin.pair_window {line_id, duration_sec}` opens `Pairable` on
@@ -1190,7 +1266,8 @@ status (mirrors the busctl commands used in Phase-0).
   rejected at the boundary) with sane upper bounds per field (round
   25). `heartbeat_interval_sec` is floored at 0.001 s
   (millisecond granularity — the wire unit is ms) and stamped as
-  `heartbeat_interval_ms = round(sec * 1000)`, min 1 (round 24c).
+  `heartbeat_interval_ms = int(sec * 1000 + 0.5)`, min 1 (round 24c;
+  halves up — Python `round()` is banker's rounding, round 27).
   Changing `heartbeat_interval_sec` NEVER kills a live
   provider session (round 23, review-12 M6): the new interval is
   negotiated at the provider's next
