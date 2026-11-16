@@ -31,6 +31,7 @@ from phonebridge.domain.contract import (
     MAX_CLOCK_SKEW_SEC,
     MAX_CLOSED_ASSIGNMENTS,
     MAX_CLOSED_LEASES,
+    MAX_CLOSED_TICKETS,
     MAX_CTRL_FRAME_LEN,
     MAX_DETAIL_LEN,
     MAX_DTMF_DIGITS,
@@ -59,6 +60,7 @@ from phonebridge.domain.contract import (
     OUTBOX_HARD_CAP,
     OUTBOX_SOFT_CAP,
     PROVIDER_COMMAND_WIRE_NAMES,
+    RING_DEDUP_MIN_GAP_SEC,
     SNAPSHOT_RECONCILED_PHASES,
     SYSTEM_AGENT_PREFIX,
     SYSTEM_FALLBACK_WORKER,
@@ -110,6 +112,7 @@ from phonebridge.domain.contract import (
     LineTimeouts,
     LivenessState,
     MediaCredentials,
+    MediaOverflowEvent,
     MediaReattachResult,
     MediaRole,
     MediaToken,
@@ -154,6 +157,7 @@ from phonebridge.domain.contract import (
     ensure_aware_utc,
     heartbeat_interval_ms_from_sec,
     is_system_agent_id,
+    secure_compare,
     validate_e164_country,
 )
 
@@ -258,6 +262,9 @@ def test_public_surface_exists(_gwt: object) -> None:
         "acquired",
         "dialing",
         "ringing",
+        # Round 31 (SA_swe2_review_1 item 2): the answer-in-flight
+        # phase - accept()'s inbound mirror of DIALING.
+        "answering",
         "alerting",
         "active",
         "terminating",
@@ -543,6 +550,9 @@ def test_naive_datetime_rejected_and_aware_normalized() -> None:
         session_id=SessionId("sess-1"),
         intent=Intent.DIAL_OUT,
         created_at=NOW_UTC,
+        # Round 31 (SA_swe2_review_1 item 37): an ACQUIRED lease MUST
+        # carry its grant deadline.
+        grant_expires_at=NOW_UTC + timedelta(seconds=5),
     )
     with pytest.raises(ValidationError):
         CallLease.model_validate(
@@ -612,6 +622,7 @@ def test_call_lease_answer_defaults_provisional() -> None:
     answered_at is None until an answer is observed. Round 22
     (review-10 CRITICAL-2): the lease carries ``session_id`` - a
     missing session is a ValidationError."""
+    grant_deadline = NOW_UTC + timedelta(seconds=5)
     lease = CallLease(
         lease_id=LeaseId("lease-1"),
         line_id=LineId("line-main"),
@@ -619,11 +630,14 @@ def test_call_lease_answer_defaults_provisional() -> None:
         session_id=SessionId("sess-1"),
         intent=Intent.DIAL_OUT,
         created_at=NOW_UTC,
+        grant_expires_at=grant_deadline,
     )
     assert lease.answered_at is None
     assert lease.answer_confidence == "provisional"
     assert lease.phase == CallPhase.ACQUIRED  # round 20: pre-dial phase
-    assert lease.grant_expires_at is None
+    # Round 31 (SA_swe2_review_1 item 37): the deadline is REQUIRED
+    # on ACQUIRED and must sit at-or-after created_at.
+    assert lease.grant_expires_at == grant_deadline
     assert lease.session_id == SessionId("sess-1")
     with pytest.raises(ValidationError):
         CallLease.model_validate(
@@ -662,9 +676,47 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     for missing in ({}, {"target_country": "MD"}, {"target_number": "+37322212345"}):
         with pytest.raises(ValidationError):
             adapter.validate_python({"policy": "forward_via_line", "line_id": "line-b", **missing})
-    rec = adapter.validate_python({"policy": "record_and_telegram", "channel": "ops-alerts"})
+    rec = adapter.validate_python(
+        {
+            "policy": "record_and_telegram",
+            "channel": "ops-alerts",
+            "announcement_ref": "rec-note",
+        }
+    )
     assert isinstance(rec, RecordAndTelegramFallback)
     assert rec.channel == "ops-alerts"
+    # Round 31 (SA_swe2_review_1 item 26): the recording leg always
+    # announces - ``announcement_ref`` is always populated and
+    # ``max_recording_sec`` bounds the recording independently of
+    # the line's whole-call cap.
+    assert rec.announcement_ref == "rec-note"
+    assert rec.max_recording_sec == 300.0
+    # Round-31 fix round (PR #78 warning 4): the compact
+    # ``record_and_telegram:<channel>`` spelling - and any
+    # pre-round-31 persisted policy JSON - carries no
+    # announcement/recording fields, so BOTH carry defaults that
+    # keep the model constructable: ``builtin:beep`` + 300 s.
+    compact = adapter.validate_python({"policy": "record_and_telegram", "channel": "ops-alerts"})
+    assert isinstance(compact, RecordAndTelegramFallback)
+    assert compact.announcement_ref == "builtin:beep"
+    assert compact.max_recording_sec == 300.0
+    direct = RecordAndTelegramFallback(channel="ops-alerts")
+    assert direct.announcement_ref == "builtin:beep"
+    assert direct.max_recording_sec == 300.0
+    # The widened ref grammar permits namespaced asset ids
+    # (``builtin:beep`` itself) while the ``channel`` field keeps
+    # the strict no-":" split-safe grammar.
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"policy": "record_and_telegram", "channel": "ops:alerts"})
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {
+                "policy": "record_and_telegram",
+                "channel": "ops-alerts",
+                "announcement_ref": "rec-note",
+                "max_recording_sec": 0.0,
+            }
+        )
     announce = adapter.validate_python(
         {"policy": "answer_and_announce", "announcement_ref": "busy-msg-wav"}
     )
@@ -720,6 +772,9 @@ def test_line_admin_kernel_surface() -> None:
         # Round 27 (review-17 items 3/26): the admin inventory surface -
         # line views, live leases, live tickets and line removal.
         "list_lines",
+        # Round 31 (SA_swe2_review_1 item 23): the single-line read
+        # counterpart of list_lines - one full AdminLineView by id.
+        "get_line",
         "list_leases",
         "list_tickets",
         "remove_line",
@@ -794,20 +849,46 @@ def test_event_wire_name_parity() -> None:
     # Doc-side parity: every wire name in the mapping must appear as a
     # table row `| `event.<name>` |` in docs/api-contract.md — and
     # every such row must be covered by the mapping (no orphans in
-    # either direction).
+    # either direction). Round 31 (SA_swe2_review_1): the domain
+    # payload for ``event.media_overflow`` landed while the doc
+    # deliberately keeps it a RESERVED wire name outside the
+    # normative table ("absent ... until then") - the event is
+    # therefore pinned against the doc's reserved-name paragraph
+    # instead of a table row, and the exemption lifts when the wire
+    # document promotes it (a later batch, outside this change's
+    # scope).
     api_contract = (Path(__file__).parents[1] / "docs" / "api-contract.md").read_text(
         encoding="utf-8"
     )
     doc_event_rows = set(re.findall(r"^\|\s*`(event\.[a-z_]+)`\s*\|", api_contract, flags=re.M))
-    assert doc_event_rows == set(EVENT_WIRE_NAMES.values())
+    reserved_rows = {"event.media_overflow"}
+    assert doc_event_rows == set(EVENT_WIRE_NAMES.values()) - reserved_rows
+    # Structural pin on the reserved event (round-31 fix round, PR
+    # #78 minor 8 - replaces the earlier doc-substring asserts):
+    # the enum member exists, its wire spelling is exact, the
+    # payload mapping lands on MediaOverflowEvent and the payload
+    # field set is exactly {lease_id, line_id} - the bounded
+    # identifiers-only shape the overflow episode fact must keep.
+    assert EventName.MEDIA_OVERFLOW in EVENT_PAYLOAD_TYPES
+    assert EVENT_WIRE_NAMES[EventName.MEDIA_OVERFLOW] == "event.media_overflow"
+    assert EVENT_PAYLOAD_TYPES[EventName.MEDIA_OVERFLOW] is MediaOverflowEvent
+    assert set(MediaOverflowEvent.__pydantic_fields__) == {"lease_id", "line_id"}
+    assert set(MediaOverflowEvent(lease_id=LeaseId("l-1"), line_id=LineId("x")).model_dump()) == {
+        "lease_id",
+        "line_id",
+    }
 
     # Payload parity: every EventName has exactly one payload model,
-    # and the model's field names + optionality match the wire row.
+    # and the model's field names + optionality match the wire row
+    # (the reserved ``event.media_overflow`` carries
+    # ``{lease_id, line_id}`` - pinned structurally above).
     assert set(EVENT_PAYLOAD_TYPES) == set(EventName)
     table = _doc_event_table()
     assert table, "parsed zero event.* payloads - doc table format changed?"
-    assert set(table) == set(EVENT_WIRE_NAMES.values())
+    assert set(table) == set(EVENT_WIRE_NAMES.values()) - reserved_rows
     for name, model in EVENT_PAYLOAD_TYPES.items():
+        if name is EventName.MEDIA_OVERFLOW:
+            continue
         wire_name = EVENT_WIRE_NAMES[name]
         model_fields = model.__pydantic_fields__
         doc_params = table[wire_name]
@@ -875,7 +956,7 @@ def test_event_envelope_and_payloads() -> None:
         caller_id=RedactedString(_RAW_NUMBER),
         # Round 25 (review-15 item 31): fallback_triggered dispatches
         # WORKER policies only - a core policy is unconstructible.
-        policy=RecordAndTelegramFallback(channel="ops-alerts"),
+        policy=RecordAndTelegramFallback(channel="ops-alerts", announcement_ref="rec-note"),
         expires_at=NOW_UTC,
     )
     lsc = LineStateChangedEvent(
@@ -1345,6 +1426,30 @@ class _FakeLineManager(LineManager):
         self._require_live_binding(assignment_id)
         return None
 
+    async def ingest_audio_lost(
+        self,
+        line_id: LineId,
+        assignment_id: contract.AssignmentId,
+        lease_id: LeaseId | None = None,
+    ) -> None:
+        # Round 31 (SA_swe2_review_1 item 4): SCO-loss fact resets
+        # the kernel-side audio_ready latch; ``lease_id=None`` is the
+        # line-scoped reset form.
+        self._require_live_binding(assignment_id)
+        return None
+
+    async def compensate_dial(
+        self,
+        line_id: LineId,
+        assignment_id: contract.AssignmentId,
+        lease_id: LeaseId,
+    ) -> None:
+        # Round 31 (SA_swe2_review_1 item 5): the adapter's
+        # binding-scoped compensation for a rejected/timed-out
+        # line.dial or line.answer - NOT the owner-scoped hangup.
+        self._require_live_binding(assignment_id)
+        return None
+
     async def decide_fallback(self, line_id: LineId, call_token: CallToken) -> FallbackDecision:
         return FallbackDecision(line_id=line_id, call_token=call_token, policy=NoPickupFallback())
 
@@ -1387,10 +1492,11 @@ def test_line_manager_is_abstract() -> None:
 
 async def test_line_manager_async_surface() -> None:
     """Non-e2e async exercise: EVERY abstract method is awaitable and
-    returns its contracted result type (all 25 methods - 23 async +
+    returns its contracted result type (all 27 methods - 25 async +
     the two sync outbox drains; round 30 adds ``ingest_media_state``
     and the ``ProviderRegisterResult`` return on
-    ``register_provider``)."""
+    ``register_provider``, round 31 adds ``ingest_audio_lost`` and
+    ``compensate_dial``)."""
     assert set(LineManager.__abstractmethods__) == {
         "register_intent",
         "acquire",
@@ -1413,6 +1519,11 @@ async def test_line_manager_async_surface() -> None:
         "ingest_ring",
         "ingest_call_state",
         "ingest_audio_ready",
+        # Round 31 (SA_swe2_review_1 items 4/5): the SCO-loss latch
+        # reset and the binding-scoped dial/answer compensation
+        # entry points.
+        "ingest_audio_lost",
+        "compensate_dial",
         # Round 30 (SA_carbon_review_19 slice-A item 1): media
         # attach/detach facts ride their own ingress so the
         # MEDIA_PAIR_TTL_SEC re-attach window has a driver.
@@ -1554,6 +1665,20 @@ async def test_line_manager_async_surface() -> None:
     await mgr.ingest_audio_ready(
         LineId("line-main"), contract.AssignmentId("bind-1"), result.lease_id
     )
+    # Round 31 (SA_swe2_review_1 items 4/5): the SCO-loss latch reset
+    # (lease-scoped AND line-scoped forms) and the binding-scoped
+    # dial/answer compensation are part of the provider-ingress
+    # surface; both ride the live-binding guard too.
+    await mgr.ingest_audio_lost(
+        LineId("line-main"), contract.AssignmentId("bind-1"), result.lease_id
+    )
+    await mgr.ingest_audio_lost(LineId("line-main"), contract.AssignmentId("bind-1"))
+    await mgr.compensate_dial(LineId("line-main"), contract.AssignmentId("bind-1"), result.lease_id)
+    with pytest.raises(PhonebridgeError) as excinfo:
+        await mgr.compensate_dial(
+            LineId("line-main"), contract.AssignmentId("asg-1"), result.lease_id
+        )
+    assert excinfo.value.code is ErrorCode.STALE_TOKEN
     await mgr.drop_session(session)
 
     # --- lifecycle hook + outbox drains (round 20) ---
@@ -1597,6 +1722,10 @@ def test_call_phase_wire_state_parity() -> None:
         CallPhase.ACQUIRED: None,  # pre-dial grant - never emitted
         CallPhase.DIALING: "dialing",
         CallPhase.RINGING: None,  # surfaces as event.incoming_call
+        # Round 31 (SA_swe2_review_1 item 2): answer-in-flight is
+        # transient like TERMINATING - the four-value wire
+        # vocabulary never spells it.
+        CallPhase.ANSWERING: None,
         CallPhase.ALERTING: "alerting",
         CallPhase.ACTIVE: "active",
         CallPhase.TERMINATING: None,  # transient teardown leg
@@ -1625,15 +1754,37 @@ def test_call_phase_forward_matrix() -> None:
         # LINE sub-state, never a lease phase; a ring preempting an
         # undialed grant ends it ENDED.
         CallPhase.ACQUIRED: frozenset({CallPhase.DIALING, CallPhase.ENDED}),
-        CallPhase.DIALING: frozenset({CallPhase.ALERTING, CallPhase.ACTIVE, CallPhase.ENDED}),
-        # The RINGING row stays for enum completeness - the phase is
-        # reserved for wire compat and unreachable on a CallLease.
-        CallPhase.RINGING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
-        CallPhase.ALERTING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
+        CallPhase.DIALING: frozenset(
+            {CallPhase.ALERTING, CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}
+        ),
+        # Round 31 (SA_swe2_review_1 item 2): the RINGING row keeps
+        # an EMPTY target set - the enum member is reserved/dead for
+        # wire compat, no lease may carry it and nothing may reach
+        # it (the former ``RINGING -> ACTIVE/ENDED`` edges implied
+        # the member was still a live phase).
+        CallPhase.RINGING: frozenset(),
+        # ANSWERING is accept()'s answer-in-flight phase - the
+        # inbound mirror of DIALING, advanced only by the provider's
+        # answer confirmation or a disconnected fact.
+        CallPhase.ANSWERING: frozenset({CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}),
+        CallPhase.ALERTING: frozenset({CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}),
         CallPhase.ACTIVE: frozenset({CallPhase.TERMINATING, CallPhase.ENDED}),
         CallPhase.TERMINATING: frozenset({CallPhase.ENDED}),
         CallPhase.ENDED: frozenset(),
     }
+    # Round-31 fix round (PR #78 warning 1): TERMINATING is
+    # reachable from EVERY phase where a call leg may exist -
+    # hangup() parks a possibly-live dialed call in TERMINATING
+    # awaiting the provider's disconnected/hold timeout; ACQUIRED
+    # stays the one pre-dial phase that ends ENDED directly.
+    for phase in (
+        CallPhase.DIALING,
+        CallPhase.ANSWERING,
+        CallPhase.ALERTING,
+        CallPhase.ACTIVE,
+    ):
+        assert CallPhase.TERMINATING in CALL_PHASE_FORWARD_TRANSITIONS[phase]
+    assert CallPhase.TERMINATING not in CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.ACQUIRED]
     # Forward-only shape: no self-loops, nothing leaves ENDED, and a
     # regression (ACTIVE -> DIALING/ALERTING) is never listed.
     assert CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.ENDED] == frozenset()
@@ -1728,6 +1879,20 @@ def test_ensure_aware_utc() -> None:
     plus2 = datetime(2026, 11, 14, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
     assert ensure_aware_utc(plus2) == datetime(2026, 11, 14, 12, 0, 0, tzinfo=timezone.utc)
     assert ensure_aware_utc(plus2).tzinfo is timezone.utc
+    # Round-31 fix round (PR #78 minor 7): the plausibility window
+    # is SYMMETRIC around the injected ``now`` - a far-past stamp
+    # is rejected exactly like a far-future one, so a stale
+    # hydrated/reported stamp can never poison dedup keys,
+    # watermarks or idle-deadline arithmetic.
+    gap = timedelta(days=3650)
+    assert ensure_aware_utc(NOW_UTC + gap, now=NOW_UTC) == NOW_UTC + gap
+    assert ensure_aware_utc(NOW_UTC - gap, now=NOW_UTC) == NOW_UTC - gap
+    with pytest.raises(ValueError, match="max reasonable"):
+        ensure_aware_utc(NOW_UTC + gap + timedelta(seconds=1), now=NOW_UTC)
+    with pytest.raises(ValueError, match="min reasonable"):
+        ensure_aware_utc(NOW_UTC - gap - timedelta(seconds=1), now=NOW_UTC)
+    with pytest.raises(ValueError, match="naive now"):
+        ensure_aware_utc(NOW_UTC, now=datetime(2026, 11, 13, 12, 0, 0))
 
 
 def test_dtmf_pattern() -> None:
@@ -1841,18 +2006,22 @@ class _FakeLineAdminKernel(LineAdminKernel):
     ) -> list[AdminLineView]:
         # Round 27 (review-17 item 3): the admin line view exposes
         # the durable/call ids the agent listing hides.
-        return [
-            AdminLineView(
-                line_id=LineId("line-main"),
-                caps=[Intent.DIAL_OUT],
-                state=LineState.BUSY,
-                liveness=LivenessState.REACHABLE,
-                assignment_id=contract.AssignmentId("asg-1"),
-                owner_agent_id="agent-1",
-                lease_id=LeaseId("l-1"),
-                queue_position=1,
-            )
-        ]
+        return [await self.get_line(LineId("line-main"))]
+
+    async def get_line(self, line_id: LineId) -> AdminLineView:
+        # Round 31 (SA_swe2_review_1 item 23): the single-line read -
+        # one full AdminLineView by id, LINE_NOT_FOUND-shaped lookup
+        # semantics on the wire.
+        return AdminLineView(
+            line_id=line_id,
+            caps=[Intent.DIAL_OUT],
+            state=LineState.BUSY,
+            liveness=LivenessState.REACHABLE,
+            assignment_id=contract.AssignmentId("asg-1"),
+            owner_agent_id="agent-1",
+            lease_id=LeaseId("l-1"),
+            queue_position=1,
+        )
 
     async def list_leases(
         self, *, offset: int = 0, limit: int = contract.MAX_LIST_PAGE
@@ -1865,6 +2034,7 @@ class _FakeLineAdminKernel(LineAdminKernel):
                 session_id=SessionId("sess-1"),
                 intent=Intent.DIAL_OUT,
                 created_at=NOW_UTC,
+                grant_expires_at=NOW_UTC + timedelta(seconds=5),
             )
         ]
 
@@ -1887,17 +2057,28 @@ class _FakeLineAdminKernel(LineAdminKernel):
         claimable: bool | None = None,
         idle_revoke_after: timedelta | None = None,
         timeouts: TimeoutConfig | None = None,
+        adapter_mac: str | None = None,
+        paired_phone_mac: str | None = None,
+        transport_profile: contract.TransportProfile | None = None,
+        line_home_country: str | None = None,
     ) -> LineAssignment:
         # Round 28 (review-18 item 6): the create half of the line
-        # lifecycle - a fresh quiescent SHARED_POOL record.
-        return _assignment()
+        # lifecycle - a fresh quiescent SHARED_POOL record; round 31
+        # (SA_swe2_review_1 item 10) adds the hardware fields.
+        return _assignment(
+            adapter_mac=adapter_mac,
+            paired_phone_mac=paired_phone_mac,
+            transport_profile=transport_profile or "loopback",
+            line_home_country=line_home_country,
+        )
 
     async def revoke_assignment(
         self, assignment_id: contract.AssignmentId, reason: str | None = None
-    ) -> LineAssignment | None:
-        # Round 25 (review-15 item 14): returns the post-revert
-        # SHARED_POOL snapshot for an agent-owned binding.
-        return _assignment()
+    ) -> bool:
+        # Round 31 (SA_swe2_review_1 item 23): the return shrank to a
+        # boolean - True when an agent-owned LineAssignment reverted,
+        # False on the provider-binding path or a tombstone-hit retry.
+        return True
 
     async def configure_line(
         self,
@@ -1911,6 +2092,10 @@ class _FakeLineAdminKernel(LineAdminKernel):
         idle_revoke_after: timedelta | None = None,
         clear_idle_revoke_after: bool = False,
         timeouts: TimeoutConfig | None = None,
+        adapter_mac: str | None = None,
+        paired_phone_mac: str | None = None,
+        transport_profile: contract.TransportProfile | None = None,
+        line_home_country: str | None = None,
     ) -> LineAssignment:
         return _assignment()
 
@@ -1919,13 +2104,15 @@ class _FakeLineAdminKernel(LineAdminKernel):
     ) -> None:
         # Round 30 (SA_carbon_review_19 slice-A item 2): batch
         # store-load hydration - records restore verbatim, no events,
-        # no id rotation.
+        # no id rotation; round 31 (SA_swe2_review_1 item 3) loads
+        # bindings dead (WS_DISCONNECTED, expired orphan deadline).
         return None
 
-    async def restore_line(self, snapshot: LineAssignment | None) -> None:
+    async def restore_line(self, line_id: LineId, snapshot: LineAssignment | None) -> None:
         # Round 30 (SA_carbon_review_19 slice-A item 3): write-through
         # compensation - the ONLY kernel-side rollback hook after a
-        # failed lines-row persistence.
+        # failed lines-row persistence; round 31 (SA_swe2_review_1
+        # item 1) names the target record by line_id.
         return None
 
     def drain_events(self) -> list[EventEnvelope[Any]]:
@@ -1954,14 +2141,21 @@ async def test_line_admin_kernel_all_methods() -> None:
     assert pending[0].claim_id == ClaimId("claim-1")
     assert isinstance((await kernel.list_assignments())[0], LineAssignment)
     assert isinstance((await kernel.list_provider_bindings())[0], ProviderBinding)
+    # Round 31 (SA_swe2_review_1 item 23): the revoke return shrank
+    # to a boolean - True for an agent-owned revert, False on the
+    # provider-binding/idempotent paths.
     post_revert = await kernel.revoke_assignment(contract.AssignmentId("asg-1"), reason="admin")
-    assert isinstance(post_revert, LineAssignment)  # round 25 item 14
+    assert post_revert is True
     # Round 27 (review-17 items 3/26): the admin inventory surface -
     # line views carrying the ids the agent listing hides, plus the
     # lease/ticket listings and the destructive line removal.
     lines = await kernel.list_lines()
     assert isinstance(lines[0], AdminLineView)
     assert lines[0].assignment_id == contract.AssignmentId("asg-1")
+    # Round 31 (SA_swe2_review_1 item 23): the single-line read.
+    detail = await kernel.get_line(LineId("line-main"))
+    assert isinstance(detail, AdminLineView)
+    assert detail.line_id == LineId("line-main")
     assert isinstance((await kernel.list_leases())[0], CallLease)
     assert isinstance((await kernel.list_tickets())[0], QueueTicket)
     # Round 30 (SA_carbon_review_19 slice-B item 1): the paged
@@ -1970,19 +2164,30 @@ async def test_line_admin_kernel_all_methods() -> None:
     assert isinstance((await kernel.list_pending_claims(limit=MAX_LIST_PAGE))[0], PendingClaim)
     assert isinstance((await kernel.list_provider_bindings(offset=0))[0], ProviderBinding)
     # Round 30 (SA_carbon_review_19 slice-A items 2/3): hydration and
-    # the write-through compensation hook are part of the surface.
+    # the write-through compensation hook are part of the surface;
+    # round 31 (SA_swe2_review_1 item 1) names the rollback target
+    # by line_id.
     await kernel.hydrate_lines([_assignment()], [])
-    await kernel.restore_line(_assignment())
-    await kernel.restore_line(None)
+    await kernel.restore_line(LineId("line-main"), _assignment())
+    await kernel.restore_line(LineId("line-main"), None)
     await kernel.remove_line(LineId("line-main"))
     # Round 28 (review-18 item 6): provision_line creates a fresh
-    # quiescent line record.
+    # quiescent line record; round 31 (SA_swe2_review_1 item 10)
+    # accepts the hardware fields.
     provisioned = await kernel.provision_line(
         LineId("line-new"),
         profile="night-line",
         claimable=False,
+        adapter_mac="AA:BB:CC:DD:EE:FF",
+        paired_phone_mac="00:11:22:33:44:55",
+        transport_profile="wireguard",
+        line_home_country="MD",
     )
     assert isinstance(provisioned, LineAssignment)
+    assert provisioned.adapter_mac == "AA:BB:CC:DD:EE:FF"
+    assert provisioned.paired_phone_mac == "00:11:22:33:44:55"
+    assert provisioned.transport_profile == "wireguard"
+    assert provisioned.line_home_country == "MD"
     # Round 25 (item 12): admin surface drains the shared outbox.
     assert isinstance(kernel.drain_events(), list)
     assert isinstance(kernel.drain_provider_commands()[0], ProviderRevokeCommand)
@@ -2386,13 +2591,13 @@ def test_round23_event_schema_freeze() -> None:
         FallbackTriggeredEvent(
             line_id=LineId("line-main"),  # type: ignore[call-arg]
             call_token=CallToken(RedactedString("fb-tok")),
-            policy=RecordAndTelegramFallback(channel="ops-alerts"),
+            policy=RecordAndTelegramFallback(channel="ops-alerts", announcement_ref="rec-note"),
         )
     ft = FallbackTriggeredEvent(
         line_id=LineId("line-main"),
         call_token=CallToken(RedactedString("fb-tok")),
         # Round 25 (review-15 item 31): worker policies only.
-        policy=RecordAndTelegramFallback(channel="ops-alerts"),
+        policy=RecordAndTelegramFallback(channel="ops-alerts", announcement_ref="rec-note"),
         expires_at=NOW_UTC,
     )
     assert ft.expires_at == NOW_UTC
@@ -2868,7 +3073,7 @@ def test_fallback_decision_token_matches_worker_policy() -> None:
     ``fallback_call_token`` IS the worker delivery - a worker policy
     must carry it, a core policy must never carry it, and
     ``fallback_triggered`` dispatches worker policies only."""
-    worker = RecordAndTelegramFallback(channel="ops-alerts")
+    worker = RecordAndTelegramFallback(channel="ops-alerts", announcement_ref="rec-note")
     core = NoPickupFallback()
     tok = CallToken(RedactedString("fb-tok"))
     base = {
@@ -4028,7 +4233,7 @@ def test_checked_id_strict_charset() -> None:
             AgentAudience(agent_id=bad)
         # ``_CheckedId`` carriers: worker-policy params.
         with pytest.raises(ValidationError):
-            RecordAndTelegramFallback(channel=bad)
+            RecordAndTelegramFallback(channel=bad, announcement_ref="rec-note")
         with pytest.raises(ValidationError):
             AnswerAndAnnounceFallback(announcement_ref=bad)
         # ``_CheckedAssignmentId`` carrier.
@@ -4373,10 +4578,16 @@ def test_provider_active_call_correlators_xor() -> None:
     assert mixed.lease_id is None
 
 
-def test_call_lease_audio_ready_received_flag() -> None:
-    """Round 27 (review-17 item 53): ``CallLease.audio_ready_received``
-    defaults to False and records the provider's local BT SCO path
-    report - the flag the ``send_dtmf`` gate consumes."""
+def test_call_lease_carries_no_audio_latch() -> None:
+    """Round 31 (SA_swe2_review_1 item 4): the ``audio_ready`` flag
+    lives KERNEL-SIDE, not on the frozen lease - the
+    ``audio_ready_received`` field that round 27 added was removed
+    because media-latch state mutates per attachment epoch while
+    ``CallLease`` records the call's identity/timing facts. The
+    kernel resets the latch on ``provider.audio_lost`` /
+    ``provider.reregister`` / a provider media-socket drop and
+    ``send_dtmf`` consults it."""
+    assert "audio_ready_received" not in CallLease.__pydantic_fields__
     lease = CallLease(
         lease_id=LeaseId("l-1"),
         line_id=LineId("line-main"),
@@ -4384,10 +4595,9 @@ def test_call_lease_audio_ready_received_flag() -> None:
         session_id=SessionId("sess-1"),
         intent=Intent.DIAL_OUT,
         created_at=NOW_UTC,
+        grant_expires_at=NOW_UTC + timedelta(seconds=5),
     )
-    assert lease.audio_ready_received is False
-    ready = lease.model_copy(update={"audio_ready_received": True})
-    assert ready.audio_ready_received is True
+    assert not hasattr(lease, "audio_ready_received")
 
 
 def test_provider_media_reattach_models() -> None:
@@ -4676,6 +4886,7 @@ def test_call_lease_profile() -> None:
         "session_id": SessionId("sess-1"),
         "intent": Intent.DIAL_OUT,
         "created_at": NOW_UTC,
+        "grant_expires_at": NOW_UTC + timedelta(seconds=5),
     }
     assert CallLease(**base, profile="front-desk").profile == "front-desk"
     assert CallLease(**base).profile is None
@@ -4798,19 +5009,25 @@ def test_round29_bounds_constants_exported() -> None:
         assert name in contract.__all__
     assert MAX_IDEMPOTENCY_KEYS_PER_SESSION == 256
     assert MAX_LINES_TOTAL == 256
-    assert MAX_LIST_PAGE == 256
+    # Round 31 (SA_swe2_review_1 item 9): the shared list page cap
+    # shrank from 256 to 64 - a full page of ``meta``-carrying rows
+    # overflowed a single wire frame.
+    assert MAX_LIST_PAGE == 64
 
 
 def test_snapshot_reconciled_phases() -> None:
-    """Round 29 (SA_quant_review_1 slice-A item 7): the formal
-    "dialing-or-later" set for ``state_snapshot`` reconciliation is
-    pinned verbatim - ``RINGING`` is excluded because an
-    ``ACQUIRED -> RINGING`` preemption grant was never dialed, and
-    ``ACQUIRED``/``ENDED`` can never be reconciled against a
-    provider-side call view."""
+    """Round 29 (SA_quant_review_1 slice-A item 7; ``ANSWERING``
+    added round 31, SA_swe2_review_1 item 2): the formal
+    "dial-or-answer-commanded" set for ``state_snapshot``
+    reconciliation is pinned verbatim - ``ANSWERING`` belongs
+    because the ``line.answer`` command already reached the
+    provider, ``RINGING`` is excluded because no lease may carry
+    the reserved member at all, and ``ACQUIRED``/``ENDED`` can
+    never be reconciled against a provider-side call view."""
     assert SNAPSHOT_RECONCILED_PHASES == frozenset(
         {
             CallPhase.DIALING,
+            CallPhase.ANSWERING,
             CallPhase.ALERTING,
             CallPhase.ACTIVE,
             CallPhase.TERMINATING,
@@ -4884,6 +5101,7 @@ def test_checked_id_length_boundaries() -> None:
             session_id=SessionId("sess-1"),
             intent=Intent.DIAL_OUT,
             created_at=NOW_UTC,
+            grant_expires_at=NOW_UTC + timedelta(seconds=5),
         )
 
     def ticket_session(raw: str) -> QueueTicket:
@@ -4911,7 +5129,7 @@ def test_checked_id_length_boundaries() -> None:
         lambda raw: _ticket(raw, 1).ticket_id,
         lambda raw: claim(raw).claim_id,
         lambda raw: _assignment(assignment_id=contract.AssignmentId(raw)).assignment_id,
-        lambda raw: RecordAndTelegramFallback(channel=raw).channel,
+        lambda raw: RecordAndTelegramFallback(channel=raw, announcement_ref="rec-note").channel,
         lambda raw: AnswerAndAnnounceFallback(announcement_ref=raw).announcement_ref,
         lambda raw: AgentAudience(agent_id=raw).agent_id,
     )
@@ -5173,25 +5391,49 @@ def test_call_lease_phase_cross_field_invariants() -> None:
     # on LineState.RINGING_LOCKED and the line's ring slot.
     with pytest.raises(ValidationError):
         CallLease(**base, phase=CallPhase.RINGING)
-    # Pre-established phases forbid answer facts.
-    for early in (CallPhase.ACQUIRED, CallPhase.DIALING, CallPhase.ALERTING):
+    # Pre-established phases forbid answer facts - round 31
+    # (SA_swe2_review_1 item 2) adds ANSWERING, the answer-in-flight
+    # phase that precedes any confirmed establishment.
+    for early in (
+        CallPhase.ACQUIRED,
+        CallPhase.DIALING,
+        CallPhase.ANSWERING,
+        CallPhase.ALERTING,
+    ):
         with pytest.raises(ValidationError):
             CallLease(**base, phase=early, answered_at=NOW_UTC)
         with pytest.raises(ValidationError):
             CallLease(**base, phase=early, answer_confidence="confirmed")
-        # ...but the grant TTL is still live in those phases.
-        CallLease(**base, phase=early, grant_expires_at=NOW_UTC + timedelta(seconds=5))
-    # Established/terminating/ended phases consume the grant TTL.
-    for late in (CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED):
+    # ...but the grant TTL rides only the phases that precede the
+    # accept's consumption of the grant - ACQUIRED carries it
+    # (REQUIRED there, round 31 item 37), DIALING/ALERTING may still
+    # document the consumed deadline.
+    for grant_phase in (CallPhase.ACQUIRED, CallPhase.DIALING, CallPhase.ALERTING):
+        CallLease(**base, phase=grant_phase, grant_expires_at=NOW_UTC + timedelta(seconds=5))
+    # From ANSWERING on the grant is spent - the field MUST be gone.
+    for late in (
+        CallPhase.ANSWERING,
+        CallPhase.ACTIVE,
+        CallPhase.TERMINATING,
+        CallPhase.ENDED,
+    ):
         with pytest.raises(ValidationError):
             CallLease(**base, phase=late, grant_expires_at=NOW_UTC + timedelta(seconds=5))
-        # ...and answer facts are legal there.
+    for late in (CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED):
+        # ...and answer facts are legal once the call is established.
         CallLease(
             **base,
             phase=late,
             answered_at=NOW_UTC,
             answer_confidence="confirmed",
         )
+    # Round 31 (SA_swe2_review_1 item 37): the ACQUIRED deadline is
+    # REQUIRED (an undialed lease without one would park the line
+    # forever) and must sit at-or-after created_at.
+    with pytest.raises(ValidationError):
+        CallLease(**base)  # ACQUIRED without grant_expires_at
+    with pytest.raises(ValidationError):
+        CallLease(**base, grant_expires_at=NOW_UTC - timedelta(seconds=1))
     # model_validate path honors the same rules (hydration cannot
     # smuggle a reserved phase either).
     with pytest.raises(ValidationError):
@@ -5205,7 +5447,13 @@ def test_owner_identity_system_boundary() -> None:
     legitimately owns leases) and is rejected on every DURABLE owner
     or durable-event owner field."""
     # Socket-bound: the fallback worker owns leases legitimately.
-    lease = CallLease(**{**_lease_base(), "owner_agent_id": SYSTEM_FALLBACK_WORKER})
+    lease = CallLease(
+        **{
+            **_lease_base(),
+            "owner_agent_id": SYSTEM_FALLBACK_WORKER,
+            "grant_expires_at": NOW_UTC + timedelta(seconds=5),
+        }
+    )
     assert lease.owner_agent_id == SYSTEM_FALLBACK_WORKER
     # Durable carriers reject the same identity.
     with pytest.raises(ValidationError):
@@ -5257,16 +5505,12 @@ def test_round30_constants_and_models_exported() -> None:
     ):
         assert name in contract.__all__
     assert MAX_HEARTBEAT_INTERVAL_MS == 86_400_000
-    # The hard cap formula is the documented fanout bound: soft cap
-    # + per-session event fanout + per-line admin cascade + live
-    # leases (round 30, SA_carbon_review_19 slice-A item 7).
-    assert OUTBOX_HARD_CAP == (
-        OUTBOX_SOFT_CAP
-        + MAX_SESSIONS_TOTAL
-        + MAX_LINES_TOTAL
-        + (MAX_SESSIONS_TOTAL * MAX_LEASES_PER_SESSION)
-    )
-    assert OUTBOX_HARD_CAP == 5120
+    # Round 31 (SA_swe2_review_1 item 16): the hard cap grew from
+    # the 5120 formula value to a flat 8192 - the worst-case
+    # accounting adds missed-call fanout, queue drain, live-lease
+    # teardown and the admin cascade on top of the soft cap.
+    assert OUTBOX_HARD_CAP == 8192
+    assert OUTBOX_HARD_CAP > OUTBOX_SOFT_CAP
 
 
 def test_heartbeat_interval_ms_guards() -> None:
@@ -5362,8 +5606,29 @@ def test_media_endpoint_bounds_all_carriers() -> None:
     for model, fields in carriers.items():
         for field_name in fields:
             meta = model.__pydantic_fields__[field_name].metadata
-            assert any(getattr(m, "min_length", None) == 1 for m in meta)
+            # Round 31 (SA_swe2_review_1 item 31): the length bound
+            # now rides ``_CheckedMediaEndpoint`` - the shared
+            # validator enforces non-empty + 1..MAX_ENDPOINT_LEN +
+            # the unix://|wss:// scheme vocabulary, and the Field
+            # keeps the schema-visible max_length.
             assert any(getattr(m, "max_length", None) == MAX_ENDPOINT_LEN for m in meta)
+            annotation = model.__pydantic_fields__[field_name].annotation
+            assert annotation is str
+            # The checked alias must be wired in: empty and
+            # scheme-less values are rejected through the validator.
+    for bad in ("", "x" * (MAX_ENDPOINT_LEN + 1), "/run/m.sock", "tcp://h:1"):
+        with pytest.raises(ValidationError):
+            DialResult(
+                lease_id=LeaseId("l-1"),
+                media_endpoint=bad,
+                media_token=MediaToken(RedactedString("mt")),
+            )
+    for good in ("unix:///run/m.sock", "wss://media.internal:7443/phonebridge"):
+        DialResult(
+            lease_id=LeaseId("l-1"),
+            media_endpoint=good,
+            media_token=MediaToken(RedactedString("mt")),
+        )
 
 
 def test_queue_ticket_seq_and_position_bounds() -> None:
@@ -5432,19 +5697,22 @@ def test_admin_line_view_provider_meta_owned_and_bounded() -> None:
     ``AdminLineView.provider_meta`` shares the ``_bounded_meta``
     contract - entry/key/value caps enforced and the model owns a
     deep copy of the caller's map."""
+    # Round 31 (SA_swe2_review_1 item 35): provider_meta is provider
+    # metadata - a UNBOUND row has no provider, so the invariant
+    # pins the meta-bearing cases to a live binding.
     view = AdminLineView(
         line_id=LineId("line-main"),
-        caps=(),
+        caps=[Intent.DIAL_OUT],
         state=LineState.FREE,
-        liveness=LivenessState.UNBOUND,
+        liveness=LivenessState.REACHABLE,
         provider_meta={"model": "gt-1"},
     )
     assert view.provider_meta == {"model": "gt-1"}
     base: dict[str, Any] = {
         "line_id": LineId("line-main"),
-        "caps": (),
+        "caps": [Intent.DIAL_OUT],
         "state": LineState.FREE,
-        "liveness": LivenessState.UNBOUND,
+        "liveness": LivenessState.REACHABLE,
     }
     with pytest.raises(ValidationError):
         AdminLineView(**base, provider_meta={"k": "v" * (MAX_PROVIDER_META_VALUE_LEN + 1)})
@@ -5455,6 +5723,16 @@ def test_admin_line_view_provider_meta_owned_and_bounded() -> None:
         )
     with pytest.raises(ValidationError):
         AdminLineView(**base, provider_meta={"k" * (MAX_PROVIDER_META_KEY_LEN + 1): "v"})
+    # Round 31 (SA_swe2_review_1 item 35): provider_meta on a
+    # liveness=UNBOUND row is a derived-state bug - the model is
+    # authoritative and rejects the inconsistent pair.
+    with pytest.raises(ValidationError):
+        AdminLineView(
+            **{**base, "liveness": LivenessState.UNBOUND, "caps": ()},
+            provider_meta={"m": "v"},
+        )
+    unbound_ok = AdminLineView(**{**base, "liveness": LivenessState.UNBOUND, "caps": ()})
+    assert unbound_ok.provider_meta == {}
     # Owned copy (round 30 deep-copy hardening): mutating the source
     # map - including a NESTED structure passed through - cannot
     # corrupt the stored row.
@@ -5586,3 +5864,336 @@ def test_dedup_ring_documented_semantics() -> None:
     assert MAX_CLOSED_LEASES == 1024
     doc = LineManager.drain_events.__doc__ or ""
     assert "drain" in doc
+
+
+# ---------------------------------------------------------------------------
+# Round 31 (architect review - SA_swe2_review_1): batch-1 pins.
+# ---------------------------------------------------------------------------
+
+
+def _doc_rpc_table(section_header: str, name_re: str) -> dict[str, dict[str, bool]]:
+    """Parse a ``| `method` | `{params}` |`` wire table inside the
+    named api-contract.md section: wire method name ->
+    {param: is_optional}. Same optionality rule as
+    :func:`_doc_line_command_table` - the trailing ``?`` is kept.
+    ``name[]`` plural markers are normalized to the bare param
+    name."""
+    text = API_CONTRACT_MD.read_text(encoding="utf-8")
+    section = text.split(section_header, 1)[1]
+    section = section.split("\n## ", 1)[0]
+    table: dict[str, dict[str, bool]] = {}
+    for m in re.finditer(rf"^\|\s*`({name_re})`\s*\|\s*`\{{([^}}]*)\}}`", section, flags=re.M):
+        params: dict[str, bool] = {}
+        for p in m.group(2).split(","):
+            p = p.strip()
+            if p:
+                params[p.rstrip("?").removesuffix("[]")] = p.endswith("?")
+        table[m.group(1)] = params
+    return table
+
+
+def _signature_params(fn: Callable[..., Any]) -> dict[str, bool]:
+    """{param: has_default} for a kernel-interface method signature
+    (``self`` excluded) - has_default mirrors the wire-table ``?``
+    optionality marker."""
+    sig = inspect.signature(fn)
+    return {
+        name: p.default is not inspect.Parameter.empty
+        for name, p in sig.parameters.items()
+        if name != "self"
+    }
+
+
+def test_provider_wire_method_drift() -> None:
+    """Round 31 (SA_swe2_review_1 item 36): the ``provider.*`` wire
+    table must not drift from the provider-fact models and the
+    ingest signatures - the same param-name/optionality parity the
+    ``line.*`` drift test pins on the down-channel.
+
+    Exclusions are explicit and reviewed: ``token`` is consumed by
+    the auth layer before the fact reaches the kernel; ``channel_seq``
+    and ``reregister`` are adapter-distilled fields that never ride the
+    wire as named params. ``provider_call_id`` rides the shared
+    ``provider.call_state`` params cell from the round-31 fix round
+    (PR #78 warning 2) - the same wire row distills into
+    ``IncomingRingIngress`` on ``state:"ringing"`` and into
+    ``ProviderCallStateUpdate`` otherwise, so the test pins BOTH
+    models against the one cell."""
+    table = _doc_rpc_table("## Manager namespace", r"provider\.[a-z_]+")
+    expected_rows = {
+        "provider.register",
+        "provider.ping",
+        "provider.capability_update",
+        "provider.call_state",
+        "provider.audio_ready",
+        "provider.audio_lost",
+        "provider.reattach_media",
+    }
+    assert set(table) == expected_rows
+
+    # provider.reregister shares the register row's prose
+    # ("same as register + state_snapshot?") - pin that the
+    # reregister method name and the extra snapshot param are
+    # documented, and that the distilled flag pair stays in place.
+    section = API_CONTRACT_MD.read_text(encoding="utf-8").split("## Manager namespace", 1)[1]
+    assert "`provider.reregister`" in section
+    assert "state_snapshot?" in section
+    reg_fields = ProviderRegistration.__pydantic_fields__
+    assert not reg_fields["reregister"].is_required()
+    assert not reg_fields["state_snapshot"].is_required()
+
+    model_map: dict[str, tuple[type[contract.ContractModel], set[str]]] = {
+        # wire method -> (fact model, model fields NOT on the wire
+        # for that method: adapter-distilled or batch-2 pending)
+        "provider.register": (
+            ProviderRegistration,
+            {"channel_seq", "reregister", "state_snapshot"},
+        ),
+        "provider.ping": (ProviderLiveness, {"channel_seq"}),
+        "provider.capability_update": (ProviderCapabilityUpdate, set()),
+        "provider.call_state": (ProviderCallStateUpdate, set()),
+        "provider.reattach_media": (ProviderMediaReattachRequest, set()),
+    }
+    # Adapter-NORMALIZED params: the wire marks them optional but
+    # the kernel model requires a value - the adapter stamps kernel
+    # receipt time when the provider omits the advisory stamp.
+    adapter_normalized: dict[str, set[str]] = {
+        "provider.ping": {"checked_at"},
+        "provider.call_state": {"observed_at"},
+    }
+    for wire, (model, internal) in model_map.items():
+        fields = model.__pydantic_fields__
+        model_params = set(fields) - internal
+        doc_params = table[wire]
+        assert model_params == set(doc_params) - {"token"}, (
+            f"{model.__name__} drift vs {wire}: "
+            f"missing={set(doc_params) - model_params - {'token'}}, "
+            f"extra={model_params - set(doc_params)}"
+        )
+        model_optional = {f for f in model_params if not fields[f].is_required()}
+        doc_optional = {
+            p for p, optional in doc_params.items() if optional
+        } - adapter_normalized.get(wire, set())
+        assert model_optional == doc_optional, (
+            f"{model.__name__} optionality drift vs {wire}: "
+            f"doc-optional-only={doc_optional - model_optional}, "
+            f"model-optional-only={model_optional - doc_optional}"
+        )
+
+    # The shared ``provider.call_state`` cell also carries the ring
+    # ingress (round-31 fix round, PR #78 warning 2): every
+    # ``IncomingRingIngress`` field MUST ride the same params cell,
+    # with the provider-supplied optionals marked ``?``.
+    ring_fields = set(IncomingRingIngress.__pydantic_fields__)
+    assert ring_fields <= set(table["provider.call_state"]), (
+        "IncomingRingIngress drift vs provider.call_state params cell: "
+        f"missing={ring_fields - set(table['provider.call_state'])}"
+    )
+    doc_optional_cs = {p for p, optional in table["provider.call_state"].items() if optional}
+    assert {"caller_id", "provider_call_id"} <= doc_optional_cs
+
+    # audio_ready / audio_lost carry no fact model - they ride the
+    # ingest signatures; compare names AND optionality (audio_lost's
+    # ``lease_id?`` is the line-scoped loss case).
+    sig_map = {
+        "provider.audio_ready": contract.LineManager.ingest_audio_ready,
+        "provider.audio_lost": contract.LineManager.ingest_audio_lost,
+    }
+    for wire, fn in sig_map.items():
+        sig_params = _signature_params(fn)
+        doc_params = table[wire]
+        assert set(sig_params) == set(doc_params), (
+            f"{fn.__name__} drift vs {wire}: "
+            f"missing={set(doc_params) - set(sig_params)}, "
+            f"extra={set(sig_params) - set(doc_params)}"
+        )
+        doc_optional = {p for p, optional in doc_params.items() if optional}
+        sig_optional = {p for p, has_default in sig_params.items() if has_default}
+        assert doc_optional == sig_optional, f"{fn.__name__} optionality drift vs {wire}"
+
+
+def test_agent_call_wire_method_drift() -> None:
+    """Round 31 (SA_swe2_review_1 item 36): the ``agent.*``/``call.*``
+    wire table must not drift from the LineManager agent surface -
+    every wire param resolves to a kernel signature param with the
+    same optionality, barring the explicit auth/adapter-owned set.
+
+    ``token`` (register_intent) and ``idempotency_key`` on
+    dial/accept/claim_exclusive are adapter-consumed: the key rides
+    the adapter-side dedup store whose partitioning and replay
+    semantics batch 2 pins in the wire doc (item 13); the kernel
+    dedups only ``call.acquire``'s key today."""
+    table = _doc_rpc_table("## APICallService —", r"(?:agent|call)\.[a-z_]+")
+    adapter_owned: dict[str, set[str]] = {
+        "agent.register_intent": {"token"},
+        "call.dial": {"idempotency_key"},
+        "call.accept": {"idempotency_key"},
+        "call.claim_exclusive": {"idempotency_key"},
+    }
+    method_map: dict[str, Callable[..., Any]] = {
+        "agent.register_intent": contract.LineManager.register_intent,
+        "call.acquire": contract.LineManager.acquire,
+        "call.cancel_acquire": contract.LineManager.cancel_acquire,
+        "call.dial": contract.LineManager.dial,
+        "call.accept": contract.LineManager.accept,
+        "call.hangup": contract.LineManager.hangup,
+        "call.send_dtmf": contract.LineManager.send_dtmf,
+        "call.reattach_media": contract.LineManager.reattach_media,
+        "call.claim_exclusive": contract.LineManager.claim_exclusive,
+        "call.get_lines": contract.LineManager.get_lines,
+    }
+    # call.release splits into the two kernel entry points by its
+    # XOR target - pin the union by name; optionality is a wire-only
+    # concept here (each kernel method takes its target positionally).
+    release_union = set(_signature_params(contract.LineManager.release)) | set(
+        _signature_params(contract.LineManager.release_assignment)
+    )
+    assert release_union == set(table["call.release"]), (
+        "call.release drift: "
+        f"missing={set(table['call.release']) - release_union}, "
+        f"extra={release_union - set(table['call.release'])}"
+    )
+    assert set(table) == set(method_map) | {"call.release"}
+
+    for wire, fn in method_map.items():
+        exempt = adapter_owned.get(wire, set())
+        sig_params = _signature_params(fn)
+        doc_params = table[wire]
+        assert set(sig_params) == set(doc_params) - exempt, (
+            f"{fn.__name__} drift vs {wire}: "
+            f"missing={set(doc_params) - exempt - set(sig_params)}, "
+            f"extra={set(sig_params) - set(doc_params)}"
+        )
+        doc_optional = {p for p, optional in doc_params.items() if optional}
+        sig_optional = {p for p, has_default in sig_params.items() if has_default}
+        assert doc_optional - exempt == sig_optional, (
+            f"{fn.__name__} optionality drift vs {wire}: "
+            f"doc-optional-only={(doc_optional - exempt) - sig_optional}, "
+            f"kernel-optional-only={sig_optional - doc_optional}"
+        )
+
+
+def test_admin_wire_method_drift() -> None:
+    """Round 31 (SA_swe2_review_1 item 36): the ``admin.*`` wire table
+    must not drift from the LineAdminKernel surface - every wire
+    method resolves to a kernel entry point (or an explicitly
+    adapter-owned method) and every param name/optionality matches.
+
+    The hardware-transport params (round-31 item 10) are kernel-side
+    already; their wire-table cells land with the batch-2 doc edit,
+    so they are pinned here as kernel-only pending-params rather than
+    silently dropped."""
+    table = _doc_rpc_table("## Admin surface", r"admin\.[a-z_]+")
+
+    kernel_pending: dict[str, set[str]] = {
+        "admin.provision_line": {
+            "adapter_mac",
+            "paired_phone_mac",
+            "transport_profile",
+            "line_home_country",
+        },
+        "admin.configure_line": {
+            "adapter_mac",
+            "paired_phone_mac",
+            "transport_profile",
+            "line_home_country",
+        },
+    }
+    method_map: dict[str, Callable[..., Any]] = {
+        "admin.provision_line": contract.LineAdminKernel.provision_line,
+        "admin.configure_line": contract.LineAdminKernel.configure_line,
+        "admin.remove_line": contract.LineAdminKernel.remove_line,
+        "admin.assign_line": contract.LineAdminKernel.assign_line,
+        "admin.approve_claim": contract.LineAdminKernel.approve_claim,
+        "admin.reject_claim": contract.LineAdminKernel.reject_claim,
+        "admin.revoke_assignment": contract.LineAdminKernel.revoke_assignment,
+        "admin.get_line": contract.LineAdminKernel.get_line,
+        "admin.list_lines": contract.LineAdminKernel.list_lines,
+        "admin.list_leases": contract.LineAdminKernel.list_leases,
+        "admin.list_tickets": contract.LineAdminKernel.list_tickets,
+        "admin.list_pending_claims": contract.LineAdminKernel.list_pending_claims,
+        "admin.list_assignments": contract.LineAdminKernel.list_assignments,
+        "admin.list_provider_bindings": contract.LineAdminKernel.list_provider_bindings,
+    }
+    # Adapter-owned admin calls never reach the kernel: the handshake
+    # auth, key management, and the HCI pair window (its params ride
+    # the typed PairWindowRequest model instead).
+    adapter_owned = {
+        "admin.auth",
+        "admin.pair_window",
+        "admin.issue_key",
+        "admin.revoke_key",
+        "admin.list_keys",
+    }
+    assert set(table) == set(method_map) | adapter_owned
+
+    # ``admin.list_keys`` (round-31 fix round, PR #78 warning 3) is a
+    # normative table row: pin the redacted metadata shape so the row
+    # can never drift into returning key material.
+    section = API_CONTRACT_MD.read_text(encoding="utf-8").split("## Admin surface", 1)[1]
+    list_keys_row = next(ln for ln in section.splitlines() if ln.startswith("| `admin.list_keys`"))
+    for field in ("key_id", "scope", "subject_id", "created_at", "last_used_at?", "revoked"):
+        assert field in list_keys_row, f"admin.list_keys row misses {field}"
+    assert table["admin.list_keys"] == {"subject_id": True}
+
+    pair_req = set(PairWindowRequest.__pydantic_fields__)
+    assert pair_req == set(table["admin.pair_window"]), (
+        "admin.pair_window drift vs PairWindowRequest: "
+        f"missing={set(table['admin.pair_window']) - pair_req}, "
+        f"extra={pair_req - set(table['admin.pair_window'])}"
+    )
+
+    for wire, fn in method_map.items():
+        pending = kernel_pending.get(wire, set())
+        sig_params = _signature_params(fn)
+        doc_params = table[wire]
+        assert set(sig_params) - pending == set(doc_params), (
+            f"{fn.__name__} drift vs {wire}: "
+            f"missing={set(doc_params) - set(sig_params)}, "
+            f"extra={set(sig_params) - pending - set(doc_params)}"
+        )
+        doc_optional = {p for p, optional in doc_params.items() if optional}
+        sig_optional = {p for p, has_default in sig_params.items() if has_default} - pending
+        assert doc_optional == sig_optional, (
+            f"{fn.__name__} optionality drift vs {wire}: "
+            f"doc-optional-only={doc_optional - sig_optional}, "
+            f"kernel-optional-only={sig_optional - doc_optional}"
+        )
+
+
+def test_secure_compare_auth_helper() -> None:
+    """Round 31 (SA_swe2_review_1 item 30): ``secure_compare`` is the
+    dedicated AUTH-decision helper - constant-time, length-tolerant,
+    and fail-closed on non-encodable input. Container
+    ``__eq__``/``__hash__`` on RedactedString stay model
+    conveniences, never an auth verdict."""
+    assert secure_compare(RedactedString("tok-1"), RedactedString("tok-1"))
+    assert not secure_compare(RedactedString("tok-1"), RedactedString("tok-2"))
+    assert not secure_compare(RedactedString("tok-1"), RedactedString(""))
+    # Length-mismatched prefixes must fail too (compare_digest is
+    # length-tolerant, not prefix-tolerant).
+    assert not secure_compare(RedactedString("tok-12"), RedactedString("tok-1"))
+    # Unpaired surrogates can never reach hmac - fail closed.
+    assert not secure_compare(RedactedString("\ud800"), RedactedString("x"))
+    assert not secure_compare(RedactedString("x"), RedactedString("\ud800"))
+
+
+def test_media_overflow_event_shape() -> None:
+    """Round 31 (SA_swe2_review_1 item 8): the reserved
+    ``event.media_overflow`` payload is exactly ``{lease_id,
+    line_id}`` - bounded identifiers only, no counters that could
+    invite unbounded per-frame emission bookkeeping."""
+    payload = MediaOverflowEvent(lease_id=LeaseId("l-1"), line_id=LineId("line-main"))
+    assert set(MediaOverflowEvent.__pydantic_fields__) == {"lease_id", "line_id"}
+    assert payload.lease_id == "l-1"
+
+
+def test_closed_ticket_ring_and_ring_dedup_bounds() -> None:
+    """Round 31 (SA_swe2_review_1 items 20/24): the tombstone rings
+    and the best-effort ring-dedup horizon are bounded, exported
+    contract constants - a drift in either unbounds kernel memory
+    or silently re-keys ring dedup."""
+    assert MAX_CLOSED_TICKETS == 1024
+    assert MAX_CLOSED_TICKETS <= contract.MAX_QUEUE_TICKETS_TOTAL
+    assert RING_DEDUP_MIN_GAP_SEC == 30.0
+    assert RING_DEDUP_MIN_GAP_SEC > 0

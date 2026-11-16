@@ -111,7 +111,18 @@ def parse(path):
                     # '|' keeps one line of content per source line.
                     fm[last] = "\n".join(block)
             else:
-                fm[last] = rest.strip('"').strip("'")
+                # strip only MATCHING surrounding quotes (round 31,
+                # swe-2 item 40): blanket strip('"').strip("'")
+                # would mangle unquoted values that merely end in a
+                # quote char and would silently merge mismatched
+                # quotes like "foo' -> foo.
+                if (
+                    len(rest) >= 2
+                    and rest[0] == rest[-1]
+                    and rest[0] in ("\"", "'")
+                ):
+                    rest = rest[1:-1]
+                fm[last] = rest
         elif last:
             fm[last] = (fm[last] + " " + s).strip()
     missing = [f for f in FIELDS if f not in fm]
