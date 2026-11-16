@@ -416,9 +416,12 @@ math (round-28 fix). The normalization MUST be applied through
 the canonical `clamp_provider_stamp` helper (round 29) so every
 provider-stamp ingress path shares one implementation of the
 rule. Dedup keys are scoped to the binding (round 29): the
-dedupe/ordering key is `(assignment_id, lease_or_call,
-accepted_stamp)` — a stamp replayed by a NEW binding can never
-collide with a superseded binding's recorded dedup entry, so a
+`checked_at` liveness stamp dedupes on `(assignment_id,
+accepted_stamp)` — a ping carries no call correlator — while the
+`observed_at` call-state stamp dedupes on `(assignment_id,
+lease_or_call, accepted_stamp)`; in both scopes a stamp replayed
+by a NEW binding can never collide with a superseded binding's
+recorded dedup entry, so a
 past-skewed stamp stays a harmless verbatim key instead of a
 false duplicate. `last_seen_at` is always kernel receipt
 time and every timer stays kernel-clock.

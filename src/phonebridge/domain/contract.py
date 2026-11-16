@@ -5060,8 +5060,14 @@ class LineManager(ABC):
         Bounded pagination (round 29, SA_quant_review_1 slice-B item
         1; PR #74 review): ``offset``/``limit`` carry the shared wire
         ``{offset?, limit?}`` window - a negative ``offset`` or a
-        ``limit`` outside ``1..MAX_LIST_PAGE`` is INVALID_ARGUMENT
-        (the ``Field`` bounds reject it at the model boundary). The
+        ``limit`` outside ``1..MAX_LIST_PAGE`` is INVALID_ARGUMENT.
+        The ``Field`` bounds on the parameter annotations are
+        DECLARATIVE wire bounds (round-29 re-review): ``Annotated``
+        ``Field`` metadata on an ABC signature is inert at call
+        time, so the bounds carry the same normative force as every
+        other contract bound - the adapter MUST reject out-of-range
+        values at the boundary and implementations MUST honour the
+        window. The
         page is a STABLE-ORDERED slice: rows enumerate in
         ``line_id`` order, so offset-paging a quiescent listing
         never skips or repeats a row; a full ``limit``-sized page

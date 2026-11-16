@@ -4757,7 +4757,10 @@ def test_aggregate_limit_consistency() -> None:
     # The dedup-table bound joins the same "no global cap" family:
     # idempotency keys are session-scoped, so the per-session cap
     # alone bounds each table and totals follow the session caps.
-    assert MAX_IDEMPOTENCY_KEYS_PER_SESSION * MAX_SESSIONS_TOTAL > 0
+    # Pin the exported values themselves (PR #74 re-review) - the
+    # earlier "> 0" assertion was vacuous.
+    assert MAX_IDEMPOTENCY_KEYS_PER_SESSION == 256
+    assert MAX_SESSIONS_TOTAL == 512
     assert "MAX_LEASES_TOTAL" not in contract.__all__
 
 
