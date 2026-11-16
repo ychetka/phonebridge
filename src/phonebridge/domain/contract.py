@@ -742,6 +742,40 @@ _CheckedCountryAlpha2 = Annotated[str | None, AfterValidator(_check_country_alph
 """Optional ISO alpha-2 country code."""
 
 
+_ANNOUNCEMENT_REF_CHARSET: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+"""Announcement-reference grammar (round-31 fix round, PR #78
+warning 4): a widened :data:`_ID_CHARSET` that additionally
+permits ``:`` and ``/`` so provisioned asset selectors like
+``builtin:beep`` or a namespaced ``wav/<asset>`` path are legal.
+The ``:`` byte is safe HERE because a
+:class:`RecordAndTelegramFallback` ref never rides the compact
+``<policy>:<param>`` split - the compact spelling carries only
+``<channel>`` and the ref arrives via the dict/JSON form or the
+default (contrast
+:attr:`AnswerAndAnnounceFallback.announcement_ref`, which DOES ride
+``answer_and_announce:<ref>`` and therefore keeps the strict
+``_CheckedId`` grammar). The alphabet still bans whitespace,
+control bytes, path separators other than ``/`` and glob
+metacharacters."""
+
+
+def _check_announcement_ref(value: str) -> str:
+    """Announcement-asset selector hygiene: non-empty, bounded at
+    ``_ID_MAX_LEN``, matching :data:`_ANNOUNCEMENT_REF_CHARSET`."""
+    if len(value) > _ID_MAX_LEN:
+        raise ValueError(f"announcement_ref exceeds {_ID_MAX_LEN} chars")
+    if not _ANNOUNCEMENT_REF_CHARSET.fullmatch(value):
+        raise ValueError(
+            "announcement_ref must match [A-Za-z0-9][A-Za-z0-9._:/-]* "
+            "(asset selectors may carry a ':' namespace or '/' path)"
+        )
+    return value
+
+
+_CheckedAnnouncementRef = Annotated[str, AfterValidator(_check_announcement_ref)]
+"""Bounded announcement-asset selector (``:``/``/`` allowed)."""
+
+
 def _check_provider_call_id(value: str | None) -> str | None:
     """Provider-side call handle (round 31, SA_swe2_review_1 item
     20): the adapter-distilled provider call identifier (e.g. an
@@ -940,10 +974,12 @@ Drift against the doc's state vocabulary is caught by
 
 CALL_PHASE_FORWARD_TRANSITIONS: dict[CallPhase, frozenset[CallPhase]] = {
     CallPhase.ACQUIRED: frozenset({CallPhase.DIALING, CallPhase.ENDED}),
-    CallPhase.DIALING: frozenset({CallPhase.ALERTING, CallPhase.ACTIVE, CallPhase.ENDED}),
+    CallPhase.DIALING: frozenset(
+        {CallPhase.ALERTING, CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}
+    ),
     CallPhase.RINGING: frozenset(),
-    CallPhase.ANSWERING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
-    CallPhase.ALERTING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
+    CallPhase.ANSWERING: frozenset({CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}),
+    CallPhase.ALERTING: frozenset({CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}),
     CallPhase.ACTIVE: frozenset({CallPhase.TERMINATING, CallPhase.ENDED}),
     CallPhase.TERMINATING: frozenset({CallPhase.ENDED}),
     CallPhase.ENDED: frozenset(),
@@ -967,8 +1003,17 @@ while the ring lives on the line's ring slot. Round 31
 row keeps an EMPTY target set - the enum member is reserved/dead,
 no lease may carry it and no transition may reach it - while
 ``ANSWERING`` (``accept()``'s answer-in-flight phase) gets the
-real ``ANSWERING -> ACTIVE/ENDED`` edges provider facts drive.
-Drift is pinned by ``test_call_phase_forward_matrix``."""
+real ``ANSWERING -> ACTIVE/TERMINATING/ENDED`` edges provider
+facts and hangups drive. Round-31 fix round (PR #78 warning 1):
+``TERMINATING`` joins the ``DIALING``/``ANSWERING``/``ALERTING``
+target sets - the matrix documented ONLY ``ACTIVE ->
+TERMINATING`` while :meth:`hangup`'s contract sends EVERY
+in-flight phase through it, and a hangup on a possibly-live
+dialed call legitimately parks in ``TERMINATING`` awaiting the
+provider's ``disconnected`` (or the hold timeout); ``ACQUIRED``
+still reaches ``ENDED`` directly because there is no air-side
+call to confirm. Drift is pinned by
+``test_call_phase_forward_matrix``."""
 
 
 SNAPSHOT_RECONCILED_PHASES: frozenset[CallPhase] = frozenset(
@@ -1336,32 +1381,50 @@ table and docs/api-contract.md's ``event.*`` table is caught by
 
 _MAX_REASONABLE_STAMP_GAP: timedelta = timedelta(days=3650)
 """Plausibility horizon for contract timestamps (round 31,
-SA_swe2_review_1 item 18): any stamp whose converted UTC value
-lies within this many days of ``datetime.max`` is rejected. Two
-failure shapes sit behind it: (a) ``astimezone`` itself can raise
-``OverflowError`` on a near-max year with a large negative offset,
-leaking a raw non-contract error at the boundary, and (b) a
-surviving near-max stamp still explodes the next deadline
-addition inside the kernel (``stamp + timedelta`` is not guarded).
-Failing closed at validation keeps both defects a contract
+SA_swe2_review_1 item 18; SYMMETRIC window from the round-31 fix
+round, PR #78 minor 7): any stamp whose converted UTC value lies
+more than this many days from the reference ``now`` - in EITHER
+direction - is rejected. Three failure shapes sit behind it:
+(a) ``astimezone`` itself can raise ``OverflowError`` on a
+near-``datetime.max``/``datetime.min`` year with a large offset,
+leaking a raw non-contract error at the boundary, (b) a surviving
+far-future stamp still explodes the next deadline addition inside
+the kernel (``stamp + timedelta`` is not guarded), and (c) a
+far-PAST stamp is just as poisonous - a hydrated or reported
+stamp years stale would poison dedup windows, ordering keys and
+idle/last-seen arithmetic in the mirror-image direction. Failing
+closed at validation keeps all three defects a contract
 ``ValueError`` (INVALID_ARGUMENT at the adapter)."""
 
 
-def ensure_aware_utc(value: datetime) -> datetime:
+def ensure_aware_utc(value: datetime, now: datetime | None = None) -> datetime:
     """Enforce CODING_HAZARDS rule 6: reject naive datetimes; normalize
     aware values to canonical UTC. Public (round 20) so that runtime
     entry points - e.g. every ``LineManager.tick(now)`` implementation
     and any adapter ingress bypassing pydantic validation - can apply
     the same check the ``AwareDatetime`` annotation only documents.
 
+    ``now`` (round-31 fix round, PR #78 minor 7) is the reference
+    instant for the plausibility window: callers that already hold
+    a kernel clock (``tick``, tests, hydration) inject it so the
+    window is computed against THEIR ``now``; ``None`` falls back
+    to the wall clock - the shape the pydantic ``AfterValidator``
+    path always takes.
+
     Pathological-range guard (round 31, SA_swe2_review_1 item 18):
-    the UTC conversion is wrapped so a near-``datetime.max`` stamp
-    (a huge year plus a large negative offset) surfaces as a
-    ``ValueError`` - never a raw ``OverflowError`` - and the
-    converted result is bounded to ``datetime.max`` minus
-    :data:`_MAX_REASONABLE_STAMP_GAP`, so downstream
-    ``stamp + timedelta`` deadline arithmetic can never overflow
-    either."""
+    the UTC conversion is wrapped so a near-``datetime.max``/
+    ``datetime.min`` stamp (a huge year plus a large offset)
+    surfaces as a ``ValueError`` - never a raw ``OverflowError`` -
+    and the converted result is bounded SYMMETRICALLY to
+    ``now +-`` :data:`_MAX_REASONABLE_STAMP_GAP` (round-31 fix,
+    PR #78 minor 7): the earlier future-only bound let a
+    far-past stamp - a stale hydrated ``last_seen_at``, a
+    clock-set-back provider stamp - slide through and poison dedup
+    keys, monotonic watermarks, ordering and idle-deadline
+    arithmetic in exactly the mirror image of the far-future case;
+    a +-10-year window around ``now`` is generous for every
+    legitimate contract stamp while catching both poisoned
+    directions fail-closed."""
     if not isinstance(value, datetime):
         raise TypeError(f"expected datetime, got {type(value).__name__}")
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
@@ -1370,8 +1433,33 @@ def ensure_aware_utc(value: datetime) -> datetime:
         converted = value.astimezone(timezone.utc)
     except OverflowError as exc:
         raise ValueError("datetime outside representable UTC range") from exc
-    if converted > datetime.max.replace(tzinfo=timezone.utc) - _MAX_REASONABLE_STAMP_GAP:
+    if now is None:
+        now_utc = datetime.now(timezone.utc)
+    else:
+        if not isinstance(now, datetime):
+            raise TypeError(f"expected datetime for now, got {type(now).__name__}")
+        if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+            raise ValueError("naive now rejected: the reference instant must be timezone-aware")
+        try:
+            now_utc = now.astimezone(timezone.utc)
+        except OverflowError as exc:
+            raise ValueError("now outside representable UTC range") from exc
+    # An injected ``now`` could itself sit near datetime.min/max -
+    # clamp the window edges instead of letting the addition
+    # overflow (a degenerate ``now`` widens the window, never
+    # narrows it).
+    try:
+        upper = now_utc + _MAX_REASONABLE_STAMP_GAP
+    except OverflowError:
+        upper = datetime.max.replace(tzinfo=timezone.utc)
+    try:
+        lower = now_utc - _MAX_REASONABLE_STAMP_GAP
+    except OverflowError:
+        lower = datetime.min.replace(tzinfo=timezone.utc)
+    if converted > upper:
         raise ValueError("datetime beyond max reasonable stamp range")
+    if converted < lower:
+        raise ValueError("datetime below min reasonable stamp range")
     return converted
 
 
@@ -2141,8 +2229,11 @@ def _bounded_meta(meta: dict[str, str]) -> dict[str, str]:
 # Typed discriminated union on `policy`. The wire spellings
 # "forward_via_line:<line_id>" / "record_and_telegram:<channel>" are
 # single strings - splitting "<policy>:<param>" is the config adapter's
-# job; the domain sees typed fields only. No forward reference to
-# LineAssignment.
+# job; the domain sees typed fields only. A compact spelling carries
+# only its positional params - every remaining field MUST have a
+# default so the compact form can never produce an unconstructable
+# model (round-31 fix round, PR #78 warning 4); the dict/JSON form is
+# the explicit-override path. No forward reference to LineAssignment.
 # ---------------------------------------------------------------------------
 
 
@@ -2232,7 +2323,20 @@ class ForwardViaLineFallback(ContractModel):
 
 class RecordAndTelegramFallback(ContractModel):
     """Worker policy: answer, play the pre-record announcement,
-    record, post to a Telegram channel."""
+    record, post to a Telegram channel.
+
+    Two config spellings (round-31 fix round, PR #78 warning 4):
+
+    - compact ``record_and_telegram:<channel>`` - carries ONLY the
+      channel selector; ``announcement_ref`` and
+      ``max_recording_sec`` fill from their defaults
+      (``builtin:beep`` / 300 s), so the compact form always
+      constructs a valid model and pre-round-31 persisted policy
+      JSON lacking the new fields hydrates unchanged;
+    - dict/JSON ``{"policy": "record_and_telegram", "channel": ...,
+      "announcement_ref": ..., "max_recording_sec": ...}`` - the
+      explicit-override form for a provisioned asset or a
+      non-default recording bound."""
 
     policy: Literal["record_and_telegram"] = "record_and_telegram"
     channel: _CheckedId
@@ -2244,20 +2348,29 @@ class RecordAndTelegramFallback(ContractModel):
     never appear on the wire - administrative config MUST use a safe
     alias the worker resolves locally (round 27, review-17 item 13
     side effect, PR #68 review)."""
-    announcement_ref: _CheckedId
-    """Mandatory pre-record announcement selector (round 31,
+    announcement_ref: _CheckedAnnouncementRef = "builtin:beep"
+    """Pre-record announcement selector, ALWAYS populated (round 31,
     SA_swe2_review_1 item 26; design "the caller is always told
-    they are being recorded"): the WAV/text asset the worker plays
+    they are being recorded"): the WAV asset the worker plays
     BEFORE recording starts - the recording leg can never run
-    unannounced. Same checked-identifier grammar as
-    :attr:`AnswerAndAnnounceFallback.announcement_ref` (no ``":"``,
-    so the ``record_and_telegram:<channel>`` split stays safe)."""
+    unannounced. The default ``builtin:beep`` is the packaged beep
+    asset (round-31 fix round, PR #78 warning 4): the compact
+    ``record_and_telegram:<channel>`` spelling carries no ref, so
+    the field fills from the default - a provisioned asset is
+    selected through the dict/JSON form only. The widened
+    :func:`_check_announcement_ref` grammar permits ``:``/``/``
+    (namespaced asset ids) because this ref never rides the compact
+    ``<policy>:<param>`` split - unlike
+    :attr:`AnswerAndAnnounceFallback.announcement_ref`, which does
+    and keeps the strict ``_CheckedId`` grammar."""
     max_recording_sec: float = Field(default=300.0, gt=0, le=86400.0)
     """Wall-clock bound on the recording itself (round 31,
-    SA_swe2_review_1 item 26; ~300 s default): the single
-    authoritative recording-length bound - the design's earlier
-    ambiguity (``max_call_duration_sec`` vs a dedicated 300 s knob)
-    resolves to this policy-level field, while the line's optional
+    SA_swe2_review_1 item 26; 300 s default - also the value the
+    compact ``record_and_telegram:<channel>`` spelling fills, PR
+    #78 warning 4): the single authoritative recording-length
+    bound - the design's earlier ambiguity
+    (``max_call_duration_sec`` vs a dedicated 300 s knob) resolves
+    to this policy-level field, while the line's optional
     ``max_call_duration_sec`` cap still bounds the WHOLE call
     independently (the stricter of the two wins at runtime)."""
 
@@ -5755,7 +5868,7 @@ class LineManager(ABC):
         ``CallPhase.ANSWERING`` (round 31, SA_swe2_review_1 item 2):
         the ``line.answer`` command is in flight but the call is not
         established yet - provider ``state=active``/``disconnected``
-        facts drive ``ANSWERING -> ACTIVE/ENDED`` through
+        facts drive ``ANSWERING -> ACTIVE/TERMINATING/ENDED`` through
         :data:`CALL_PHASE_FORWARD_TRANSITIONS`, and the phase joins
         :data:`SNAPSHOT_RECONCILED_PHASES` because the provider can
         already observe the answered call. The minted lease carries
@@ -6491,13 +6604,19 @@ class LineManager(ABC):
         answer - the network may report ``active`` before an
         ``alerting`` leg propagates or without one, a legal
         provider fact the matrix must not reject; added in the
-        round-28 fix, PR #72 review)/``ENDED``;
-        ``ANSWERING`` -> ``ACTIVE``/``ENDED`` (round 31,
+        round-28 fix, PR #72 review)/``TERMINATING``/``ENDED``;
+        ``ANSWERING`` -> ``ACTIVE``/``TERMINATING``/``ENDED`` (round 31,
         SA_swe2_review_1 item 2 - the provider's answer
         confirmation or rejection on the accept path);
-        ``ALERTING`` -> ``ACTIVE``/``ENDED``; ``ACTIVE`` ->
+        ``ALERTING`` -> ``ACTIVE``/``TERMINATING``/``ENDED``; ``ACTIVE`` ->
         ``TERMINATING``/``ENDED``; ``TERMINATING`` -> ``ENDED``;
-        ``ENDED`` is terminal. A REGRESSION is never legal - an
+        ``ENDED`` is terminal. The ``TERMINATING`` legs out of the
+        in-flight phases are the :meth:`hangup` path (round-31 fix
+        round, PR #78 warning 1): a hangup on a possibly-live
+        dialed call parks the lease in ``TERMINATING`` awaiting
+        the provider's ``disconnected`` or the hold timeout, so
+        every phase where a call leg may exist admits the edge.
+        A REGRESSION is never legal - an
         ``ACTIVE`` lease can never return to ``DIALING``/``ALERTING``
         (a provider reporting its own state machine restart is a
         defect fact, dropped like an out-of-order update), and

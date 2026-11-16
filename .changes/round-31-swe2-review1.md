@@ -56,7 +56,34 @@ dev_summary: >-
   surrounding quotes, check_changes_entry validates --pr
   numeric before URL interpolation, check_version_tag makes
   TIMEOUT=0 a single immediate check; drift-test coverage is
-  extended to the new wire/admin surfaces.
+  extended to the new wire/admin surfaces. Round-31 fix round
+  (PR #78 review, 4 warnings + 4 minors):
+  CALL_PHASE_FORWARD_TRANSITIONS gains TERMINATING targets on the
+  DIALING/ANSWERING/ALERTING rows (hangup parks every
+  possibly-live call leg in TERMINATING; ACQUIRED still ends
+  directly); the provider.call_state params cell gains
+  provider_call_id? covering both the IncomingRingIngress and
+  ProviderCallStateUpdate distillations; admin.list_keys lands as
+  a normative wire row returning only redacted
+  {key_id, scope, subject_id, created_at, last_used_at?, revoked}
+  metadata - never key material; RecordAndTelegramFallback gives
+  announcement_ref the "builtin:beep" default and
+  max_recording_sec the 300 s default so the compact
+  record_and_telegram:<channel> spelling and pre-round-31
+  persisted policy JSON always construct a valid policy (dict/JSON
+  is the explicit-override path; the ref grammar widens to a
+  ':'/'/'-permitting announcement selector since it never rides
+  the compact split); hydrated-dead wording corrected - a
+  CallLease never persists, only provider_bindings rows do, so a
+  fresh provider.register supersedes the dead row rather than
+  "restored leases re-binding"; the FULL LineAssignment
+  enumerations list all four hardware fields;
+  ensure_aware_utc bounds stamps SYMMETRICALLY to now +- 3650 days
+  so a far-past stale stamp can never poison dedup keys,
+  watermarks or idle-deadline arithmetic; and the
+  event.media_overflow pin is structural
+  (EventName/EVENT_PAYLOAD_TYPES + {lease_id, line_id}), not a
+  doc-substring check.
 why: >-
   The swe-2 paranoid audit (SA_swe2_review_1, software-engineer-2
   registry, issue #77) again found the dominant class was
@@ -89,4 +116,5 @@ refs: issue #77, SA_swe2_review_1
 - modifies: docs/specs/line-manager.md#requirement-line-lifecycle-admin-operations-round-28
 - modifies: docs/specs/line-manager.md#requirement-wire-secrets-are-non-string-containers-round-25
 - modifies: docs/specs/line-manager.md#requirement-dial-target-and-caps-validation-is-model-level
+- modifies: docs/specs/line-manager.md#requirement-forwarding-policies-are-loop-safe-and-bounded-round-25
 - modifies: docs/specs/line-manager.md#requirement-the-0x02-flush-watermark-rides-the-agent-stream-clock-round-28

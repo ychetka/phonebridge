@@ -1065,18 +1065,30 @@ HTTP, WAV files, or call bridging:
 - `record_and_telegram:<channel>` - answer, record the call/
   voicemail ourselves, post to a Telegram channel (recording
   architecture expanded round 30, review-19 B2a#9): **beep first** —
-  the policy carries a MANDATORY `announcement_ref` field (round 31,
-  SA_swe2_review_1 item 26 — the checked-identifier selector of the
-  provisioned WAV asset the worker MUST play BEFORE recording
-  starts, the `answer_and_announce` machinery; a recording leg
-  never runs unannounced, so a recorded party never hears dead air
-  and hangs up thinking the line is dead); recording length is
-  bounded by the policy's own `max_recording_sec` field (round 31 —
-  a `RecordAndTelegramFallback` model field, not a `timeouts` knob:
-  default 300 s, `0 < v <= 86400`, the SINGLE authoritative
-  recording bound; the line's optional `max_call_duration_sec`
-  still caps the WHOLE call independently and the stricter of the
-  two wins — see §10 media quotas for the storage side).
+  the policy carries an always-populated `announcement_ref` field
+  (round 31, SA_swe2_review_1 item 26 — the asset selector of the
+  provisioned WAV the worker MUST play BEFORE recording starts, the
+  `answer_and_announce` machinery; a recording leg never runs
+  unannounced, so a recorded party never hears dead air and hangs
+  up thinking the line is dead); recording length is bounded by
+  the policy's own `max_recording_sec` field (round 31 — a
+  `RecordAndTelegramFallback` model field, not a `timeouts` knob:
+  `0 < v <= 86400`, the SINGLE authoritative recording bound; the
+  line's optional `max_call_duration_sec` still caps the WHOLE call
+  independently and the stricter of the two wins — see §10 media
+  quotas for the storage side). **Two config spellings (round-31
+  fix):** the compact `record_and_telegram:<channel>` string carries
+  ONLY the channel selector — `announcement_ref` and
+  `max_recording_sec` fill from their defaults (`builtin:beep`, the
+  packaged beep asset / 300 s), so the compact form always
+  constructs a valid policy and pre-round-31 persisted
+  `fallback_policy_json` lacking the new fields hydrates unchanged;
+  the dict/JSON form `{"policy": "record_and_telegram", "channel":
+  ..., "announcement_ref": ..., "max_recording_sec": ...}` is the
+  explicit-override path for a provisioned asset or a non-default
+  bound (the ref grammar permits `:`/`/` namespaced asset ids —
+  it never rides the compact split, unlike the `:`-banned
+  `answer_and_announce:<ref>` selector).
   **Bot-token storage:** the Telegram bot token is a SECRET —
   stored in the SQLite `escalation_hooks`/`secrets` row alongside
   the channel id, never in `fallback_policy_json` and never on

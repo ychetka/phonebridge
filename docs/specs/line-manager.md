@@ -106,8 +106,15 @@ UNREACHABLE on a lease (round 30): inbound-ring state lives on
 lease phase, and a `CallLease` MUST reject `phase="ringing"`. The
 forward matrix `CALL_PHASE_FORWARD_TRANSITIONS` is:
 `ACQUIRED -> DIALING | ENDED`, `DIALING -> ALERTING | ACTIVE |
-ENDED`, `ANSWERING -> ACTIVE | ENDED`, `ALERTING -> ACTIVE |
-ENDED`, `ACTIVE -> TERMINATING | ENDED`, `TERMINATING -> ENDED`.
+TERMINATING | ENDED`, `ANSWERING -> ACTIVE | TERMINATING | ENDED`,
+`ALERTING -> ACTIVE | TERMINATING | ENDED`, `ACTIVE -> TERMINATING
+| ENDED`, `TERMINATING -> ENDED` — the `TERMINATING` edges out of
+the in-flight phases are the `hangup` path (round-31 fix round,
+PR #78 warning 1): a hangup on a possibly-live dialed call parks
+the lease in `TERMINATING` awaiting the provider's
+`disconnected` or the hold timeout, so every phase where a call
+leg may exist admits the edge, while pre-dial `ACQUIRED` still
+reaches `ENDED` directly.
 `ANSWERING` (round 31, item 2) is the real answer-in-flight rung:
 `call.accept` mints the lease in `ANSWERING` — the inbound answer
 was dispatched to the provider but not yet confirmed — and the
@@ -485,17 +492,23 @@ wall-clock length; `clear_max_call_duration:true` removes a set
 cap and is
 `INVALID_ARGUMENT` together with a value (same PATCH-tombstone
 pattern as `clear_idle_revoke_after`). The
-`record_and_telegram` policy carries its own mandatory
+`record_and_telegram` policy carries its own always-populated
 `announcement_ref` — the pre-record asset the worker MUST play
 BEFORE recording starts, so a recording leg can never run
 unannounced (the FallbackWorker holds no admin scope to resolve a
 missing one at runtime) — and a bounded `max_recording_sec`
-(default 300 s, `0 < v <= 86400`) that is the SINGLE authoritative
+(`0 < v <= 86400`) that is the SINGLE authoritative
 recording-length bound (round 31, item 26): the earlier ambiguity
 between `max_call_duration_sec` and a dedicated knob resolves to
 this policy-level field, while the line's optional
 `max_call_duration_sec` still bounds the WHOLE call independently
-and the stricter of the two wins at runtime.
+and the stricter of the two wins at runtime. Two config spellings
+(round-31 fix): the compact `record_and_telegram:<channel>` string
+carries ONLY the channel — `announcement_ref`/`max_recording_sec`
+fill from their defaults (`builtin:beep` / 300 s) so the compact
+form always constructs a valid policy and persisted policy JSON
+lacking the fields hydrates unchanged; the dict/JSON form is the
+explicit-override path.
 
 ### Requirement: Wire secrets are non-string containers (round 25)
 
@@ -685,11 +698,14 @@ legality is governed solely by
 `last_seen_at` is always kernel receipt
 time and every timer stays kernel-clock. All stamps pass through
 `ensure_aware_utc`, which MUST also guard the pathological range
-(round 31, item 18): a near-`datetime.max` input surfaces as a
+(round 31, item 18; symmetric window from the round-31 fix): a
+near-`datetime.max`/`datetime.min` input surfaces as a
 `ValueError` — never a raw `OverflowError` escaping the
-`astimezone` conversion — and the converted stamp is bounded to
-`datetime.max` minus a reasonable-stamp gap so downstream
-`stamp + timedelta` deadline arithmetic can never overflow.
+`astimezone` conversion — and the converted stamp is bounded
+SYMMETRICALLY to `now ±` the reasonable-stamp gap (3650 days) so
+downstream `stamp + timedelta` deadline arithmetic can never
+overflow and a far-past stale stamp can never poison dedup keys,
+monotonic watermarks or idle-deadline arithmetic.
 
 ### Requirement: Reregister supersedes a live binding, register does not (round 28)
 

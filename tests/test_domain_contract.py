@@ -686,13 +686,28 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     assert isinstance(rec, RecordAndTelegramFallback)
     assert rec.channel == "ops-alerts"
     # Round 31 (SA_swe2_review_1 item 26): the recording leg always
-    # announces - ``announcement_ref`` is required and
+    # announces - ``announcement_ref`` is always populated and
     # ``max_recording_sec`` bounds the recording independently of
     # the line's whole-call cap.
     assert rec.announcement_ref == "rec-note"
     assert rec.max_recording_sec == 300.0
+    # Round-31 fix round (PR #78 warning 4): the compact
+    # ``record_and_telegram:<channel>`` spelling - and any
+    # pre-round-31 persisted policy JSON - carries no
+    # announcement/recording fields, so BOTH carry defaults that
+    # keep the model constructable: ``builtin:beep`` + 300 s.
+    compact = adapter.validate_python({"policy": "record_and_telegram", "channel": "ops-alerts"})
+    assert isinstance(compact, RecordAndTelegramFallback)
+    assert compact.announcement_ref == "builtin:beep"
+    assert compact.max_recording_sec == 300.0
+    direct = RecordAndTelegramFallback(channel="ops-alerts")
+    assert direct.announcement_ref == "builtin:beep"
+    assert direct.max_recording_sec == 300.0
+    # The widened ref grammar permits namespaced asset ids
+    # (``builtin:beep`` itself) while the ``channel`` field keeps
+    # the strict no-":" split-safe grammar.
     with pytest.raises(ValidationError):
-        adapter.validate_python({"policy": "record_and_telegram", "channel": "ops-alerts"})
+        adapter.validate_python({"policy": "record_and_telegram", "channel": "ops:alerts"})
     with pytest.raises(ValidationError):
         adapter.validate_python(
             {
@@ -848,22 +863,29 @@ def test_event_wire_name_parity() -> None:
     doc_event_rows = set(re.findall(r"^\|\s*`(event\.[a-z_]+)`\s*\|", api_contract, flags=re.M))
     reserved_rows = {"event.media_overflow"}
     assert doc_event_rows == set(EVENT_WIRE_NAMES.values()) - reserved_rows
-    assert "`event.media_overflow" in api_contract
-    assert "{lease_id, line_id}" in api_contract
+    # Structural pin on the reserved event (round-31 fix round, PR
+    # #78 minor 8 - replaces the earlier doc-substring asserts):
+    # the enum member exists, its wire spelling is exact, the
+    # payload mapping lands on MediaOverflowEvent and the payload
+    # field set is exactly {lease_id, line_id} - the bounded
+    # identifiers-only shape the overflow episode fact must keep.
+    assert EventName.MEDIA_OVERFLOW in EVENT_PAYLOAD_TYPES
+    assert EVENT_WIRE_NAMES[EventName.MEDIA_OVERFLOW] == "event.media_overflow"
+    assert EVENT_PAYLOAD_TYPES[EventName.MEDIA_OVERFLOW] is MediaOverflowEvent
+    assert set(MediaOverflowEvent.__pydantic_fields__) == {"lease_id", "line_id"}
+    assert set(MediaOverflowEvent(lease_id=LeaseId("l-1"), line_id=LineId("x")).model_dump()) == {
+        "lease_id",
+        "line_id",
+    }
 
     # Payload parity: every EventName has exactly one payload model,
     # and the model's field names + optionality match the wire row
     # (the reserved ``event.media_overflow`` carries
-    # ``{lease_id, line_id}`` per the doc paragraph above - its
-    # MediaOverflowEvent fields are asserted directly below).
+    # ``{lease_id, line_id}`` - pinned structurally above).
     assert set(EVENT_PAYLOAD_TYPES) == set(EventName)
     table = _doc_event_table()
     assert table, "parsed zero event.* payloads - doc table format changed?"
     assert set(table) == set(EVENT_WIRE_NAMES.values()) - reserved_rows
-    assert set(EVENT_PAYLOAD_TYPES[EventName.MEDIA_OVERFLOW].__pydantic_fields__) == {
-        "lease_id",
-        "line_id",
-    }
     for name, model in EVENT_PAYLOAD_TYPES.items():
         if name is EventName.MEDIA_OVERFLOW:
             continue
@@ -1732,7 +1754,9 @@ def test_call_phase_forward_matrix() -> None:
         # LINE sub-state, never a lease phase; a ring preempting an
         # undialed grant ends it ENDED.
         CallPhase.ACQUIRED: frozenset({CallPhase.DIALING, CallPhase.ENDED}),
-        CallPhase.DIALING: frozenset({CallPhase.ALERTING, CallPhase.ACTIVE, CallPhase.ENDED}),
+        CallPhase.DIALING: frozenset(
+            {CallPhase.ALERTING, CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}
+        ),
         # Round 31 (SA_swe2_review_1 item 2): the RINGING row keeps
         # an EMPTY target set - the enum member is reserved/dead for
         # wire compat, no lease may carry it and nothing may reach
@@ -1742,12 +1766,25 @@ def test_call_phase_forward_matrix() -> None:
         # ANSWERING is accept()'s answer-in-flight phase - the
         # inbound mirror of DIALING, advanced only by the provider's
         # answer confirmation or a disconnected fact.
-        CallPhase.ANSWERING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
-        CallPhase.ALERTING: frozenset({CallPhase.ACTIVE, CallPhase.ENDED}),
+        CallPhase.ANSWERING: frozenset({CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}),
+        CallPhase.ALERTING: frozenset({CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED}),
         CallPhase.ACTIVE: frozenset({CallPhase.TERMINATING, CallPhase.ENDED}),
         CallPhase.TERMINATING: frozenset({CallPhase.ENDED}),
         CallPhase.ENDED: frozenset(),
     }
+    # Round-31 fix round (PR #78 warning 1): TERMINATING is
+    # reachable from EVERY phase where a call leg may exist -
+    # hangup() parks a possibly-live dialed call in TERMINATING
+    # awaiting the provider's disconnected/hold timeout; ACQUIRED
+    # stays the one pre-dial phase that ends ENDED directly.
+    for phase in (
+        CallPhase.DIALING,
+        CallPhase.ANSWERING,
+        CallPhase.ALERTING,
+        CallPhase.ACTIVE,
+    ):
+        assert CallPhase.TERMINATING in CALL_PHASE_FORWARD_TRANSITIONS[phase]
+    assert CallPhase.TERMINATING not in CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.ACQUIRED]
     # Forward-only shape: no self-loops, nothing leaves ENDED, and a
     # regression (ACTIVE -> DIALING/ALERTING) is never listed.
     assert CALL_PHASE_FORWARD_TRANSITIONS[CallPhase.ENDED] == frozenset()
@@ -1842,6 +1879,20 @@ def test_ensure_aware_utc() -> None:
     plus2 = datetime(2026, 11, 14, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
     assert ensure_aware_utc(plus2) == datetime(2026, 11, 14, 12, 0, 0, tzinfo=timezone.utc)
     assert ensure_aware_utc(plus2).tzinfo is timezone.utc
+    # Round-31 fix round (PR #78 minor 7): the plausibility window
+    # is SYMMETRIC around the injected ``now`` - a far-past stamp
+    # is rejected exactly like a far-future one, so a stale
+    # hydrated/reported stamp can never poison dedup keys,
+    # watermarks or idle-deadline arithmetic.
+    gap = timedelta(days=3650)
+    assert ensure_aware_utc(NOW_UTC + gap, now=NOW_UTC) == NOW_UTC + gap
+    assert ensure_aware_utc(NOW_UTC - gap, now=NOW_UTC) == NOW_UTC - gap
+    with pytest.raises(ValueError, match="max reasonable"):
+        ensure_aware_utc(NOW_UTC + gap + timedelta(seconds=1), now=NOW_UTC)
+    with pytest.raises(ValueError, match="min reasonable"):
+        ensure_aware_utc(NOW_UTC - gap - timedelta(seconds=1), now=NOW_UTC)
+    with pytest.raises(ValueError, match="naive now"):
+        ensure_aware_utc(NOW_UTC, now=datetime(2026, 11, 13, 12, 0, 0))
 
 
 def test_dtmf_pattern() -> None:
@@ -5862,8 +5913,12 @@ def test_provider_wire_method_drift() -> None:
     Exclusions are explicit and reviewed: ``token`` is consumed by
     the auth layer before the fact reaches the kernel; ``channel_seq``
     and ``reregister`` are adapter-distilled fields that never ride the
-    wire as named params; ``provider_call_id`` is the round-31 item-20
-    addition whose wire-table row lands in batch 2."""
+    wire as named params. ``provider_call_id`` rides the shared
+    ``provider.call_state`` params cell from the round-31 fix round
+    (PR #78 warning 2) - the same wire row distills into
+    ``IncomingRingIngress`` on ``state:"ringing"`` and into
+    ``ProviderCallStateUpdate`` otherwise, so the test pins BOTH
+    models against the one cell."""
     table = _doc_rpc_table("## Manager namespace", r"provider\.[a-z_]+")
     expected_rows = {
         "provider.register",
@@ -5896,7 +5951,7 @@ def test_provider_wire_method_drift() -> None:
         ),
         "provider.ping": (ProviderLiveness, {"channel_seq"}),
         "provider.capability_update": (ProviderCapabilityUpdate, set()),
-        "provider.call_state": (ProviderCallStateUpdate, {"provider_call_id"}),
+        "provider.call_state": (ProviderCallStateUpdate, set()),
         "provider.reattach_media": (ProviderMediaReattachRequest, set()),
     }
     # Adapter-NORMALIZED params: the wire marks them optional but
@@ -5924,6 +5979,18 @@ def test_provider_wire_method_drift() -> None:
             f"doc-optional-only={doc_optional - model_optional}, "
             f"model-optional-only={model_optional - doc_optional}"
         )
+
+    # The shared ``provider.call_state`` cell also carries the ring
+    # ingress (round-31 fix round, PR #78 warning 2): every
+    # ``IncomingRingIngress`` field MUST ride the same params cell,
+    # with the provider-supplied optionals marked ``?``.
+    ring_fields = set(IncomingRingIngress.__pydantic_fields__)
+    assert ring_fields <= set(table["provider.call_state"]), (
+        "IncomingRingIngress drift vs provider.call_state params cell: "
+        f"missing={ring_fields - set(table['provider.call_state'])}"
+    )
+    doc_optional_cs = {p for p, optional in table["provider.call_state"].items() if optional}
+    assert {"caller_id", "provider_call_id"} <= doc_optional_cs
 
     # audio_ready / audio_lost carry no fact model - they ride the
     # ingest signatures; compare names AND optionality (audio_lost's
@@ -6056,8 +6123,18 @@ def test_admin_wire_method_drift() -> None:
         "admin.pair_window",
         "admin.issue_key",
         "admin.revoke_key",
+        "admin.list_keys",
     }
     assert set(table) == set(method_map) | adapter_owned
+
+    # ``admin.list_keys`` (round-31 fix round, PR #78 warning 3) is a
+    # normative table row: pin the redacted metadata shape so the row
+    # can never drift into returning key material.
+    section = API_CONTRACT_MD.read_text(encoding="utf-8").split("## Admin surface", 1)[1]
+    list_keys_row = next(ln for ln in section.splitlines() if ln.startswith("| `admin.list_keys`"))
+    for field in ("key_id", "scope", "subject_id", "created_at", "last_used_at?", "revoked"):
+        assert field in list_keys_row, f"admin.list_keys row misses {field}"
+    assert table["admin.list_keys"] == {"subject_id": True}
 
     pair_req = set(PairWindowRequest.__pydantic_fields__)
     assert pair_req == set(table["admin.pair_window"]), (
