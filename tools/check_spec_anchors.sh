@@ -36,7 +36,13 @@
 #   spec file. A fragment inside the diff that declares a bare "-"
 #   noop while the same diff touches docs/specs/*.md is REJECTED
 #   (round 31, swe-2 item 40): the spec edit is documented behavior
-#   changing, so it must be anchored, not noop'd away. Without
+#   changing, so it must be anchored, not noop'd away. Coverage is
+#   per-FILE (round 32, swe-2 item 27): EVERY docs/specs/*.md file
+#   changed in the diff must be the target of >=1 adds/modifies/
+#   removes anchor across the fragments that are themselves part of
+#   the diff - a spec file left unanchored by every in-diff fragment
+#   is undocumented behavior, even when some OTHER spec file is
+#   anchored. Without
 #   --base the existence checks above still apply
 #   (a bare "-" noop remains undeclarable - a script cannot prove no
 #   behavior changed).
@@ -174,6 +180,9 @@ if not files:
 
 problems = []
 anchor_cache = {}
+# --base per-file coverage (round 32, swe-2 item 27): spec files
+# anchored by fragments that are themselves inside the diff.
+anchored_specs_by_diff = set()
 for name in files:
     # repo-relative fragment path, matched against the --base diff set
     frag_rel = os.path.relpath(os.path.join(changes_dir, name), top)
@@ -221,6 +230,8 @@ for name in files:
         if norm != spec_rel or not norm.startswith("docs/specs/"):
             problems.append(f"{name}: Spec impact must target docs/specs/, got '{spec_rel}'")
             continue
+        if changed_fragments is not None and frag_rel in changed_fragments:
+            anchored_specs_by_diff.add(spec_rel)
         spec_abs = os.path.join(top, spec_rel)
         if spec_rel not in anchor_cache:
             anchor_cache[spec_rel] = requirement_anchors(spec_abs)
@@ -256,6 +267,19 @@ for name in files:
                 "which is unchanged in this diff - update the spec or "
                 "drop the anchor"
             )
+
+# --base per-file coverage (round 32, swe-2 item 27): EVERY spec
+# file touched by the diff must be anchored by at least one fragment
+# that is itself inside the diff - "some anchor exists somewhere"
+# is not coverage. Fragments outside the diff are pending entries
+# for other changes and cannot vouch for this PR's spec edits.
+if changed_specs is not None:
+    for uncovered in sorted(changed_specs - anchored_specs_by_diff):
+        problems.append(
+            f"{uncovered}: spec file changed in diff but no in-diff "
+            ".changes fragment anchors it - add an adds/modifies/"
+            "removes entry"
+        )
 
 for p in problems:
     print(f"FAIL: {p}", file=sys.stderr)

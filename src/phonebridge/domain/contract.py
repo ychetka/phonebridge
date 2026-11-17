@@ -37,9 +37,10 @@ import hmac
 import math
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from types import MappingProxyType
 from typing import (
     Annotated,
     Any,
@@ -78,6 +79,7 @@ __all__ = [
     "EVENT_AUDIENCE_SCOPES",
     "EVENT_PAYLOAD_TYPES",
     "EVENT_WIRE_NAMES",
+    "IDEMPOTENCY_TTL_SEC",
     "MAX_CALLER_ID_LEN",
     "MAX_CLOCK_SKEW_SEC",
     "MAX_CLOSED_ASSIGNMENTS",
@@ -105,6 +107,7 @@ __all__ = [
     "MAX_SESSIONS_PER_AGENT",
     "MAX_SESSIONS_TOTAL",
     "MAX_TICKETS_PER_SESSION",
+    "MAX_TICK_DEADLINES",
     "MAX_TOKEN_LEN",
     "MEDIA_AUTH_TIMEOUT_SEC",
     "MEDIA_PAIR_TTL_SEC",
@@ -152,6 +155,7 @@ __all__ = [
     "FallbackDecision",
     "FallbackPolicy",
     "FallbackTriggeredEvent",
+    "FanoutAudience",
     "ForwardViaLineFallback",
     "IdleAlertEvent",
     "IncomingCallEvent",
@@ -322,11 +326,19 @@ class RedactedString:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, RedactedString):
             return False
-        # Constant-time secret compare (round 25, review-15 item 39):
-        # ``==`` on the raw str short-circuits on the first differing
-        # byte - a timing oracle for a media/call token checked inside
-        # ``media.auth``/``call.accept``. ``hmac.compare_digest`` makes
-        # the comparison length-tolerant but time-flat. Surrogate-
+        # Constant-time secret compare (round 25, review-15 item 39;
+        # length semantics stated honestly round 32,
+        # SA_swe2_review_2 item 20): ``==`` on the raw str
+        # short-circuits on the first differing byte - a timing
+        # oracle for a media/call token checked inside
+        # ``media.auth``/``call.accept``. ``hmac.compare_digest``
+        # runs in time independent of CONTENT, but it early-outs
+        # on a length MISMATCH - the comparison is constant-time
+        # only for equal-length inputs, and the length of a
+        # presented token is NOT hidden (tokens are fixed-shape
+        # credentials, so the leak is documented and accepted -
+        # the claim here is content-flatness, never length
+        # hiding). Surrogate-
         # safe (round 31, SA_swe2_review_1 item 30): a pathological
         # value carrying an unpaired surrogate fails UTF-8 encoding -
         # ``NotImplemented`` lets Python fall back to identity
@@ -387,8 +399,14 @@ def secure_compare(left: RedactedString, right: RedactedString) -> bool:
     """Constant-time secret equality for AUTHENTICATION decisions
     (round 31, SA_swe2_review_1 item 30): the helper
     ``media.auth``/``call.accept``/provider-token checks MUST ride.
-    :func:`hmac.compare_digest` keeps the comparison time-flat and
-    length-tolerant; unpaired surrogates return ``False`` (fail
+    :func:`hmac.compare_digest` keeps the comparison flat w.r.t.
+    token CONTENT; it early-outs on a length mismatch, so it is
+    constant-time ONLY for equal-length inputs and the presented
+    token's length is observable (round 32, SA_swe2_review_2 item
+    20 - the earlier "length-tolerant" wording implied a length
+    hiding the function does not provide; accepted because tokens
+    are fixed-shape credentials). Unpaired surrogates return
+    ``False`` (fail
     closed) rather than raising ``UnicodeEncodeError``. Container
     ``__eq__``/``__hash__``/dict lookups are model conveniences only -
     a hash-table membership test is never an auth verdict."""
@@ -610,17 +628,24 @@ _RedactedT = TypeVar("_RedactedT", bound=RedactedString)
 
 
 def _check_token(value: _RedactedT) -> _RedactedT:
-    """Bearer-token hygiene (round 28, review-18 items 16/17): a
+    """Bearer-token hygiene (round 28, review-18 items 16/17;
+    text gate added round 32, SA_swe2_review_2 item 20): a
     ``CallToken``/``MediaToken`` is a non-empty opaque string of at
     most ``MAX_TOKEN_LEN`` chars - an empty token can never
     authorize anything and an unbounded one is a wire/log bloat
-    hazard. Generic over the token NewTypes so each checked field
+    hazard - and it additionally passes the shared
+    :func:`_require_no_control_text` gate: no control bytes, no
+    unpaired surrogates, never whitespace-only (a token is
+    compared verbatim in ``media.auth``, so an exotic raw value
+    is a credential-smuggling surface, not legitimate entropy).
+    Generic over the token NewTypes so each checked field
     keeps its declared type."""
     raw = value.expose()
     if not raw:
         raise ValueError("token must be non-empty")
     if len(raw) > MAX_TOKEN_LEN:
         raise ValueError(f"token exceeds {MAX_TOKEN_LEN} chars")
+    _require_no_control_text(raw, "token")
     return value
 
 
@@ -631,16 +656,28 @@ banned from every free-form string the contract carries - they
 corrupt logs/terminals, smuggle injected content past reviewers,
 and a NUL can truncate downstream C-string handling."""
 
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+"""Unpaired UTF-16 surrogate code point (round 32,
+SA_swe2_review_2 item 20): JSON decoders admit lone surrogates
+into ``str``, but the value can never be UTF-8 encoded - it
+crashes serialization on the way back out and trips
+``UnicodeEncodeError`` paths the contract's auth helpers had to
+special-case. Rejected at the same gate as control text."""
+
 
 def _require_no_control_text(raw: str, label: str) -> str:
-    """Shared control-character/whitespace-only gate (round 31,
-    SA_swe2_review_1 item 31): a non-empty free-form string must
-    contain no C0/C1/DEL bytes and must not be whitespace-only
-    (``"   "`` passes ``min_length`` but carries no information -
+    """Shared control-character/surrogate/whitespace-only gate
+    (round 31, SA_swe2_review_1 item 31; unpaired surrogates added
+    round 32, SA_swe2_review_2 item 20): a non-empty free-form
+    string must contain no C0/C1/DEL bytes, no unpaired UTF-16
+    surrogate, and must not be whitespace-only (``"   "`` passes
+    ``min_length`` but carries no information -
     it is the whitespace twin of ``""``). Returns ``raw`` for
     chaining."""
     if _CONTROL_CHAR_RE.search(raw):
         raise ValueError(f"{label} must not contain control characters")
+    if _SURROGATE_RE.search(raw):
+        raise ValueError(f"{label} must not contain unpaired surrogates")
     if not raw.strip():
         raise ValueError(f"{label} must not be whitespace-only")
     return raw
@@ -666,6 +703,24 @@ def _check_caller_number(value: RedactedString) -> RedactedString:
 _CheckedCallToken = Annotated[CallToken, AfterValidator(_check_token)]
 _CheckedMediaToken = Annotated[MediaToken, AfterValidator(_check_token)]
 _CheckedCallerNumber = Annotated[RedactedString, AfterValidator(_check_caller_number)]
+
+
+def _check_idempotency_key(value: str | None) -> str | None:
+    """``idempotency_key`` text gate (round 32, SA_swe2_review_2
+    item 20): same bounded-string rule as every other external
+    string - non-empty when present, at most
+    :data:`MAX_IDEMPOTENCY_KEY_LEN` chars, free of control bytes
+    and unpaired surrogates, never whitespace-only; the key rides
+    logs and dedup-table keys verbatim, so the exotic-text ban is
+    not cosmetic."""
+    if value is None:
+        return None
+    if len(value) > MAX_IDEMPOTENCY_KEY_LEN:
+        raise ValueError(f"idempotency_key exceeds {MAX_IDEMPOTENCY_KEY_LEN} chars")
+    return _require_no_control_text(value, "idempotency_key")
+
+
+_CheckedIdempotencyKey = Annotated[str | None, AfterValidator(_check_idempotency_key)]
 
 
 def _check_profile(value: str) -> str:
@@ -751,17 +806,26 @@ The ``:`` byte is safe HERE because a
 :class:`RecordAndTelegramFallback` ref never rides the compact
 ``<policy>:<param>`` split - the compact spelling carries only
 ``<channel>`` and the ref arrives via the dict/JSON form or the
-default (contrast
-:attr:`AnswerAndAnnounceFallback.announcement_ref`, which DOES ride
-``answer_and_announce:<ref>`` and therefore keeps the strict
-``_CheckedId`` grammar). The alphabet still bans whitespace,
-control bytes, path separators other than ``/`` and glob
-metacharacters."""
+default. :attr:`AnswerAndAnnounceFallback.announcement_ref` shares
+this widened type since round 32 (SA_swe2_review_2 item 19): its
+compact ``answer_and_announce:<ref>`` spelling splits on the
+FIRST colon only, so a ``:``-carrying selector stays inside the
+param. The alphabet still bans whitespace, control bytes, path
+separators other than ``/`` and glob metacharacters, and the
+grammar bans a leading ``/`` and ``..`` segments outright."""
 
 
 def _check_announcement_ref(value: str) -> str:
     """Announcement-asset selector hygiene: non-empty, bounded at
-    ``_ID_MAX_LEN``, matching :data:`_ANNOUNCEMENT_REF_CHARSET`."""
+    ``_ID_MAX_LEN``, matching :data:`_ANNOUNCEMENT_REF_CHARSET`,
+    and traversal-safe (round 32, SA_swe2_review_2 item 19): a
+    leading ``/`` is forbidden - the ref is always resolved
+    RELATIVE to the announcement-asset root - and no ``/``-
+    delimited segment may be ``..`` - a parent-directory escape
+    inside an otherwise-legal charset must never reach the
+    adapter's file lookup. The kernel check is grammar-only: WAV
+    existence/media validation stays ADAPTER-side at
+    ``configure_line`` time."""
     if len(value) > _ID_MAX_LEN:
         raise ValueError(f"announcement_ref exceeds {_ID_MAX_LEN} chars")
     if not _ANNOUNCEMENT_REF_CHARSET.fullmatch(value):
@@ -769,11 +833,16 @@ def _check_announcement_ref(value: str) -> str:
             "announcement_ref must match [A-Za-z0-9][A-Za-z0-9._:/-]* "
             "(asset selectors may carry a ':' namespace or '/' path)"
         )
+    if value.startswith("/"):
+        raise ValueError("announcement_ref is relative - leading '/' is forbidden")
+    if ".." in value.split("/"):
+        raise ValueError("announcement_ref must not contain '..' path segments")
     return value
 
 
 _CheckedAnnouncementRef = Annotated[str, AfterValidator(_check_announcement_ref)]
-"""Bounded announcement-asset selector (``:``/``/`` allowed)."""
+"""Bounded announcement-asset selector (``:``/``/`` allowed; no
+leading ``/``, no ``..`` segments - round 32 item 19)."""
 
 
 def _check_provider_call_id(value: str | None) -> str | None:
@@ -1319,6 +1388,12 @@ class ErrorReason(str, Enum):
     SESSION_LIMIT_EXCEEDED = "SESSION_LIMIT_EXCEEDED"
     CLAIM_NOT_FOUND = "CLAIM_NOT_FOUND"
     INVALID_DTMF = "INVALID_DTMF"
+    # Round 32 (SA_swe2_review_2 item 17): the typed detail on the
+    # INVALID_ARGUMENT a keyed retry gets when the SAME
+    # idempotency_key re-arrives under DIFFERENT params inside the
+    # (method, session_id, key) partition - the stored outcome is
+    # never silently merged with a non-matching request.
+    IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 
 
 class EventName(str, Enum):
@@ -1380,51 +1455,58 @@ table and docs/api-contract.md's ``event.*`` table is caught by
 
 
 _MAX_REASONABLE_STAMP_GAP: timedelta = timedelta(days=3650)
-"""Plausibility horizon for contract timestamps (round 31,
-SA_swe2_review_1 item 18; SYMMETRIC window from the round-31 fix
-round, PR #78 minor 7): any stamp whose converted UTC value lies
-more than this many days from the reference ``now`` - in EITHER
-direction - is rejected. Three failure shapes sit behind it:
-(a) ``astimezone`` itself can raise ``OverflowError`` on a
-near-``datetime.max``/``datetime.min`` year with a large offset,
-leaking a raw non-contract error at the boundary, (b) a surviving
-far-future stamp still explodes the next deadline addition inside
-the kernel (``stamp + timedelta`` is not guarded), and (c) a
-far-PAST stamp is just as poisonous - a hydrated or reported
-stamp years stale would poison dedup windows, ordering keys and
-idle/last-seen arithmetic in the mirror-image direction. Failing
-closed at validation keeps all three defects a contract
+"""Far-future safety margin for contract timestamps (round 31,
+SA_swe2_review_1 item 18): any stamp whose converted UTC value
+lies within this many days of ``datetime.max`` is rejected. Two
+failure shapes sit behind it: (a) ``astimezone`` itself can raise
+``OverflowError`` on a near-max year with a large negative offset,
+leaking a raw non-contract error at the boundary, and (b) a
+surviving near-max stamp still explodes the next deadline
+addition inside the kernel (``stamp + timedelta`` is not guarded).
+Failing closed at validation keeps both defects a contract
 ``ValueError`` (INVALID_ARGUMENT at the adapter)."""
 
 
-def ensure_aware_utc(value: datetime, now: datetime | None = None) -> datetime:
+_MIN_REASONABLE_STAMP: datetime = datetime(2000, 1, 1, tzinfo=timezone.utc)
+"""Far-past plausibility floor for contract timestamps (round 32,
+SA_swe2_review_2 item 4 - ABSOLUTE bound, deliberately NOT
+now-relative): any stamp before the year 2000 is rejected. The
+floor exists to catch ``datetime.min``/epoch-zero garbage and
+pre-Y2K RTC garbage without re-introducing the round-31
+``now - gap`` window - a relative bound made validation depend on
+the host clock (the pydantic path has no injected ``now``), so an
+RTC-less provider reporting epoch-1970 stamps or a >10-year-old
+durable row would wedge at model construction instead of being
+handled as advisory input. The only clock-sensitive bound is the
+``+MAX_CLOCK_SKEW_SEC`` clamp :func:`clamp_provider_stamp` applies
+where elapsed math actually needs it."""
+
+
+def ensure_aware_utc(value: datetime) -> datetime:
     """Enforce CODING_HAZARDS rule 6: reject naive datetimes; normalize
     aware values to canonical UTC. Public (round 20) so that runtime
     entry points - e.g. every ``LineManager.tick(now)`` implementation
     and any adapter ingress bypassing pydantic validation - can apply
     the same check the ``AwareDatetime`` annotation only documents.
 
-    ``now`` (round-31 fix round, PR #78 minor 7) is the reference
-    instant for the plausibility window: callers that already hold
-    a kernel clock (``tick``, tests, hydration) inject it so the
-    window is computed against THEIR ``now``; ``None`` falls back
-    to the wall clock - the shape the pydantic ``AfterValidator``
-    path always takes.
-
-    Pathological-range guard (round 31, SA_swe2_review_1 item 18):
-    the UTC conversion is wrapped so a near-``datetime.max``/
-    ``datetime.min`` stamp (a huge year plus a large offset)
-    surfaces as a ``ValueError`` - never a raw ``OverflowError`` -
-    and the converted result is bounded SYMMETRICALLY to
-    ``now +-`` :data:`_MAX_REASONABLE_STAMP_GAP` (round-31 fix,
-    PR #78 minor 7): the earlier future-only bound let a
-    far-past stamp - a stale hydrated ``last_seen_at``, a
-    clock-set-back provider stamp - slide through and poison dedup
-    keys, monotonic watermarks, ordering and idle-deadline
-    arithmetic in exactly the mirror image of the far-future case;
-    a +-10-year window around ``now`` is generous for every
-    legitimate contract stamp while catching both poisoned
-    directions fail-closed."""
+    Pathological-range guard (round 31, SA_swe2_review_1 item 18;
+    ABSOLUTE bounds pinned round 32, SA_swe2_review_2 item 4): the
+    UTC conversion is wrapped so a near-``datetime.max`` stamp
+    (a huge year plus a large negative offset) surfaces as a
+    ``ValueError`` - never a raw ``OverflowError`` - and the
+    converted result is bounded ABSOLUTELY to
+    [:data:`_MIN_REASONABLE_STAMP`,
+    ``datetime.max - _MAX_REASONABLE_STAMP_GAP``]. The bound is
+    deliberately NOT relative to ``now`` (the round-31 ``now +-
+    3650d`` window was itself the defect, SA_swe2_review_2 item 4):
+    pydantic validation has no kernel clock, a relative window
+    would make every stored/advisory stamp's legality drift with
+    wall-clock time, and clock-sensitivity belongs only where
+    elapsed math needs it - :func:`clamp_provider_stamp`'s
+    ``+MAX_CLOCK_SKEW_SEC`` future clamp on provider stamps. A
+    far-future stamp is bounded so downstream
+    ``stamp + timedelta`` deadline arithmetic can never overflow;
+    a pre-2000 stamp is rejected as garbage either way."""
     if not isinstance(value, datetime):
         raise TypeError(f"expected datetime, got {type(value).__name__}")
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
@@ -1433,33 +1515,10 @@ def ensure_aware_utc(value: datetime, now: datetime | None = None) -> datetime:
         converted = value.astimezone(timezone.utc)
     except OverflowError as exc:
         raise ValueError("datetime outside representable UTC range") from exc
-    if now is None:
-        now_utc = datetime.now(timezone.utc)
-    else:
-        if not isinstance(now, datetime):
-            raise TypeError(f"expected datetime for now, got {type(now).__name__}")
-        if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
-            raise ValueError("naive now rejected: the reference instant must be timezone-aware")
-        try:
-            now_utc = now.astimezone(timezone.utc)
-        except OverflowError as exc:
-            raise ValueError("now outside representable UTC range") from exc
-    # An injected ``now`` could itself sit near datetime.min/max -
-    # clamp the window edges instead of letting the addition
-    # overflow (a degenerate ``now`` widens the window, never
-    # narrows it).
-    try:
-        upper = now_utc + _MAX_REASONABLE_STAMP_GAP
-    except OverflowError:
-        upper = datetime.max.replace(tzinfo=timezone.utc)
-    try:
-        lower = now_utc - _MAX_REASONABLE_STAMP_GAP
-    except OverflowError:
-        lower = datetime.min.replace(tzinfo=timezone.utc)
-    if converted > upper:
-        raise ValueError("datetime beyond max reasonable stamp range")
-    if converted < lower:
+    if converted < _MIN_REASONABLE_STAMP:
         raise ValueError("datetime below min reasonable stamp range")
+    if converted > datetime.max.replace(tzinfo=timezone.utc) - _MAX_REASONABLE_STAMP_GAP:
+        raise ValueError("datetime beyond max reasonable stamp range")
     return converted
 
 
@@ -1511,16 +1570,35 @@ key is a non-empty string of at most 128 chars - an empty or
 overlong key is INVALID_ARGUMENT at the boundary."""
 
 MAX_IDEMPOTENCY_KEYS_PER_SESSION: int = 256
-"""Bound on the per-session ``call.acquire`` dedup table (round 29,
-SA_quant_review_1 slice-B item 6; rule 7): the
-``(session_id, idempotency_key)`` outcome entries live only inside
-the LIVE session, but a long-lived session minting a fresh key on
-every call would otherwise grow the table without bound. Once a
-session already holds this many entries, a NEW key is rejected
-``RESOURCE_EXHAUSTED`` fail-closed - the table is never
-LRU-trimmed, because evicting a recorded outcome would let a
-same-key retry re-execute an acquire the dedup table was built to
-absorb."""
+"""Bound on the per-session keyed-dedup table (round 29,
+SA_quant_review_1 slice-B item 6; overflow policy REVERSED round
+32, SA_swe2_review_2 item 17): the
+``(method, session_id, idempotency_key)`` outcome entries live
+only inside the LIVE session, but a long-lived session minting a
+fresh key on every call would otherwise grow the table without
+bound. Overflow policy is bounded LRU: once a session already
+holds this many entries, the OLDEST entry is evicted to admit
+the new key - a NEW key is NEVER rejected, because the
+round-29 ``RESOURCE_EXHAUSTED`` fail-closed rule punished a
+legitimate long-lived session for its clients' retry hygiene,
+while an evicted entry's key replaying later simply re-executes
+(a stale retry window, bounded by the TTL below)."""
+
+IDEMPOTENCY_TTL_SEC: float = 3600.0
+"""Time-to-live of one keyed-dedup outcome entry (round 32,
+SA_swe2_review_2 item 17): an entry recorded for
+``(method, session_id, key)`` stops deduping once it is older
+than one hour - a retry arriving after the TTL re-executes the
+operation fresh (the idempotency contract is a bounded retry
+window, not a permanent operation alias). Entries are evicted
+earlier only by the :data:`MAX_IDEMPOTENCY_KEYS_PER_SESSION` LRU
+bound or by ``drop_session`` tearing the whole session table
+down; inside the TTL a same-key replay returns the STORED
+result verbatim (``replay-after-completion`` - the recorded
+outcome is served, never re-derived), and the same key under
+DIFFERENT params inside the live entry's window is
+``INVALID_ARGUMENT`` with
+``ErrorReason.IDEMPOTENCY_CONFLICT``."""
 
 MAX_PENDING_CLAIMS_PER_AGENT: int = 8
 """Bounded pending ``call.claim_exclusive`` requests per agent
@@ -1712,26 +1790,43 @@ every queue/liveness sweep into unbounded work.
 :meth:`LineAdminKernel.provision_line` MUST reject a provisioning
 attempt beyond this count with ``RESOURCE_EXHAUSTED``."""
 
+MAX_TICK_DEADLINES: int = 256
+"""Bound on deadline items one ``tick`` call processes (round 32,
+SA_swe2_review_2 item 2): every deadline class ``tick`` owns -
+accept windows, grant TTLs, ring-drain TTLs, media-pair TTLs,
+``hangup_hold_sec`` lapses, orphan-grace deadlines, idle alerts -
+is processed for at most this many expired items per call; items
+beyond the bound stay pending and are processed on the NEXT
+``tick`` (continuation, not loss), so a mass-expiry wave can
+never wedge one ``tick`` into an over-cap burst or starve the
+event loop. Deadline volume can NEVER surface
+``RESOURCE_EXHAUSTED`` - expiry is liveness bookkeeping, not a
+client request, so backpressure is expressed as deferral, never
+rejection."""
+
 OUTBOX_HARD_CAP: int = 8192
 """Final bounded-capacity guard of the outbox (round 30,
 SA_carbon_review_19 slice-A item 7; re-derived round 31,
-SA_swe2_review_1 item 16): the absolute bound EVERY mutation -
+SA_swe2_review_1 item 16; true worst case pinned round 32,
+SA_swe2_review_2 item 2): the absolute bound EVERY mutation -
 including soft-cap-exempt teardown, admin cascades and ring fanout
 - checks BEFORE committing partial state; overflow is
-RESOURCE_EXHAUSTED. Sized above the worst-case single-mutation
-burst with margin: the theoretical maximum adds up
-``OUTBOX_SOFT_CAP`` steady-state (256) + a ``missed_call`` fanout
-wave to all :data:`MAX_SESSIONS_TOTAL` sessions (512) + a queue
-drain over :data:`MAX_QUEUE_TICKETS_TOTAL` head tickets (1024) +
-teardown of every live lease
-(``MAX_SESSIONS_TOTAL * MAX_LEASES_PER_SESSION`` = 4096) + a
-:data:`MAX_LINES_TOTAL`-wide admin cascade (256) + the same
-missed-call fanout repeated on a second line's concurrent decision
-(512) ~= 6656 entries; the round-30 derived formula
-(``256 + 512 + 256 + 4096 = 5120``) already sat BELOW that true
-worst case, so round 31 pins the flat ``8192`` headroom instead of
-a fragile closed-form re-sum (audit items 16-18 verified the
-under-sizing by inspection)."""
+RESOURCE_EXHAUSTED for client-driven mutations only - deadline
+volume inside ``tick`` is deferred by
+:data:`MAX_TICK_DEADLINES`, never rejected. Sizing: with the
+round-32 single-envelope fan-out (one ``FanoutAudience`` envelope
+per line wave, not one per session) a single deadline emits at
+most a small constant of envelopes (~8: ring events, queue drain,
+lease teardown, binding cascade), so the true worst-case
+``tick`` burst is
+``MAX_TICK_DEADLINES * 8`` = 2048 envelopes + the
+:data:`OUTBOX_SOFT_CAP` steady-state floor (256) + a
+:data:`MAX_LINES_TOTAL`-wide admin cascade (256) + teardown of
+every live lease (``MAX_SESSIONS_TOTAL * MAX_LEASES_PER_SESSION``
+= 4096) ~= 6656 - the flat ``8192`` headroom covers it with
+margin, where the pre-round-32 O(sessions) fan-out arithmetic
+(512-envelope ring waves) was the livelock risk the bounded tick
+and single-envelope fan-out remove together."""
 
 MAX_LIST_PAGE: int = 64
 """Page bound for the shared ``{offset?, limit?}`` window on the
@@ -1749,7 +1844,21 @@ round-29 value of 256 was arithmetic on smaller rows; with
 frame. ``admin.list_provider_bindings`` answers with the COMPACT
 projection for the same reason (``meta`` is stripped from the
 listing rows; the field remains readable through
-``admin.get_line``/the binding record itself)."""
+``admin.get_line``/the binding record itself).
+
+Wire envelope (round 32, SA_swe2_review_2 item 13): every listing
+reply - the seven methods above plus the non-kernel
+``admin.list_keys``, which accepts the same
+``{subject_id?, offset?, limit?}`` window - wraps its rows in
+``{<rows>, has_more, cursor}``: ``has_more`` is ``true`` exactly
+when rows exist past the returned slice and ``cursor`` is the
+adapter's opaque encoding of the authoritative resume offset
+(``null`` when ``has_more`` is false). The kernel surface keeps
+returning ``list[T]`` - the slice contract (stable order,
+bounded window) already carries everything the adapter needs to
+stamp the two fields, and a mid-page byte-cap truncation
+publishes the TRUE resume point through ``cursor`` rather than
+the arithmetic ``offset+limit``."""
 
 MAX_DETAIL_LEN: int = 256
 """Upper bound on ``ErrorData.detail`` (round 27, review-17 item
@@ -1844,7 +1953,12 @@ def clamp_provider_stamp(stamp: datetime, now: datetime) -> datetime:
     dedupe/ordering key and never feeds elapsed-time math. Both
     arguments pass through :func:`ensure_aware_utc` first - the
     same reject-naive/normalize-UTC convention every runtime
-    entry point applies."""
+    entry point applies (round 32, SA_swe2_review_2 item 4: the
+    bound is ABSOLUTE, so this clamp is the only ``now``-relative
+    rule - a provider stamp is rejected only when naive or
+    outside the absolute plausibility range, skew handling is
+    exactly the ``+MAX_CLOCK_SKEW_SEC`` future normalization
+    above)."""
     stamp_utc = ensure_aware_utc(stamp)
     now_utc = ensure_aware_utc(now)
     if stamp_utc - now_utc > timedelta(seconds=MAX_CLOCK_SKEW_SEC):
@@ -2189,7 +2303,7 @@ def _provider_caps_check(caps: tuple[Intent, ...]) -> tuple[Intent, ...]:
     return caps
 
 
-def _bounded_meta(meta: dict[str, str]) -> dict[str, str]:
+def _bounded_meta(meta: Mapping[str, str]) -> Mapping[str, str]:
     """Shared bound for provider ``meta`` maps (round 22, review-10
     MEDIUM-5; extracted for reuse on :class:`ProviderBinding` in
     round 27, review-17 item 27): an unbounded provider-controlled
@@ -2219,8 +2333,14 @@ def _bounded_meta(meta: dict[str, str]) -> dict[str, str]:
     # never corrupt the stored kernel fact. Hardened to a defensive
     # DEEP copy in round 30 (SA_carbon_review_19 slice-A item 14):
     # values are ``str`` (immutable) today, so the deep copy is cheap
-    # insurance against any future widened value type.
-    return copy.deepcopy(meta)
+    # insurance against any future widened value type. Round 32
+    # (SA_swe2_review_2 item 24 - "immutable meta" pin): the copy is
+    # wrapped in ``MappingProxyType`` so the STORED map is read-only
+    # at runtime, not merely by convention - a mutation attempt
+    # raises ``TypeError`` instead of silently diverging kernel state
+    # from the persisted/listing mirror. ``dict(meta)`` materializes
+    # first because ``deepcopy`` cannot reduce a proxy.
+    return MappingProxyType(copy.deepcopy(dict(meta)))
 
 
 # ---------------------------------------------------------------------------
@@ -2402,12 +2522,18 @@ class AnswerAndAnnounceFallback(ContractModel):
     FallbackWorker connects via the standard agent API only (ADR-01),
     so the policy model itself MUST carry the announcement selector:
     the worker has no admin scope to query line config. Wire config
-    spelling: ``answer_and_announce:<announcement_ref>`` - the ref is
-    a checked identifier (``_CheckedId``) because a ``":"`` inside it
-    would corrupt the adapter's ``<policy>:<param>`` split."""
+    spelling: ``answer_and_announce:<announcement_ref>`` - the ref
+    rides :data:`_CheckedAnnouncementRef` since round 32
+    (SA_swe2_review_2 item 19 - it accepts ``builtin:*`` namespaced
+    selectors like ``builtin:wav/ringback`` the strict
+    ``_CheckedId`` grammar rejected): the adapter's compact
+    ``<policy>:<param>`` split is FIRST-colon only, so a ``:``
+    inside the ref stays inside the param; the ``..``/leading-``/``
+    bans make the grammar traversal-safe, and WAV existence is
+    validated ADAPTER-side at ``configure_line``, never here."""
 
     policy: Literal["answer_and_announce"] = "answer_and_announce"
-    announcement_ref: _CheckedId
+    announcement_ref: _CheckedAnnouncementRef
 
 
 FallbackPolicy = Annotated[
@@ -2566,6 +2692,19 @@ class LineTimeouts(ContractModel):
     where ``None`` is the resolved state, not an unpatched knob.
     When set it bounds every call's duration on the line and caps
     the ``record_and_telegram`` fallback's recording length."""
+    hangup_hold_sec: float = Field(default=10.0, ge=1.0, le=120.0)
+    """Bound on the ``TERMINATING`` hold (round 32, SA_swe2_review_2
+    item 1): after :meth:`LineManager.hangup` parks an in-flight
+    lease in ``TERMINATING`` and queues ``line.hangup``, the kernel
+    waits at most this long for the provider's ``disconnected``
+    confirmation - on lapse ``tick`` ends the lease with
+    ``CallEndReason.NETWORK_ERROR`` as a KERNEL-side timeout fact
+    (never a synthesized provider ``disconnected`` fact, which
+    would fabricate a provider report), frees the line and drains
+    the FIFO so a lost/wedged hangup can never hold the line BUSY
+    forever. Tight 1..120 s bound (not the generic one-day
+    ceiling): the hold is a modem-confirmation grace, not a
+    session-length knob."""
 
     @model_validator(mode="after")
     def _heartbeat_thresholds_ordered(self) -> LineTimeouts:
@@ -2774,7 +2913,7 @@ class AdminLineView(ContractModel):
     provider binding is attached, else ``assignment.profile`` - the
     admin listing shows what the stored label actually resolved to,
     bounded by :data:`MAX_PROFILE_LEN`."""
-    provider_meta: dict[str, str] = Field(default_factory=dict)
+    provider_meta: Mapping[str, str] = Field(default_factory=dict)
     """Live binding metadata mirror - the admin-scoped home of the
     field removed from :class:`LineSummary` (round 28, review-18
     item 13): filled with ``binding.meta`` while a live provider
@@ -2784,7 +2923,7 @@ class AdminLineView(ContractModel):
 
     @field_validator("provider_meta")
     @classmethod
-    def _provider_meta_bounds(cls, meta: dict[str, str]) -> dict[str, str]:
+    def _provider_meta_bounds(cls, meta: Mapping[str, str]) -> Mapping[str, str]:
         """Same ``_bounded_meta`` invariant as the register ingress
         (round 28, review-18 item 13) - the admin listing mirror
         never exceeds what ``provider.register`` accepted."""
@@ -2931,10 +3070,14 @@ class LineAssignment(ContractModel):
     last_seen_at: AwareDatetime
     """Activity stamp for the ``idle_revoke_after`` window (round 24,
     review-13 H4; owner-only stamping corrected round 30,
-    SA_carbon_review_19 slice-A item 4): refreshed to ``now`` ONLY
-    by OWNER line operations (the owning agent's
-    acquire/dial/accept/release/send_dtmf/claim activity on the
-    line) and by ``drop_session`` closing the owner's LAST open
+    SA_carbon_review_19 slice-A item 4; operation list unified
+    round 32, SA_swe2_review_2 item 26): refreshed to ``now`` ONLY
+    by OWNER line operations - EVERY owner-attributed mutation on
+    the line counts identically: acquire/dial/accept/hangup/
+    answer/release/send_dtmf/reattach_media/claim, with no
+    privileged subset (an owner that hangs a call up or reattaches
+    media is exercising the line exactly like one that dials) -
+    and by ``drop_session`` closing the owner's LAST open
     session - the moment the idle window starts. Provider-side
     facts (``provider.ping``/liveness, ``ingest_ring``,
     ``ingest_call_state``) and admin ``configure_line`` MUST NOT
@@ -3050,7 +3193,36 @@ class ProviderBinding(ContractModel):
     binding at register time so a ``configure_line`` patch can never
     move a deadline under a live session. ``UNBOUND`` can never be
     stored here: a binding existing at all means a provider is
-    attached - UNBOUND is the listing-only absence of this record."""
+    attached - UNBOUND is the listing-only absence of this record.
+
+    Persistence contract (round 31, SA_swe2_review_1 item 22;
+    cache semantics pinned round 32, SA_swe2_review_2 items
+    14/15): the ``provider_bindings`` row is a BEST-EFFORT CACHE
+    of the live record, not a second source of truth - a
+    write-through failure raises the ``config_stale`` condition
+    plus an admin alert and NOTHING ELSE: no kernel compensation,
+    no ``restore_line`` call (that hook is ``LineAssignment``-
+    shaped only), because the provider's next successful
+    ``provider.register``/``provider.reregister`` rewrites the row
+    anyway. ``last_seen_at`` writes are DEBOUNCED through the
+    writer task - at most one persisted stamp per ``>= 30 s``
+    coalesce window, never one row write per ``provider.ping``;
+    the kernel's in-memory copy still updates per fact (liveness
+    math reads memory, never the row). The persisted row ALSO
+    carries the provider-stamp watermark (the highest applied
+    ``observed_at``/``checked_at`` per binding) so a restart
+    cannot re-apply replayed facts below the watermark, and
+    ``channel_seq`` reseeds as ``max(stored) + 1`` across
+    restarts - a hydrated generation is never re-issued, so a
+    stale socket's facts can never pass the live-generation check
+    against a restored binding. A hydrated row loads DEAD by
+    construction (``liveness: ws_disconnected`` + an
+    already-expired ``orphan_deadline_at``; see
+    ``LineAdminKernel.hydrate_lines``) and the hydrated-dead
+    ``tick`` cascade SUPPRESSES the external escalation hooks a
+    live-binding teardown would fire - the restart window is
+    tagged by the hydration epoch, so webhooks never re-alert on
+    provider deaths that predate the process."""
 
     assignment_id: _CheckedAssignmentId
     line_id: _CheckedLineId
@@ -3068,13 +3240,15 @@ class ProviderBinding(ContractModel):
     :attr:`ProviderRegistration.profile` - the binding carries the
     label the provider declared so the ``LineSummary`` mirror can
     never hold an unlistable value."""
-    meta: dict[str, str] = Field(default_factory=dict)
+    meta: Mapping[str, str] = Field(default_factory=dict)
     """Opaque provider metadata carried over from the registration
     (round 27, review-17 item 27): ``register_provider`` MUST copy
     the incoming ``ProviderRegistration.meta`` verbatim so admin
     diagnostics can inspect it; the same ``_bounded_meta``
-    invariant applies. Kept as ``dict`` for wire parity - treat
-    contents as immutable by convention.
+    invariant applies. Typed ``Mapping`` + wrapped in
+    ``MappingProxyType`` at validation (round 32, SA_swe2_review_2
+    item 24): the stored map is read-only at runtime - a mutation
+    attempt is a ``TypeError``, not a silent divergence.
 
     Ownership rule (round 28, review-18 item 16): the binding holds
     the kernel's OWN copy - ``_bounded_meta`` returns a fresh dict
@@ -3133,12 +3307,18 @@ class ProviderBinding(ContractModel):
     connected_at: AwareDatetime
     last_seen_at: AwareDatetime
     orphan_deadline_at: AwareDatetime | None = None
-    """Orphan-grace deadline - in-memory only (round 27, review-17
-    item 76): bindings are NOT durable state, so a kernel restart
-    discards every deadline together with the sockets they guarded
-    - the single-process kernel owns the provider control sockets,
-    and a restart kills them, so no zombie binding can survive
-    into the next process anyway."""
+    """Orphan-grace deadline (round 27, review-17 item 76;
+    persistence corrected round 32, SA_swe2_review_2 items
+    14/15): the field IS persisted on the ``provider_bindings``
+    cache row - a restart discards the sockets the deadline
+    guarded but NOT the binding row, which hydrates DEAD with an
+    already-expired deadline so the first ``tick`` runs the
+    orphan cascade deterministically instead of relying on wall
+    time. The deadline is projected verbatim onto the
+    admin-scoped binding listing (``ProviderBindingSummary``
+    carries it, round 32 item 24) so an operator can see a
+    binding inside its grace window - a ``null`` there means
+    ``ws_disconnected`` is not the binding's rung."""
     channel_seq: int = Field(ge=1)
     """Generation of the control socket this binding last accepted a
     fact from (round 30, SA_carbon_review_19 slice-A item 10): the
@@ -3158,7 +3338,7 @@ class ProviderBinding(ContractModel):
 
     @field_validator("meta")
     @classmethod
-    def _meta_bounds(cls, meta: dict[str, str]) -> dict[str, str]:
+    def _meta_bounds(cls, meta: Mapping[str, str]) -> Mapping[str, str]:
         """Same ``_bounded_meta`` invariant as the register ingress
         (round 27, review-17 item 27) - enforced on the stored
         binding so a carried-over map can never be unbounded."""
@@ -3244,15 +3424,17 @@ class CallLease(ContractModel):
     ``call_state_changed{reason: "grant_ttl_expired"}`` by
     ``tick()``. Phase coherence (model-enforced by
     ``_lease_invariants``, rounds 30/31 - SA_swe2_review_1 items
-    2/37): the field is REQUIRED on ``ACQUIRED`` - every grant
-    carries a TTL, an undialed lease without one would park the
-    line forever - and MUST lie at-or-after ``created_at``; it MAY
-    still ride ``DIALING``/``ALERTING`` (the dial consumed the
-    grant semantically but the field documents the consumed
-    deadline); and it is CONSUMED from ``ANSWERING`` on - the
-    accept already spent the grant - so
-    ``ANSWERING``/``ACTIVE``/``TERMINATING``/``ENDED`` leases MUST
-    carry ``None``."""
+    2/37; tightened round 32, SA_swe2_review_2 item 21): the
+    field is REQUIRED on ``ACQUIRED`` - every grant carries a
+    TTL, an undialed lease without one would park the line
+    forever - and MUST lie at-or-after ``created_at``; it is
+    consumed the instant the grant is spent, so EVERY later phase
+    - ``DIALING``/``ANSWERING``/``ALERTING``/``ACTIVE``/
+    ``TERMINATING``/``ENDED`` - MUST carry ``None`` (the
+    round-30 tolerance for a still-recorded deadline on
+    ``DIALING``/``ALERTING`` is gone: a consumed deadline is not
+    documentation, it is a stale field a reader could
+    mis-enforce)."""
     profile: _CheckedProfile | None = Field(default=None, max_length=MAX_PROFILE_LEN)
     """The ``acquire(profile=...)`` label the agent asked for, saved
     on the lease (round 28, review-18 item 13): the acquire contract
@@ -3288,16 +3470,11 @@ class CallLease(ContractModel):
             raise ValueError(
                 "answered_at/'confirmed' answer_confidence require an established call"
             )
-        if (
-            self.phase
-            in (
-                CallPhase.ANSWERING,
-                CallPhase.ACTIVE,
-                CallPhase.TERMINATING,
-                CallPhase.ENDED,
-            )
-            and self.grant_expires_at is not None
-        ):
+        if self.phase is not CallPhase.ACQUIRED and self.grant_expires_at is not None:
+            # Round 32 (SA_swe2_review_2 item 21): the deadline
+            # field exists ONLY while the grant is unspent - a
+            # post-ACQUIRED phase carrying it would document a
+            # consumed deadline a reader could mis-enforce.
             raise ValueError("grant_expires_at is consumed once the grant was spent")
         if self.phase is CallPhase.ACQUIRED and self.grant_expires_at is None:
             raise ValueError("an ACQUIRED lease must carry grant_expires_at")
@@ -3353,6 +3530,22 @@ class QueueTicket(ContractModel):
     item 22): ``drop_session`` discards the session's
     ``(session_id, idempotency_key)`` entries together with its
     tickets, so a key can never dedup across a reconnect.
+
+    Re-check triggers (round 32, SA_swe2_review_2 item 16 - the
+    enumeration the round-31 "re-check every free line" rule
+    implies): the pending set is re-evaluated at EVERY mutation
+    that can change eligibility, not only inside ``tick`` - a
+    lease ENDED/line freed (hangup, provider ``disconnected``,
+    ``hangup_hold_sec`` lapse, dead-man teardown, orphan
+    cascade), a fresh ``provider.register`` binding a previously
+    unbound line, a ``provider.capability_update`` widening or
+    narrowing caps, a claim resolution or ``release_assignment``
+    returning a line to the pool, a new ticket enqueue (the new
+    ticket itself may be
+    immediately servable), and every ``tick`` deadline expiry.
+    A grant is issued only from a re-check that ran AFTER the
+    triggering mutation committed, so a ticket can never observe
+    a line the same transaction already allocated elsewhere.
     """
 
     ticket_id: _CheckedTicketId
@@ -3361,13 +3554,16 @@ class QueueTicket(ContractModel):
     intent: Intent
     preferred_line_id: _CheckedLineId | None = None
     enqueued_at: AwareDatetime
-    idempotency_key: str | None = Field(
+    idempotency_key: _CheckedIdempotencyKey = Field(
         default=None, min_length=1, max_length=MAX_IDEMPOTENCY_KEY_LEN
     )
-    """Bounded when present (round 23, review-12 M2): a key is either
+    """Bounded when present (round 23, review-12 M2; text gate
+    round 32, SA_swe2_review_2 item 20): a key is either
     absent (no dedup - every call is independent) or a non-empty
-    string of at most ``MAX_IDEMPOTENCY_KEY_LEN`` chars; an empty or
-    overlong key is rejected as INVALID_ARGUMENT at the boundary."""
+    string of at most ``MAX_IDEMPOTENCY_KEY_LEN`` chars free of
+    control bytes/surrogates and never whitespace-only; an empty,
+    overlong or exotic key is rejected as INVALID_ARGUMENT at the
+    boundary."""
     profile: _CheckedProfile | None = Field(default=None, max_length=MAX_PROFILE_LEN)
     """The ``acquire(profile=...)`` label recorded on the ticket
     (round-28 fix, PR #72 review - audit item 20 named BOTH
@@ -3377,6 +3573,21 @@ class QueueTicket(ContractModel):
     when the ticket is granted INHERITS it verbatim. Same
     ``1..MAX_PROFILE_LEN`` bound as :attr:`CallLease.profile` -
     ``None`` means the acquire carried no label."""
+
+    @field_validator("intent")
+    @classmethod
+    def _intent_is_dial_out(cls, intent: Intent) -> Intent:
+        """``call.acquire`` serves ONLY ``dial_out`` (round 32,
+        SA_swe2_review_2 item 16 - the pin the api-contract "Queue
+        semantics" section already documented but the model never
+        enforced): inbound rings are consumed by
+        ``call.accept(call_token)`` without a grant, durable
+        exclusivity rides ``call.claim_exclusive``, so a ticket
+        carrying any other intent is a defect row that could only
+        park forever - reject it at construction instead."""
+        if intent is not Intent.DIAL_OUT:
+            raise ValueError("queue tickets exist for dial_out acquires only")
+        return intent
 
     def __lt__(self, other: object) -> bool:
         if not isinstance(other, QueueTicket):
@@ -3473,6 +3684,15 @@ class DialResult(ContractModel):
     """call.dial result: server-issued media attachment (ADR-02)."""
 
     lease_id: _CheckedLeaseId
+    provider_call_id: _CheckedProviderCallId = None
+    """The provider's own call handle for the dialed leg when the
+    provider echoed one back on the ``line.dial`` reply (round 32,
+    SA_swe2_review_2 item 18): an OPTIONAL advisory mirror - the
+    kernel records it as the lease's external-handle evidence
+    (:meth:`ingest_call_state` correlates uncorrelated updates
+    against it) and surfaces it so the agent's call log names the
+    same call the provider's does; ``None`` means the provider
+    stack returned no stable handle."""
     media_endpoint: _CheckedMediaEndpoint = Field(max_length=MAX_ENDPOINT_LEN)
     """The AGENT-side media endpoint (round 25, review-15 item 6):
     the address the calling agent connects its media socket to -
@@ -3610,6 +3830,13 @@ class PendingRing(ContractModel):
 
     call_token: _CheckedCallToken
     caller_id: _CheckedCallerNumber | None = None
+    provider_call_id: _CheckedProviderCallId = None
+    """The echoed provider handle of the snapshot row the ring was
+    minted from (round 32, SA_swe2_review_2 item 18): the adapter
+    relays it back so the provider can bind its own call object to
+    the kernel-minted ``call_token`` - same exact-identity role as
+    :attr:`IncomingRingIngress.provider_call_id`, now available on
+    the rediscovery direction too."""
     observed_at: AwareDatetime
 
 
@@ -3959,10 +4186,13 @@ class SessionAudience(ContractModel):
     carry session-scoped lease facts that must not leak to other
     sessions (round 21, HIGH-4). One logical event MAY be emitted as
     several envelopes with distinct session ids - e.g. a shared-pool
-    ``incoming_call`` fans out as one ``SessionAudience`` envelope
-    per live ``Intent.RECEIVE_INBOUND`` session (round 22, review-10
-    HIGH-4); the EventBus stays a stateless router and needs no
-    session-intent table."""
+    ``incoming_call`` fans out to every live
+    ``Intent.RECEIVE_INBOUND`` session (round 22, review-10 HIGH-4);
+    since round 32 (SA_swe2_review_2 item 2) that fan-out rides ONE
+    :class:`FanoutAudience` envelope carrying the member list, so
+    per-session ``SessionAudience`` envelopes remain for genuinely
+    session-scoped facts and the EventBus stays a stateless router
+    with no session-intent table."""
 
     scope: Literal["session"] = "session"
     session_id: _CheckedSessionId
@@ -3980,8 +4210,37 @@ class AdminAudience(ContractModel):
     scope: Literal["admin"] = "admin"
 
 
+_FanoutMember = Annotated[
+    AgentAudience | SessionAudience,
+    Field(discriminator="scope"),
+]
+"""Recipient inside a :class:`FanoutAudience` member list - only
+concrete ``agent``/``session`` recipients may ride a fanout
+(``broadcast``/``admin``/nested ``fanout`` are structurally
+excluded)."""
+
+
+class FanoutAudience(ContractModel):
+    """Bounded multi-recipient routing target (round 32,
+    SA_swe2_review_2 item 2): ONE envelope carries the whole
+    recipient list for a fan-out fact - a shared-pool
+    ``incoming_call``/``missed_call`` reaching every live
+    ``Intent.RECEIVE_INBOUND`` session emits a single
+    ``FanoutAudience`` envelope, so a line-wide wave costs
+    O(lines) outbox envelopes instead of O(sessions). The EventBus
+    expands the envelope once per member at publish time and stays
+    a stateless router - it never re-enters kernel tables after
+    the fact, so the member list IS the stamped routing truth
+    (same rule as :data:`EventAudience` overall). ``members`` is
+    bounded at :data:`MAX_SESSIONS_TOTAL` - the widest legal
+    fan-out is "every live session"."""
+
+    scope: Literal["fanout"] = "fanout"
+    members: tuple[_FanoutMember, ...] = Field(min_length=1, max_length=MAX_SESSIONS_TOTAL)
+
+
 EventAudience = Annotated[
-    BroadcastAudience | AgentAudience | SessionAudience | AdminAudience,
+    BroadcastAudience | AgentAudience | SessionAudience | AdminAudience | FanoutAudience,
     Field(discriminator="scope"),
 ]
 """Discriminated union of event routing targets (round 21, HIGH-4).
@@ -3992,8 +4251,8 @@ must not strand its queued event)."""
 
 
 EVENT_AUDIENCE_SCOPES: dict[EventName, frozenset[str]] = {
-    EventName.INCOMING_CALL: frozenset({"agent", "session"}),
-    EventName.MISSED_CALL: frozenset({"agent", "session"}),
+    EventName.INCOMING_CALL: frozenset({"agent", "session", "fanout"}),
+    EventName.MISSED_CALL: frozenset({"agent", "session", "fanout"}),
     EventName.FALLBACK_TRIGGERED: frozenset({"agent"}),
     EventName.ASSIGNMENT_REVOKED: frozenset({"agent"}),
     EventName.LINE_STATE_CHANGED: frozenset({"broadcast", "agent", "admin"}),
@@ -4013,9 +4272,12 @@ review-15 item 31) - the audience-union literal each event name may
 be stamped with, enforced by :class:`EventEnvelope` at construction:
 
 - ``incoming_call``/``missed_call`` carry caller-number PII and a
-  one-shot ``call_token``: ``agent`` (exclusive owner) or
-  ``session`` (one envelope per live RECEIVE_INBOUND session,
-  round 22 HIGH-4) - NEVER ``broadcast``;
+  one-shot ``call_token``: ``agent`` (exclusive owner), ``session``
+  (one envelope per live RECEIVE_INBOUND session,
+  round 22 HIGH-4) or ``fanout`` (round 32, SA_swe2_review_2 item
+  2 - ONE envelope carrying the whole RECEIVE_INBOUND member list,
+  so a line-wide wave is O(lines) envelopes, not O(sessions)) -
+  NEVER ``broadcast``;
 - ``fallback_triggered`` carries the worker's
   ``fallback_call_token``: ``agent`` only (the reserved
   :data:`SYSTEM_FALLBACK_WORKER` identity);
@@ -4797,19 +5059,19 @@ class ProviderRegistration(ContractModel):
     :data:`MAX_PROFILE_LEN` chars - shared with
     :class:`ProviderCapabilityUpdate` and the :class:`LineSummary`
     mirror."""
-    meta: dict[str, str] = Field(default_factory=dict)
+    meta: Mapping[str, str] = Field(default_factory=dict)
     """Opaque provider metadata (wire: ``provider.register{meta?}``
     object). Bounded (round 22, review-10 MEDIUM-5; CODING_HAZARDS
     rule 7 on an external JSON-RPC ingress field): at most
     ``MAX_PROVIDER_META_ENTRIES`` keys, each key non-empty and at
     most ``MAX_PROVIDER_META_KEY_LEN`` chars, each value at most
     ``MAX_PROVIDER_META_VALUE_LEN`` chars - a violation is a
-    ValidationError (INVALID_ARGUMENT at the adapter). Kept as
-    ``dict`` for wire compat: ``frozen=True`` covers
-    field reassignment only, so the mapping itself stays mutable -
-    treat contents as immutable by convention (round-21 review; a
-    MappingProxyType wrapper would add a custom validator+serializer
-    for no wire-shape gain).
+    ValidationError (INVALID_ARGUMENT at the adapter). Typed
+    ``Mapping`` + wrapped in ``MappingProxyType`` at validation
+    (round 32, SA_swe2_review_2 item 24): the wire shape stays a
+    plain JSON object, but the stored map is read-only at
+    runtime - ``frozen=True`` alone covered only field
+    reassignment.
 
     Ownership rule (round 28, review-18 item 16): the model stores
     its OWN copy of the map - ``_bounded_meta`` returns a fresh
@@ -4885,7 +5147,7 @@ class ProviderRegistration(ContractModel):
 
     @field_validator("meta")
     @classmethod
-    def _meta_bounds(cls, meta: dict[str, str]) -> dict[str, str]:
+    def _meta_bounds(cls, meta: Mapping[str, str]) -> Mapping[str, str]:
         """Bound the external ``meta`` map (round 22, review-10
         MEDIUM-5): an unbounded provider-controlled dict on a
         wire-facing model is a memory/log hazard. Shared with
@@ -5036,14 +5298,35 @@ class ProviderCallStateUpdate(ContractModel):
     learned a token - ring correlation is by line, not by token, so
     the echoed ``call_token`` is a hint, never the identity key.
 
-    External calls (round 21, HIGH-6): an update carrying NEITHER
-    ``call_token`` nor ``lease_id`` on a line NOT in
-    ``RINGING_LOCKED`` reports a human-initiated call on the
-    physical phone (dialed or answered on the handset itself).
-    The kernel marks the line BUSY with reason ``"external_call"`` -
-    no agent lease is minted, no PipeWire bridge is attached (audio
-    stays on the phone) and NO Hangup is ever sent; the state clears
-    when the provider reports DISCONNECTED (design §9).
+    External calls (round 21, HIGH-6; attribution evidence pinned
+    round 32, SA_swe2_review_2 item 10): an update carrying
+    NEITHER ``call_token`` nor ``lease_id`` on a line NOT in
+    ``RINGING_LOCKED`` is correlated against the line's live
+    leases BEFORE the external mint. With ZERO live candidates the
+    kernel mints ``external_call`` unconditionally - it reports a
+    human-initiated call on the physical phone (dialed or
+    answered on the handset itself); the line is marked BUSY with
+    reason ``"external_call"``, no agent lease is minted, no
+    PipeWire bridge is attached (audio stays on the phone), NO
+    Hangup is ever sent, and the state clears when the provider
+    reports DISCONNECTED (design §9). With EXACTLY ONE live
+    candidate - e.g. a ``DIALING`` lease whose provider omitted
+    the ``lease_id`` echo - correlation requires EVERY
+    attributable field the update carries to AGREE with the
+    lease's evidence (``provider_call_id`` vs the lease's
+    recorded handle, ``caller_id`` vs the dialed number; the
+    direction implied by the lease's phase): a field ABSENT on
+    either side is unverifiable and never blocks correlation,
+    but a field PRESENT on both sides that DISAGREES - a
+    ``caller_id`` naming a different number than the dialed one,
+    a ``provider_call_id`` naming a different modem call object -
+    is conflicting evidence: the kernel correlates NOTHING, mints
+    the ``external_call`` hold for the human-initiated call the
+    update truly describes, and leaves the unmatched lease on its
+    normal deadline/orphan-grace expiry (it is never ended
+    early by evidence it cannot answer for). Two or more live
+    candidates with no token make the update unattributable -
+    it is also minted ``external_call`` rather than guessed.
 
     Handset-answered ring (round 28, review-18 item 9; drain edge
     added round 30, SA_carbon_review_19 slice-A item 6): a
@@ -5532,13 +5815,24 @@ class LineManager(ABC):
         on either is RESOURCE_EXHAUSTED with
         ``ErrorReason.SESSION_LIMIT_EXCEEDED``.
 
-        Re-register semantics (round 27, review-17 item 70): every
-        ``agent.register_intent`` call mints a NEW ``session_id`` -
-        there is no "update intents" operation. A reconnecting agent
-        does NOT resume its old session: the old one's tickets and
-        leases were socket-bound and died with it via
-        ``drop_session``; the new session starts clean (deliberate -
-        session state must never migrate between sockets).
+        Re-register semantics (round 27, review-17 item 70;
+        identity match pinned round 32, SA_swe2_review_2 item 17):
+        every ``agent.register_intent`` call mints a NEW
+        ``session_id`` - there is no "update intents" operation. A
+        reconnecting agent does NOT resume its old session: the old
+        one's tickets and leases were socket-bound and died with it
+        via ``drop_session``; the new session starts clean
+        (deliberate - session state must never migrate between
+        sockets). Idempotent registration on the SAME transport
+        socket (an adapter-level retry of the handshake, not a new
+        connection) returns the EXISTING session verbatim ONLY when
+        the presented ``(agent_id, intents, profile)`` triple is
+        IDENTICAL to the live session's recorded triple - the same
+        socket asking for a different intent set or a different
+        label is a fresh registration of conflicting facts, which
+        is ``INVALID_ARGUMENT`` carrying
+        ``ErrorReason.IDEMPOTENCY_CONFLICT`` rather than a silent
+        second session or a silent intent swap.
 
         ``profile`` (round 27, review-17 items 27/80): optional
         agent-side session label - a human-readable tag surfaced in
@@ -5653,10 +5947,17 @@ class LineManager(ABC):
         mutation, so a queued ticket can never wait on a pool that
         can never serve it. The dedup table records the OUTCOME of
         a keyed acquire (the granted ``lease_id`` or the queued
-        ``ticket_id``): a same-key retry returns the recorded
-        outcome while its object lives, and the same key with
-        different parameters is INVALID_ARGUMENT; entries die with
-        the session as documented below.
+        ``ticket_id``): a same-key retry inside the entry's
+        :data:`IDEMPOTENCY_TTL_SEC` window returns the recorded
+        outcome VERBATIM (replay-after-completion - the stored
+        result is served, never re-derived), the same key with
+        DIFFERENT parameters inside the window is
+        ``INVALID_ARGUMENT`` carrying
+        ``ErrorReason.IDEMPOTENCY_CONFLICT`` (round 32,
+        SA_swe2_review_2 item 17), and a retry arriving after the
+        TTL re-executes fresh - the contract is a bounded retry
+        window, not a permanent alias; entries die with the
+        session as documented below.
 
         ``system:fallback_worker`` (round 22, review-10 MEDIUM-2; the
         reserved :data:`SYSTEM_FALLBACK_WORKER` identity, round 25
@@ -5705,15 +6006,15 @@ class LineManager(ABC):
         27, review-17 item 22): ``drop_session`` discards a
         session's ``(session_id, idempotency_key)`` entries with
         its tickets, so a key never dedups across a reconnect. It
-        is also BOUNDED (round 29, SA_quant_review_1 slice-B item
-        6; rule 7): at most :data:`MAX_IDEMPOTENCY_KEYS_PER_SESSION`
-        recorded outcomes per session - a long-lived session
-        minting a fresh key per call would otherwise grow kernel
-        memory without bound. Once the cap is reached a NEW key is
-        rejected ``RESOURCE_EXHAUSTED`` fail-closed; the table is
-        NEVER LRU-trimmed, because evicting a recorded outcome
-        would let a same-key retry re-execute the acquire the dedup
-        table exists to absorb.
+        is also BOUNDED twice over (round 29, SA_quant_review_1
+        slice-B item 6; LRU+TTL policy pinned round 32,
+        SA_swe2_review_2 item 17): at most
+        :data:`MAX_IDEMPOTENCY_KEYS_PER_SESSION` recorded outcomes
+        per session - the OLDEST entry is evicted to admit a new
+        key (bounded LRU; the round-29 fail-closed
+        ``RESOURCE_EXHAUSTED`` rule is REPLACED - a new key is
+        never rejected for table fullness) - and every entry
+        expires :data:`IDEMPOTENCY_TTL_SEC` after recording.
         ``position`` inside :class:`AcquireQueued` is the GLOBAL
         FIFO rank across all eligible tickets (item 48).
 
@@ -5915,7 +6216,17 @@ class LineManager(ABC):
         ``disconnected`` fact confirms the air-side teardown
         (``TERMINATING -> ENDED``) or the hold lapses, so
         ``TERMINATING`` is a real reachable phase, not a dead rung
-        in the matrix. On an ``ACQUIRED`` (granted-but-undialed)
+        in the matrix. The hold is bounded
+        (:attr:`LineTimeouts.hangup_hold_sec`, default 10 s, 1..120
+        s - round 32, SA_swe2_review_2 item 1): ``call.hangup``
+        returns to the agent immediately once the command is
+        queued, and ``tick`` ends a ``TERMINATING`` lease whose
+        hold lapsed with ``CallEndReason.NETWORK_ERROR`` as a
+        KERNEL-side timeout fact - never a synthesized provider
+        ``disconnected`` report, which would fabricate a provider
+        fact - so a lost or wedged ``line.hangup`` can never hold
+        the line BUSY forever or stall the FIFO. On an
+        ``ACQUIRED`` (granted-but-undialed)
         lease there is no air-side call to confirm - the lease ends
         directly ``ENDED`` with no command queued. Either way the
         lease ends with the call: no separate ``call.release`` is
@@ -6554,16 +6865,25 @@ class LineManager(ABC):
         SA_quant_review_1 slice-B item 2). Idempotent same-token
         return applies only to a ring on the LIVE binding id.
 
-        Dedup identity (round 31, SA_swe2_review_1 item 20): when
+        Dedup identity (round 31, SA_swe2_review_1 item 20; epoch
+        pinned round 32, SA_swe2_review_2 item 18): when
         ``ring.provider_call_id`` is present the physical-ring
         identity is EXACT - a second report carrying the same
         handle is the same ring (the same ``call_token`` comes
         back), a different handle is a genuinely new call no
         matter how little time elapsed. With the handle absent the
         kernel falls back to ``(line_id, caller_id)`` plus
-        :data:`RING_DEDUP_MIN_GAP_SEC`: a same-number report
-        inside that window is treated as the same ring (dedup),
-        one further out as a real hangup-and-redial. The residual
+        :data:`RING_DEDUP_MIN_GAP_SEC` measured from the
+        ``observed_at`` of the ring's FIRST sighting - the dedup
+        window is anchored at the original report, NOT re-armed on
+        every repeated report, so a CLIR/withheld-number caller
+        (``caller_id`` absent - every repeat shares the same
+        ``None`` key) whose provider re-reports a still-ringing
+        call cannot keep the dedup epoch sliding forward forever
+        and mask a genuine hangup-and-redial at the window's
+        edge: a same-number report inside the anchored window is
+        treated as the same ring (dedup), one past it as a real
+        hangup-and-redial. The residual
         ambiguity is documented - a fast same-number redial inside
         the gap merges into the prior ring - and an adapter that
         always fills ``provider_call_id`` removes it entirely."""
@@ -6754,16 +7074,21 @@ class LineManager(ABC):
         path serves the LINE): the latch resets on every live lease
         of that line.
 
-        Bounded emission: the kernel emits at most ONE
-        :class:`MediaOverflowEvent` per contiguous media-loss
-        interval (per epoch between two ``audio_ready`` facts) -
-        repeated ``audio_lost`` reports inside one loss interval are
-        deduplicated, never one event per dropped frame. ``tick``
-        also treats a latch-reset lease's media detachment like any
-        other detach: the :data:`MEDIA_PAIR_TTL_SEC` re-attach
-        deadline the media-adapter detach fact armed continues to
-        run, and its lapse still ends the lease with
-        ``CallEndReason.NETWORK_ERROR``.
+        TTL separation (round 32, SA_swe2_review_2 item 11): an
+        ``audio_lost`` fact RESETS the latch ONLY - it does NOT
+        arm the :data:`MEDIA_PAIR_TTL_SEC` re-attach deadline.
+        That deadline is armed exactly twice: at pair mint
+        (:meth:`dial`/``accept``/``claim``-driven allocation) and
+        by an :meth:`ingest_media_state` ``attached=False`` socket
+        fact. A SCO flap reported while the media socket is still
+        attached leaves any running TTL untouched - the socket
+        detaching (or not) is the fact that decides the lease's
+        fate, not the radio-path report. ``audio_lost`` also
+        NEVER emits :class:`MediaOverflowEvent` - that event is
+        the media-router's PCM-drop signal
+        (:meth:`ingest_media_overflow`), not an SCO-loss one;
+        a repeated ``audio_lost`` inside one loss interval is
+        still deduplicated to a no-op on the latch.
 
         Same id/hygiene rules as :meth:`ingest_audio_ready`:
         ``_check_line_id`` on ``line_id``, ``_check_id`` on
@@ -6794,11 +7119,42 @@ class LineManager(ABC):
         ``tick(now)`` ends the lease with
         ``CallEndReason.NETWORK_ERROR`` - a live call never
         silently loses its audio channel, mirroring the
-        dead-man-switch teardown semantics. A fact for an
+        dead-man-switch teardown semantics. Phase gate (round 32,
+        SA_swe2_review_2 item 26): a fact on an ``ACQUIRED`` lease
+        is ``PhonebridgeError(ErrorCode.INVALID_STATE)`` - the
+        grant is still unspent, no media pair exists to attach.
+        A fact for an
         unknown/already-ended ``lease_id`` resolves through the
         ``_closed_leases`` ring as a dedupe/no-op or
         ``PhonebridgeError(ErrorCode.STALE_TOKEN)`` - never an
         external-call mint, never a silent accept."""
+        ...
+
+    @abstractmethod
+    async def ingest_media_overflow(self, line_id: LineId, lease_id: LeaseId) -> None:
+        """Media-router overflow ingress (round 32,
+        SA_swe2_review_2 item 11): the media adapter's bounded
+        uplink buffer dropped PCM frames for ``lease_id`` on
+        ``line_id`` (the ``0x04``-frame path of design §6.4 - the
+        socket is ALWAYS read, drop-NEWEST applies, and the
+        adapter reports the episode to the kernel). The kernel
+        emits at most ONE :class:`MediaOverflowEvent` per
+        contiguous overflow interval (per epoch between two
+        non-overflowing windows) - repeated reports inside one
+        episode dedupe, never one event per dropped frame, so a
+        saturated media path cannot overflow the domain outbox
+        too.
+
+        This is the ONLY ``event.media_overflow`` source: the
+        SCO-loss path (:meth:`ingest_audio_lost`) never emits it
+        - a BT-side flap is latch bookkeeping, not a router
+        buffer drop. The fact carries no teardown effect - the
+        lease's fate stays governed by socket attach/detach
+        facts and the :data:`MEDIA_PAIR_TTL_SEC` deadline. Same
+        id/hygiene rules as :meth:`ingest_media_state`: unknown
+        or ended ``lease_id`` resolves through the
+        ``_closed_leases`` ring as dedupe/no-op or
+        ``STALE_TOKEN``."""
         ...
 
     @abstractmethod
@@ -6836,7 +7192,11 @@ class LineManager(ABC):
         report racing a real teardown must not resurrect anything).
         On an ``ACQUIRED`` lease the call is ``INVALID_STATE`` -
         no dial was dispatched for it, so there is nothing to
-        compensate.
+        compensate. A lease already in ``TERMINATING`` is a
+        dedupe/no-op (round 32, SA_swe2_review_2 item 26 - a late
+        rejected-dial report racing a queued ``line.hangup`` must
+        not mint a second hangup command nor re-end the lease;
+        its provider-fact or ``hangup_hold_sec`` lapse closes it).
 
         Synthesizing a ``disconnected``
         :meth:`ingest_call_state` fact remains FORBIDDEN here
@@ -6844,6 +7204,62 @@ class LineManager(ABC):
         ``ProviderHangupCommand`` outbox effect IS the teardown
         and a real ``disconnected`` fact arriving later dedupes
         against the ended lease."""
+        ...
+
+    @abstractmethod
+    async def compensate_answer(
+        self,
+        line_id: LineId,
+        assignment_id: AssignmentId,
+        lease_id: LeaseId,
+        call_token: CallToken,
+    ) -> None:
+        """Ring-scoped answer compensation (round 32,
+        SA_swe2_review_2 item 9): the adapter's FIRST call after a
+        ``call.accept``/``line.answer`` reply came back
+        ``{accepted: false}``, timed out inside the ~2 s reply
+        deadline, or hit a transport error. The kernel enqueues a
+        best-effort RING-scoped reject -
+        ``ProviderHangupCommand`` with ``call_token`` set and
+        ``lease_id`` ``None`` (the frozen reject vehicle: oFono
+        ``VoiceCall.Hangup`` on a still-ringing call IS a reject;
+        the wire deliberately carries no separate ``reject``
+        command, review-12 C1) - ends the ``ANSWERING`` lease the
+        accept minted, and keeps the line ``RINGING_LOCKED`` under
+        the ring-drain rule.
+
+        Distinction from :meth:`compensate_dial`: dial
+        compensation is LINE-freeing - the lease ends and the
+        line returns FREE in the same step because the kernel
+        itself initiated the outbound leg. Answer compensation is
+        RING-preserving: the physical inbound ring can outlive the
+        failed answer (the ``accepted: false`` reply does NOT
+        prove the carrier-side call is gone, and the queued
+        reject can itself be lost), so the line MUST NOT be freed
+        early - it stays ``RINGING_LOCKED`` until the provider's
+        ``disconnected`` report or the ``ring_drain_ttl_sec``
+        lapse in ``tick`` resolves the drain, exactly like the
+        post-``MissedCallEvent`` drain window. ``lease_id`` names
+        the ``ANSWERING``/``ALERTING`` lease the failed accept
+        minted - it ends in the same atomic step - while
+        ``call_token`` scopes the reject to the ring itself
+        (the original ``call_token`` or the re-issued
+        ``fallback_call_token``; same BY-LINE rule as
+        :attr:`ProviderHangupCommand.call_token`).
+
+        Binding/line correlation: ``assignment_id`` must resolve
+        to the LIVE binding (superseded ids hit the
+        ``_closed_assignments`` ring as
+        ``PhonebridgeError(ErrorCode.STALE_TOKEN)``), ``line_id``
+        must own both the lease and the ring, and the ring must
+        still be open. An already-ended lease or closed ring is a
+        dedupe/no-op (a lost-answer report racing a real
+        ``disconnected`` must not resurrect or double-reject); a
+        ``call_token`` the line never held is ``STALE_TOKEN``.
+        Synthesizing a ``disconnected``
+        :meth:`ingest_call_state` fact stays FORBIDDEN here too -
+        the queued reject command IS the teardown, and the drain
+        closes on real provider facts only."""
         ...
 
     @abstractmethod
@@ -6964,6 +7380,20 @@ class LineManager(ABC):
         policy) - never on ``no_pickup``/missed outcomes, where
         the phone's own carrier-side end clears the ring.
 
+        ``TERMINATING`` hold lapse (round 32, SA_swe2_review_2 item
+        1): a lease parked in ``TERMINATING`` by
+        :meth:`hangup`/``compensate_dial`` carries a private
+        hold deadline stamped at transition time; at
+        ``now >= hold_deadline`` ``tick`` ends it with
+        ``CallEndReason.NETWORK_ERROR`` as a KERNEL-side timeout
+        fact - never a synthesized provider ``disconnected``
+        report, which would fabricate a provider fact - frees the
+        line and lets the queue advance. The bound comes from the
+        line's effective ``hangup_hold_sec`` (default 10 s, tight
+        1..120 s range), NOT ``max_call_duration_sec``: a lost or
+        wedged ``line.hangup`` can never leave the lease (and the
+        line's FIFO) wedged in ``TERMINATING`` past the hold.
+
         Tick OWNS both ring timers (round 24, review-13 H2): at
         ``now >= ring.expires_at`` (``accept_window_sec`` elapsed) it
         performs the :meth:`decide_fallback` policy decision
@@ -7002,48 +7432,65 @@ class LineManager(ABC):
         because a caller that never received its audio path
         cannot be served. On the detach side a lease whose
         detached media role outlived its re-attach window (armed
-        by :meth:`ingest_media_state` detach facts and by
-        :meth:`ingest_audio_lost`, re-armed by
-        ``MediaAllocator.reissue()``) ends with
+        by :meth:`ingest_media_state` detach facts ONLY - a SCO
+        ``audio_lost`` fact never arms it, round 32 item 11;
+        re-armed by ``MediaAllocator.reissue()``) ends with
         ``CallEndReason.NETWORK_ERROR`` exactly like the other
         connectivity-loss teardowns.
 
-        Orphan cascade (round 31, SA_swe2_review_1 item 22):
-        when the heartbeat ladder (or an adapter-reported
+        Orphan cascade (round 31, SA_swe2_review_1 item 22; reason
+        unified round 32, SA_swe2_review_2 item 12): when the
+        heartbeat ladder (or an adapter-reported
         WS_DISCONNECTED/UNREACHABLE fact) declares a binding
         dead and its ``orphan_deadline_at`` grace elapses -
         or is already expired, as for a hydrated dead row -
         ``tick`` tombstones the binding AND cascades in one
         atomic step: every live lease on the dead binding ends
-        (``NETWORK_ERROR``, ``ProviderHangupCommand`` best-effort
-        where a call leg existed), every pending queue ticket
-        served by it is cancelled
+        with ``CallEndReason.PROVIDER_LOST`` (the ONE unified
+        reason for "the provider channel died" - the earlier
+        ``NETWORK_ERROR`` spelling contradicted the
+        queue/claim siblings and is gone), every pending queue
+        ticket served by it is cancelled
         (``event.queue_cancelled{reason: "provider_lost"}``), its
         pending claims reject ``provider_lost``, the binding row
         moves into the ``_closed_assignments`` ring so later
         facts resolve ``STALE_TOKEN``, and an expired
         ``fallback_call_token``/ring timer owned by the binding
-        burns with its ``MissedCallEvent``. A hydrated
+        burns with its ``MissedCallEvent``. NO
+        ``ProviderHangupCommand`` is queued for the dying binding
+        (round 32, SA_swe2_review_2 item 12): a tombstoned
+        binding can never receive commands - the dead-binding
+        outbox purge wins, and the modem-side call is left for
+        the provider's own reconnect/caller-side cleanup, exactly
+        like the external-call bookkeeping the cascade resets.
+        A hydrated
         ``ProviderBinding`` row follows the same cascade on the
         first ``tick`` after load - its ``orphan_deadline_at`` is
         already past - unless a fresh ``provider.register``
         superseded it first (see :meth:`register_provider`).
 
-        Queue drain (round 31, SA_swe2_review_1 item 25): each
-        ``tick`` re-checks pending tickets against EVERY
+        Queue drain (round 31, SA_swe2_review_1 item 25; ordering
+        pinned round 32, SA_swe2_review_2 item 16): each re-check
+        walk evaluates pending tickets against EVERY
         currently-free line, not only the line that just freed
-        or the line a ticket originally queued on - an
-        ``ANY_LINE``/``SHARED``-intent ticket is eligible for any
-        free line matching its intents, and a ticket whose target
-        line is busy MUST NOT block a younger ticket another free
-        line can serve (per-line head-of-line fairness is by
-        ``created_at`` order within one line's queue; across
-        lines the drain walks every free line). A grant is
+        or the line a ticket originally queued on - a ticket
+        WITHOUT a ``preferred_line_id`` is eligible for any free
+        ``SHARED_POOL`` line serving ``DIAL_OUT`` (tickets carry
+        no ``ANY_LINE``/``SHARED`` intent - ``intent`` is
+        ``DIAL_OUT`` only, model-enforced on
+        :class:`QueueTicket`), and a ticket whose preferred line
+        is busy MUST NOT block a younger ticket another free
+        line can serve (head-of-line fairness is by ``seq``
+        order within the eligible set - the mandatory global
+        FIFO - never ``created_at``). A grant is
         idempotent post-issue: the ticket leaves the pending set
         atomically with the grant mint, so a repeated drain never
-        double-grants, and a grant TTL lapse returns the ticket
-        to pending exactly once (or cancels it after the retry
-        bound) - never a second live grant for the same ticket.
+        double-grants, and a grant TTL lapse is TERMINAL for the
+        grant - the lease ends ``grant_ttl_expired`` and the
+        ticket's fate follows its own path (the preemption
+        reissue rule owns head-of-queue reinsertion; a lapsed
+        grant never silently re-queues a second live grant for
+        the same ticket).
 
         Ring-drain sub-phase (round 29, SA_quant_review_1 slice-A
         item 1 - normative, docs/specs/line-manager.md "Ring drain
@@ -7059,6 +7506,22 @@ class LineManager(ABC):
         implementations MUST track the drain sub-phase in private
         kernel state; the contract deliberately adds no public
         enum rung or field for it.
+
+        Bounded deadline processing (round 32, SA_swe2_review_2
+        item 2): ONE ``tick`` call processes at most
+        :data:`MAX_TICK_DEADLINES` expired items in total - a
+        mass-expiry wave (every line's accept window lapsing at
+        once, a restart-expired orphan deadline on every hydrated
+        binding) is split across consecutive ``tick`` calls with
+        the remainder pending until the next call, NEVER dropped
+        and NEVER rejected. Deadline work is kernel liveness
+        bookkeeping, not a client request, so
+        ``RESOURCE_EXHAUSTED`` is inadmissible on this path - the
+        ``tick`` contract expresses backpressure as deferral, and
+        the outbox hard cap still applies to the bounded slice the
+        call actually commits (:data:`OUTBOX_HARD_CAP` accounting
+        counts ``MAX_TICK_DEADLINES *`` max-envelopes-per-deadline
+        at one envelope per line fan-out wave).
 
         Justification for a hook at all: the narrowed ingress surface
         forbids per-timer public methods, yet all of the above are
@@ -7297,6 +7760,13 @@ class TimeoutConfig(ContractModel):
     "leave unchanged" here, NOT "unlimited": the wire-level off
     switch for a previously set cap is
     ``clear_max_call_duration``."""
+    hangup_hold_sec: float | None = Field(default=None, ge=1.0, le=120.0)
+    """Bound on the ``TERMINATING`` hold (round 32, SA_swe2_review_2
+    item 1): how long ``tick`` waits for the provider's
+    ``disconnected`` after a ``line.hangup`` was queued before it
+    ends the lease ``network_error`` as a kernel-side lapse
+    (default 10 s, tight 1..120 s bound - a modem-confirmation
+    grace, not a session knob)."""
     clear_max_call_duration: bool | None = Field(default=None)
     """Explicit off switch for ``max_call_duration_sec`` (round 25,
     review-15 item 24), mirroring the
@@ -7912,6 +8382,18 @@ class LineAdminKernel(ABC):
         after the kernel commit, outside the mutation critical
         section).
 
+        Forward-policy referential check (round 32,
+        SA_swe2_review_2 item 24): a patch that NARROWS a
+        constraint other records reference - a smaller
+        ``allowed_number_types`` set, a ``fallback_policy`` swap
+        that invalidates a stored ``forward_to`` number kind -
+        re-validates every existing ``forward_to`` policy and
+        referencing fallback against the NEW constraint; a patch
+        that would orphan a configured forward is
+        ``INVALID_ARGUMENT`` (the admin must clear the
+        referencing policy first), never a silent config whose
+        stored policy can no longer execute.
+
         ``idle_revoke_after`` vs ``clear_idle_revoke_after`` (round
         25, review-15 item 22): the ``None``-means-unchanged patch
         convention alone could never DISABLE a previously set idle
@@ -8077,6 +8559,26 @@ class LineAdminKernel(ABC):
         - the admin adapter calls it when a ``lines``-row
         persistence (write-through SQLite upsert/delete) fails
         AFTER the kernel mutation already committed.
+
+        Ordering pins (round 32, SA_swe2_review_2 item 3): the
+        single ordered writer task is the ONLY component that
+        performs SQLite writes - a mutation bundle is marked
+        ``pending-write`` until its write confirms, admin
+        mutations touching a record with an unconfirmed pending
+        write wait (boundedly) for it, and provider/agent ingress
+        is unaffected by the marker. Compensation itself is
+        SERIALIZED through the same mutation queue like any other
+        mutation - never invoked inline by the writer - so a
+        restore can never interleave with an in-flight mutation,
+        and if the failed record was legitimately re-mutated
+        before the compensation lands (a later committed mutation
+        changed the same record) the compensation MUST degrade to
+        the ``config_stale`` condition plus admin alert instead of
+        blindly overwriting the newer truth with the stale
+        snapshot. The hook covers ``LineAssignment``-shaped
+        durable records ONLY - a ``provider_bindings`` row is a
+        best-effort cache entry (see :class:`ProviderBinding`), it
+        is never rolled back through this hook.
 
         ``line_id`` selects the record the rollback targets -
         required because ``snapshot=None`` alone cannot name the
