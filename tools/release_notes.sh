@@ -48,6 +48,46 @@ FIELDS = ("type", "scope", "user_visible", "breaking",
           "user_summary", "dev_summary", "why", "refs")
 TYPES = ("feat", "fix", "refactor", "docs", "chore")
 
+def _close_quote(s, q):
+    """Index of the closing quote in s (s[0] is the open quote), or
+    -1. Single quotes escape by doubling (''), double quotes by
+    backslash."""
+    i = 1
+    while i < len(s):
+        c = s[i]
+        if q == '"' and c == "\\":
+            i += 2
+            continue
+        if c == q:
+            if q == "'" and s[i:i + 2] == "''":
+                i += 2
+                continue
+            return i
+        i += 1
+    return -1
+
+def unquote_scalar(s):
+    """Unquote a COMPLETE quoted scalar: strip the matching quotes
+    and decode YAML escapes ('' inside single quotes, backslash
+    escapes inside double quotes). Unquoted input is returned
+    verbatim - matching-quote stripping only (round 31, swe-2 item
+    40; escape decoding added round 32, swe-2 item 27)."""
+    if len(s) >= 2 and s[0] in ("\"", "'"):
+        idx = _close_quote(s, s[0])
+        if idx == len(s) - 1:
+            body = s[1:-1]
+            if s[0] == "'":
+                return body.replace("''", "'")
+            return re.sub(
+                r"\\(.)",
+                lambda m: {
+                    "n": "\n", "t": "\t", "r": "\r",
+                    "\\": "\\", '"': '"', "'": "'",
+                }.get(m.group(1), m.group(1)),
+                body,
+            )
+    return s
+
 def parse(path):
     name = os.path.basename(path)
     lines = open(path, encoding="utf-8").read().splitlines()
@@ -111,18 +151,37 @@ def parse(path):
                     # '|' keeps one line of content per source line.
                     fm[last] = "\n".join(block)
             else:
-                # strip only MATCHING surrounding quotes (round 31,
-                # swe-2 item 40): blanket strip('"').strip("'")
-                # would mangle unquoted values that merely end in a
-                # quote char and would silently merge mismatched
-                # quotes like "foo' -> foo.
+                # A QUOTED scalar may span frontmatter lines (YAML
+                # folds its embedded newlines to single spaces):
+                # if `rest` opens a quote that does not close on
+                # this line, keep consuming lines until the closing
+                # quote lands, then unquote properly - stripping
+                # first/last chars is not unquoting (round 32,
+                # swe-2 item 27): a folded double-quoted scalar must
+                # have its backslash escapes decoded and a folded
+                # single-quoted scalar its '' escapes, not just
+                # lose its outer quote pair.
                 if (
-                    len(rest) >= 2
-                    and rest[0] == rest[-1]
-                    and rest[0] in ("\"", "'")
+                    rest[:1] in ("\"", "'")
+                    and _close_quote(rest, rest[0]) < 0
                 ):
-                    rest = rest[1:-1]
-                fm[last] = rest
+                    q = rest[0]
+                    while i < len(fm_lines):
+                        rest += " " + fm_lines[i].strip()
+                        i += 1
+                        if _close_quote(rest, q) >= 0:
+                            break
+                # Drop any trailing whitespace/comment after the
+                # closing quote so unquote_scalar sees a complete
+                # scalar; a trailing non-comment keeps the value
+                # verbatim (malformed YAML would fail elsewhere).
+                if rest[:1] in ("\"", "'"):
+                    idx = _close_quote(rest, rest[0])
+                    if idx >= 0:
+                        tail = rest[idx + 1:].strip()
+                        if not tail or tail.startswith("#"):
+                            rest = rest[: idx + 1]
+                fm[last] = unquote_scalar(rest)
         elif last:
             fm[last] = (fm[last] + " " + s).strip()
     missing = [f for f in FIELDS if f not in fm]
@@ -193,13 +252,20 @@ fi
 # --apply: fold into CHANGELOG.md above the first release section
 # (the title and any preamble stay on top), then drop consumed files.
 # The rewrite goes through a temp file + os.replace so a crash cannot
-# leave a truncated CHANGELOG.
+# leave a truncated CHANGELOG. The generated notes travel in a temp
+# FILE, never the environment (round 32, swe-2 item 27): env vars
+# share ARG_MAX/MAX_ARG_STRLEN with argv (~128 KiB per string), so a
+# large enough notes payload would make the python child fail to
+# exec at all.
 [ -f "$CHANGELOG" ] || { printf '# Changelog\n' > "$CHANGELOG"; }
-GENERATED="$GENERATED" python3 - "$CHANGELOG" <<'PYEOF'
+NOTES_FILE=$(mktemp) || { echo "mktemp failed" >&2; exit 1; }
+trap 'rm -f "$NOTES_FILE"' EXIT
+printf '%s\n' "$GENERATED" > "$NOTES_FILE"
+python3 - "$CHANGELOG" "$NOTES_FILE" <<'PYEOF'
 import os, sys, re, tempfile
-path = sys.argv[1]
+path, notes_path = sys.argv[1], sys.argv[2]
 text = open(path, encoding="utf-8").read()
-new = os.environ["GENERATED"].rstrip() + "\n"
+new = open(notes_path, encoding="utf-8").read().rstrip() + "\n"
 m = re.search(r"(?m)^## ", text)
 if m:
     out = text[: m.start()] + new + "\n" + text[m.start():]

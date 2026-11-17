@@ -164,6 +164,11 @@ from phonebridge.domain.contract import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 API_CONTRACT_MD = REPO_ROOT / "docs" / "api-contract.md"
 
+# Arbitrary fixed epoch (round 32, SA_swe2_review_2 item 4): a
+# deterministic kernel-clock value for tests - NOT a "current
+# time" assertion. All stamp plausibility bounds are absolute, so
+# the constant can never age into rejection; tests that inject it
+# as ``now`` exercise kernel arithmetic, not wall-clock truth.
 NOW_UTC = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
 # libphonenumber's reserved documentation example for MD (mobile) -
 # never a real subscriber. The fixed-line example "+37322212345" is
@@ -723,17 +728,24 @@ def test_fallback_policy_union_and_assignment_default() -> None:
     assert isinstance(announce, AnswerAndAnnounceFallback)
     assert announce.announcement_ref == "busy-msg-wav"
     # Round 22 (review-10 MEDIUM-2): the policy carries the
-    # announcement selector - it cannot be empty or absent. The ref
-    # is a checked identifier: a ":" would corrupt the adapter's
-    # "answer_and_announce:<ref>" split (round 25, review-15 item 37).
+    # announcement selector - it cannot be empty or absent. Round 32
+    # (SA_swe2_review_2 item 19) widened the ref grammar: namespaced
+    # selectors (``wav:busy-msg``) and relative paths are LEGAL -
+    # the adapter resolves the ref against the announcement root -
+    # while a leading ``/`` and any ``..`` path segment stay
+    # forbidden (traversal escapes can never reach the file lookup).
     with pytest.raises(ValidationError):
         adapter.validate_python({"policy": "answer_and_announce"})
     with pytest.raises(ValidationError):
         adapter.validate_python({"policy": "answer_and_announce", "announcement_ref": ""})
-    with pytest.raises(ValidationError):
-        adapter.validate_python(
-            {"policy": "answer_and_announce", "announcement_ref": "wav:busy-msg"}
-        )
+    namespaced = adapter.validate_python(
+        {"policy": "answer_and_announce", "announcement_ref": "wav:busy-msg"}
+    )
+    assert isinstance(namespaced, AnswerAndAnnounceFallback)
+    assert namespaced.announcement_ref == "wav:busy-msg"
+    for bad_ref in ("/abs/path.wav", "../up.wav", "a/../b.wav", "..", "seg/../x"):
+        with pytest.raises(ValidationError):
+            adapter.validate_python({"policy": "answer_and_announce", "announcement_ref": bad_ref})
     with pytest.raises(ValidationError):
         adapter.validate_python({"policy": "spill_to_pool"})  # never existed
 
@@ -849,46 +861,22 @@ def test_event_wire_name_parity() -> None:
     # Doc-side parity: every wire name in the mapping must appear as a
     # table row `| `event.<name>` |` in docs/api-contract.md — and
     # every such row must be covered by the mapping (no orphans in
-    # either direction). Round 31 (SA_swe2_review_1): the domain
-    # payload for ``event.media_overflow`` landed while the doc
-    # deliberately keeps it a RESERVED wire name outside the
-    # normative table ("absent ... until then") - the event is
-    # therefore pinned against the doc's reserved-name paragraph
-    # instead of a table row, and the exemption lifts when the wire
-    # document promotes it (a later batch, outside this change's
-    # scope).
+    # either direction). Round 32 (SA_swe2_review_2 item 23) lifted
+    # the round-31 exemption: ``event.media_overflow`` was promoted
+    # into the normative event table, so no reserved name survives.
     api_contract = (Path(__file__).parents[1] / "docs" / "api-contract.md").read_text(
         encoding="utf-8"
     )
     doc_event_rows = set(re.findall(r"^\|\s*`(event\.[a-z_]+)`\s*\|", api_contract, flags=re.M))
-    reserved_rows = {"event.media_overflow"}
-    assert doc_event_rows == set(EVENT_WIRE_NAMES.values()) - reserved_rows
-    # Structural pin on the reserved event (round-31 fix round, PR
-    # #78 minor 8 - replaces the earlier doc-substring asserts):
-    # the enum member exists, its wire spelling is exact, the
-    # payload mapping lands on MediaOverflowEvent and the payload
-    # field set is exactly {lease_id, line_id} - the bounded
-    # identifiers-only shape the overflow episode fact must keep.
-    assert EventName.MEDIA_OVERFLOW in EVENT_PAYLOAD_TYPES
-    assert EVENT_WIRE_NAMES[EventName.MEDIA_OVERFLOW] == "event.media_overflow"
-    assert EVENT_PAYLOAD_TYPES[EventName.MEDIA_OVERFLOW] is MediaOverflowEvent
-    assert set(MediaOverflowEvent.__pydantic_fields__) == {"lease_id", "line_id"}
-    assert set(MediaOverflowEvent(lease_id=LeaseId("l-1"), line_id=LineId("x")).model_dump()) == {
-        "lease_id",
-        "line_id",
-    }
+    assert doc_event_rows == set(EVENT_WIRE_NAMES.values())
 
     # Payload parity: every EventName has exactly one payload model,
-    # and the model's field names + optionality match the wire row
-    # (the reserved ``event.media_overflow`` carries
-    # ``{lease_id, line_id}`` - pinned structurally above).
+    # and the model's field names + optionality match the wire row.
     assert set(EVENT_PAYLOAD_TYPES) == set(EventName)
     table = _doc_event_table()
     assert table, "parsed zero event.* payloads - doc table format changed?"
-    assert set(table) == set(EVENT_WIRE_NAMES.values()) - reserved_rows
+    assert set(table) == set(EVENT_WIRE_NAMES.values())
     for name, model in EVENT_PAYLOAD_TYPES.items():
-        if name is EventName.MEDIA_OVERFLOW:
-            continue
         wire_name = EVENT_WIRE_NAMES[name]
         model_fields = model.__pydantic_fields__
         doc_params = table[wire_name]
@@ -1438,6 +1426,12 @@ class _FakeLineManager(LineManager):
         self._require_live_binding(assignment_id)
         return None
 
+    async def ingest_media_overflow(self, line_id: LineId, lease_id: LeaseId) -> None:
+        # Round 32 (SA_swe2_review_2 item 11): the media-router
+        # PCM-drop ingress - the ONLY event.media_overflow source;
+        # the SCO-loss path above never emits it.
+        return None
+
     async def compensate_dial(
         self,
         line_id: LineId,
@@ -1447,6 +1441,19 @@ class _FakeLineManager(LineManager):
         # Round 31 (SA_swe2_review_1 item 5): the adapter's
         # binding-scoped compensation for a rejected/timed-out
         # line.dial or line.answer - NOT the owner-scoped hangup.
+        self._require_live_binding(assignment_id)
+        return None
+
+    async def compensate_answer(
+        self,
+        line_id: LineId,
+        assignment_id: contract.AssignmentId,
+        lease_id: LeaseId,
+        call_token: CallToken,
+    ) -> None:
+        # Round 32 (SA_swe2_review_2 item 9): ring-scoped answer
+        # compensation - ring reject by call_token while the line
+        # stays RINGING_LOCKED under the drain rule.
         self._require_live_binding(assignment_id)
         return None
 
@@ -1492,11 +1499,12 @@ def test_line_manager_is_abstract() -> None:
 
 async def test_line_manager_async_surface() -> None:
     """Non-e2e async exercise: EVERY abstract method is awaitable and
-    returns its contracted result type (all 27 methods - 25 async +
+    returns its contracted result type (all 29 methods - 27 async +
     the two sync outbox drains; round 30 adds ``ingest_media_state``
     and the ``ProviderRegisterResult`` return on
     ``register_provider``, round 31 adds ``ingest_audio_lost`` and
-    ``compensate_dial``)."""
+    ``compensate_dial``, round 32 adds ``ingest_media_overflow``
+    and ``compensate_answer``)."""
     assert set(LineManager.__abstractmethods__) == {
         "register_intent",
         "acquire",
@@ -1528,6 +1536,10 @@ async def test_line_manager_async_surface() -> None:
         # attach/detach facts ride their own ingress so the
         # MEDIA_PAIR_TTL_SEC re-attach window has a driver.
         "ingest_media_state",
+        # Round 32 (SA_swe2_review_2 items 9/11): the media-router
+        # overflow ingress and the ring-scoped answer compensation.
+        "ingest_media_overflow",
+        "compensate_answer",
         "decide_fallback",
         "drop_session",
         "tick",
@@ -1677,6 +1689,24 @@ async def test_line_manager_async_surface() -> None:
     with pytest.raises(PhonebridgeError) as excinfo:
         await mgr.compensate_dial(
             LineId("line-main"), contract.AssignmentId("asg-1"), result.lease_id
+        )
+    assert excinfo.value.code is ErrorCode.STALE_TOKEN
+    # Round 32 (SA_swe2_review_2 items 9/11): the router overflow
+    # ingress and the ring-scoped answer compensation ride the same
+    # live-binding guard.
+    await mgr.ingest_media_overflow(LineId("line-main"), result.lease_id)
+    await mgr.compensate_answer(
+        LineId("line-main"),
+        contract.AssignmentId("bind-1"),
+        result.lease_id,
+        CallToken(RedactedString("tok-1")),
+    )
+    with pytest.raises(PhonebridgeError) as excinfo:
+        await mgr.compensate_answer(
+            LineId("line-main"),
+            contract.AssignmentId("asg-1"),
+            result.lease_id,
+            CallToken(RedactedString("tok-1")),
         )
     assert excinfo.value.code is ErrorCode.STALE_TOKEN
     await mgr.drop_session(session)
@@ -1879,20 +1909,18 @@ def test_ensure_aware_utc() -> None:
     plus2 = datetime(2026, 11, 14, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
     assert ensure_aware_utc(plus2) == datetime(2026, 11, 14, 12, 0, 0, tzinfo=timezone.utc)
     assert ensure_aware_utc(plus2).tzinfo is timezone.utc
-    # Round-31 fix round (PR #78 minor 7): the plausibility window
-    # is SYMMETRIC around the injected ``now`` - a far-past stamp
-    # is rejected exactly like a far-future one, so a stale
-    # hydrated/reported stamp can never poison dedup keys,
-    # watermarks or idle-deadline arithmetic.
-    gap = timedelta(days=3650)
-    assert ensure_aware_utc(NOW_UTC + gap, now=NOW_UTC) == NOW_UTC + gap
-    assert ensure_aware_utc(NOW_UTC - gap, now=NOW_UTC) == NOW_UTC - gap
-    with pytest.raises(ValueError, match="max reasonable"):
-        ensure_aware_utc(NOW_UTC + gap + timedelta(seconds=1), now=NOW_UTC)
+    # Round 32 (SA_swe2_review_2 item 4): the plausibility bounds
+    # are ABSOLUTE - a >= 2000-01-01 floor and a
+    # ``datetime.max - gap`` ceiling - never now-relative, so a
+    # stored/advisory stamp's legality cannot drift with the host
+    # clock and the validator needs no injected ``now``.
+    assert ensure_aware_utc(datetime(2000, 1, 1, tzinfo=timezone.utc)) == datetime(
+        2000, 1, 1, tzinfo=timezone.utc
+    )
     with pytest.raises(ValueError, match="min reasonable"):
-        ensure_aware_utc(NOW_UTC - gap - timedelta(seconds=1), now=NOW_UTC)
-    with pytest.raises(ValueError, match="naive now"):
-        ensure_aware_utc(NOW_UTC, now=datetime(2026, 11, 13, 12, 0, 0))
+        ensure_aware_utc(datetime(1999, 12, 31, 23, 59, 59, tzinfo=timezone.utc))
+    with pytest.raises(ValueError, match="max reasonable"):
+        ensure_aware_utc(datetime.max.replace(tzinfo=timezone.utc))
 
 
 def test_dtmf_pattern() -> None:
@@ -4234,11 +4262,36 @@ def test_checked_id_strict_charset() -> None:
         # ``_CheckedId`` carriers: worker-policy params.
         with pytest.raises(ValidationError):
             RecordAndTelegramFallback(channel=bad, announcement_ref="rec-note")
-        with pytest.raises(ValidationError):
-            AnswerAndAnnounceFallback(announcement_ref=bad)
         # ``_CheckedAssignmentId`` carrier.
         with pytest.raises(ValidationError):
             _assignment(assignment_id=contract.AssignmentId(bad))
+    # ``announcement_ref`` carriers run a WIDER grammar (round 32,
+    # SA_swe2_review_2 item 19): ``:`` namespaces and ``/`` paths
+    # are legal, so the strict-id list does not apply wholesale -
+    # the banned subset is charset violations plus traversal.
+    for bad_ref in (
+        "lead space",
+        "tab\tchar",
+        "new\nline",
+        "back\\slash",
+        "*glob",
+        "?glob",
+        "[bracket",
+        "/slash",
+        "../escape",
+        "a/../b",
+        "",
+        "x" * 129,
+    ):
+        with pytest.raises(ValidationError):
+            AnswerAndAnnounceFallback(announcement_ref=bad_ref)
+        with pytest.raises(ValidationError):
+            RecordAndTelegramFallback(channel="ops-alerts", announcement_ref=bad_ref)
+    # ...while namespaced/relative-path selectors stay legal.
+    assert (
+        AnswerAndAnnounceFallback(announcement_ref="ns:dir/file.wav").announcement_ref
+        == "ns:dir/file.wav"
+    )
     # Dots/dashes/underscores INSIDE the id stay legal.
     ok = LineSummary(
         line_id=LineId("line-1.main_2"),
@@ -5343,6 +5396,7 @@ def test_closed_vocabulary_value_dicts_pinned() -> None:
     }
     assert {m.name: m.value for m in ErrorReason} == {
         "ACCEPT_WINDOW_EXPIRED": "ACCEPT_WINDOW_EXPIRED",
+        "IDEMPOTENCY_CONFLICT": "IDEMPOTENCY_CONFLICT",
         "QUEUE_FULL": "QUEUE_FULL",
         "TICKET_NOT_FOUND": "TICKET_NOT_FOUND",
         "INVALID_CALL_STATE": "INVALID_CALL_STATE",
@@ -5404,21 +5458,21 @@ def test_call_lease_phase_cross_field_invariants() -> None:
             CallLease(**base, phase=early, answered_at=NOW_UTC)
         with pytest.raises(ValidationError):
             CallLease(**base, phase=early, answer_confidence="confirmed")
-    # ...but the grant TTL rides only the phases that precede the
-    # accept's consumption of the grant - ACQUIRED carries it
-    # (REQUIRED there, round 31 item 37), DIALING/ALERTING may still
-    # document the consumed deadline.
-    for grant_phase in (CallPhase.ACQUIRED, CallPhase.DIALING, CallPhase.ALERTING):
-        CallLease(**base, phase=grant_phase, grant_expires_at=NOW_UTC + timedelta(seconds=5))
-    # From ANSWERING on the grant is spent - the field MUST be gone.
-    for late in (
+    # The grant TTL rides ACQUIRED and ONLY ACQUIRED - REQUIRED
+    # there (round 31 item 37); round 32 (SA_swe2_review_2 item 21)
+    # removed the DIALING/ALERTING tolerance so a consumed deadline
+    # can never linger as a field a reader might mis-enforce.
+    CallLease(**base, grant_expires_at=NOW_UTC + timedelta(seconds=5))
+    for post in (
+        CallPhase.DIALING,
         CallPhase.ANSWERING,
+        CallPhase.ALERTING,
         CallPhase.ACTIVE,
         CallPhase.TERMINATING,
         CallPhase.ENDED,
     ):
         with pytest.raises(ValidationError):
-            CallLease(**base, phase=late, grant_expires_at=NOW_UTC + timedelta(seconds=5))
+            CallLease(**base, phase=post, grant_expires_at=NOW_UTC + timedelta(seconds=5))
     for late in (CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED):
         # ...and answer facts are legal once the call is established.
         CallLease(
@@ -5922,6 +5976,7 @@ def test_provider_wire_method_drift() -> None:
     table = _doc_rpc_table("## Manager namespace", r"provider\.[a-z_]+")
     expected_rows = {
         "provider.register",
+        "provider.reregister",
         "provider.ping",
         "provider.capability_update",
         "provider.call_state",
@@ -5931,13 +5986,10 @@ def test_provider_wire_method_drift() -> None:
     }
     assert set(table) == expected_rows
 
-    # provider.reregister shares the register row's prose
-    # ("same as register + state_snapshot?") - pin that the
-    # reregister method name and the extra snapshot param are
-    # documented, and that the distilled flag pair stays in place.
-    section = API_CONTRACT_MD.read_text(encoding="utf-8").split("## Manager namespace", 1)[1]
-    assert "`provider.reregister`" in section
-    assert "state_snapshot?" in section
+    # provider.reregister now carries an explicit params cell
+    # (round 32, SA_swe2_review_2 item 23 - the earlier "same as
+    # register" prose cell could never be drift-checked); the
+    # distilled flag pair stays in place.
     reg_fields = ProviderRegistration.__pydantic_fields__
     assert not reg_fields["reregister"].is_required()
     assert not reg_fields["state_snapshot"].is_required()
@@ -5949,6 +6001,7 @@ def test_provider_wire_method_drift() -> None:
             ProviderRegistration,
             {"channel_seq", "reregister", "state_snapshot"},
         ),
+        "provider.reregister": (ProviderRegistration, {"channel_seq", "reregister"}),
         "provider.ping": (ProviderLiveness, {"channel_seq"}),
         "provider.capability_update": (ProviderCapabilityUpdate, set()),
         "provider.call_state": (ProviderCallStateUpdate, set()),
@@ -6079,26 +6132,12 @@ def test_admin_wire_method_drift() -> None:
     method resolves to a kernel entry point (or an explicitly
     adapter-owned method) and every param name/optionality matches.
 
-    The hardware-transport params (round-31 item 10) are kernel-side
-    already; their wire-table cells land with the batch-2 doc edit,
-    so they are pinned here as kernel-only pending-params rather than
-    silently dropped."""
+    Round 32 (SA_swe2_review_2 item 23) lifted the round-31
+    pending-param exemption: the hardware-transport params now ride
+    the wire-table cells explicitly, so the parity check covers them
+    like every other param."""
     table = _doc_rpc_table("## Admin surface", r"admin\.[a-z_]+")
 
-    kernel_pending: dict[str, set[str]] = {
-        "admin.provision_line": {
-            "adapter_mac",
-            "paired_phone_mac",
-            "transport_profile",
-            "line_home_country",
-        },
-        "admin.configure_line": {
-            "adapter_mac",
-            "paired_phone_mac",
-            "transport_profile",
-            "line_home_country",
-        },
-    }
     method_map: dict[str, Callable[..., Any]] = {
         "admin.provision_line": contract.LineAdminKernel.provision_line,
         "admin.configure_line": contract.LineAdminKernel.configure_line,
@@ -6129,12 +6168,25 @@ def test_admin_wire_method_drift() -> None:
 
     # ``admin.list_keys`` (round-31 fix round, PR #78 warning 3) is a
     # normative table row: pin the redacted metadata shape so the row
-    # can never drift into returning key material.
+    # can never drift into returning key material. Round 32 adds the
+    # shared ``offset?``/``limit?`` window params.
     section = API_CONTRACT_MD.read_text(encoding="utf-8").split("## Admin surface", 1)[1]
     list_keys_row = next(ln for ln in section.splitlines() if ln.startswith("| `admin.list_keys`"))
     for field in ("key_id", "scope", "subject_id", "created_at", "last_used_at?", "revoked"):
         assert field in list_keys_row, f"admin.list_keys row misses {field}"
-    assert table["admin.list_keys"] == {"subject_id": True}
+    assert table["admin.list_keys"] == {"subject_id": True, "offset": True, "limit": True}
+
+    # Adapter-owned param columns stay drift-checked too (round 32,
+    # SA_swe2_review_2 item 23): no kernel signature exists for them,
+    # so pin the exact wire param sets.
+    assert table["admin.auth"] == {"api_key": False}
+    assert table["admin.issue_key"] == {
+        "agent_id": True,
+        "scopes": False,
+        "line_id": True,
+        "expires_at": True,
+    }
+    assert table["admin.revoke_key"] == {"key_id": False}
 
     pair_req = set(PairWindowRequest.__pydantic_fields__)
     assert pair_req == set(table["admin.pair_window"]), (
@@ -6144,16 +6196,15 @@ def test_admin_wire_method_drift() -> None:
     )
 
     for wire, fn in method_map.items():
-        pending = kernel_pending.get(wire, set())
         sig_params = _signature_params(fn)
         doc_params = table[wire]
-        assert set(sig_params) - pending == set(doc_params), (
+        assert set(sig_params) == set(doc_params), (
             f"{fn.__name__} drift vs {wire}: "
             f"missing={set(doc_params) - set(sig_params)}, "
-            f"extra={set(sig_params) - pending - set(doc_params)}"
+            f"extra={set(sig_params) - set(doc_params)}"
         )
         doc_optional = {p for p, optional in doc_params.items() if optional}
-        sig_optional = {p for p, has_default in sig_params.items() if has_default} - pending
+        sig_optional = {p for p, has_default in sig_params.items() if has_default}
         assert doc_optional == sig_optional, (
             f"{fn.__name__} optionality drift vs {wire}: "
             f"doc-optional-only={doc_optional - sig_optional}, "
