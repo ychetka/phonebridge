@@ -577,9 +577,11 @@ transport: a `HCI_PASSTHRU` frame is checked before any
 (event `param_len` / ACL `data_len` / SCO `payload_len`) MUST
 equal the actual inner payload (`len - 5 - header`), and the H4
 type itself is allowlisted to the AGENT→FEEDER set
-`0x02`/`0x03`/`0x04` (§"H4 type split"; round 32,
+`0x02`/`0x04` (§"H4 type split"; round 32,
 SA_swe2_review_2 item 7 — the earlier `0x01`-inclusive list was
-wrong): HCI `0x01` commands flow in ONE direction only —
+wrong, and `0x03` rides the media channel as record kind
+`0x03`, never a `HCI_PASSTHRU` write): HCI `0x01` commands flow
+in ONE direction only —
 kernel→agent, read off the `/dev/vhci` fd by the feeder and
 proxied down the tunnel — the dongle never emits a command, so
 an agent-originated `0x01` is a fabricated packet the kernel
@@ -658,9 +660,11 @@ explicit health event.
 part of the contract (round 32, SA_swe2_review_2 item 7):
 `0x01` commands flow ONLY kernel→agent — the feeder reads them
 off `/dev/vhci` and proxies them down the tunnel, the agent never
-mints one — while `0x02`/`0x04`/`0x03` are the only types an
-agent may write back (see the allowlist in the frame-validation
-paragraph). On the USB side the class is implied by the
+mints one — while `0x02`/`0x04` are the only H4 types an agent
+may write back on the control channel (`0x03` SCO travels on the
+media channel as record kind `0x03`, never inside a
+`HCI_PASSTHRU` frame — see the allowlist in the
+frame-validation paragraph). On the USB side the class is implied by the
 endpoint (no literal H4 byte exists on USB); the agent adds/strips it
 when translating to the wire framing, and the container's `vhci`
 adapter consumes the same typed frames.

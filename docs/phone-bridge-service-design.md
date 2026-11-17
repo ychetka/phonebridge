@@ -582,10 +582,15 @@ lived).
 Down (server-initiated on the provider's own inbound connection):
 `line.dial`, `line.answer`, `line.hangup`, `line.send_dtmf` -
 each returning
-`{accepted}`; `line.dial`/`line.hangup`/`line.send_dtmf` carry
-`{assignment_id, lease_id, ...}` while `line.answer` carries
-`{assignment_id, call_token}` — it names the RING, no lease
-exists yet (round 31) — and `line.hangup` alternatively carries
+`{accepted}`; `line.dial`/`line.answer`/`line.hangup`/`line.send_dtmf`
+carry `{assignment_id, lease_id, ...}` — `line.answer` carries
+the full `{assignment_id, lease_id, call_token, media_endpoint,
+media_token}` set (round 32): the lease EXISTS by then —
+`call.accept` minted it in the `answering` phase — so the wire
+names both the lease (media credentials are per-lease) and the
+ring's `call_token` (the provider's ring correlation key, which
+was minted before any lease existed) — and `line.hangup`
+alternatively carries
 `{assignment_id, call_token}` to reject a still-unanswered ring
 (XOR target, round 23). `line.dial`'s reply additionally carries
 `provider_call_id?` (round 32 — the provider's own call handle,
@@ -2004,14 +2009,17 @@ status (mirrors the busctl commands used in Phase-0).
   `{grant_ttl_sec?, orphan_grace_sec?, heartbeat_interval_sec?,
   heartbeat_degraded_after?, heartbeat_down_after?,
   fallback_accept_ttl_sec?, ring_drain_ttl_sec?,
-  max_call_duration_sec?, clear_max_call_duration?}` (round 22;
+  max_call_duration_sec?, clear_max_call_duration?,
+  hangup_hold_sec?}` (round 22;
   `fallback_accept_ttl_sec`
   added round 23, ~10 s default, bounds the FallbackWorker accept
   deadline; `ring_drain_ttl_sec` ~60 s default bounds the
   ring-drain wait of §5.2 step 6; `max_call_duration_sec` — round
   25 — caps any single call's wall-clock length, default off, ≤
   86400 s when set, and bounds `record_and_telegram` recording
-  length). All timeout values are finite numbers (`NaN`/`Infinity`
+  length; `hangup_hold_sec` — round 32, SA_swe2_review_2 item 1 —
+  bounds the `terminating` hold of §5.2, default 10 s, tight
+  `1..120` bound). All timeout values are finite numbers (`NaN`/`Infinity`
   rejected at the boundary) with sane upper bounds per field (round
   25). `heartbeat_interval_sec` is floored at 0.001 s
   (millisecond granularity — the wire unit is ms) and stamped as

@@ -818,23 +818,23 @@ grammar bans a leading ``/`` and ``..`` segments outright."""
 def _check_announcement_ref(value: str) -> str:
     """Announcement-asset selector hygiene: non-empty, bounded at
     ``_ID_MAX_LEN``, matching :data:`_ANNOUNCEMENT_REF_CHARSET`,
-    and traversal-safe (round 32, SA_swe2_review_2 item 19): a
-    leading ``/`` is forbidden - the ref is always resolved
-    RELATIVE to the announcement-asset root - and no ``/``-
-    delimited segment may be ``..`` - a parent-directory escape
-    inside an otherwise-legal charset must never reach the
-    adapter's file lookup. The kernel check is grammar-only: WAV
-    existence/media validation stays ADAPTER-side at
+    and traversal-safe (round 32, SA_swe2_review_2 item 19): no
+    ``/``-delimited segment may be ``..`` - a parent-directory
+    escape inside an otherwise-legal charset must never reach the
+    adapter's file lookup. A leading ``/`` needs no separate
+    check: the charset's first-character class already excludes
+    it, so the ref is always resolved RELATIVE to the
+    announcement-asset root. The kernel check is grammar-only:
+    WAV existence/media validation stays ADAPTER-side at
     ``configure_line`` time."""
     if len(value) > _ID_MAX_LEN:
         raise ValueError(f"announcement_ref exceeds {_ID_MAX_LEN} chars")
     if not _ANNOUNCEMENT_REF_CHARSET.fullmatch(value):
         raise ValueError(
             "announcement_ref must match [A-Za-z0-9][A-Za-z0-9._:/-]* "
-            "(asset selectors may carry a ':' namespace or '/' path)"
+            "(asset selectors may carry a ':' namespace or '/' path; "
+            "the leading-alnum class already forbids a leading '/')"
         )
-    if value.startswith("/"):
-        raise ValueError("announcement_ref is relative - leading '/' is forbidden")
     if ".." in value.split("/"):
         raise ValueError("announcement_ref must not contain '..' path segments")
     return value
@@ -1792,13 +1792,14 @@ attempt beyond this count with ``RESOURCE_EXHAUSTED``."""
 
 MAX_TICK_DEADLINES: int = 256
 """Bound on deadline items one ``tick`` call processes (round 32,
-SA_swe2_review_2 item 2): every deadline class ``tick`` owns -
+SA_swe2_review_2 item 2): all deadline classes ``tick`` owns -
 accept windows, grant TTLs, ring-drain TTLs, media-pair TTLs,
 ``hangup_hold_sec`` lapses, orphan-grace deadlines, idle alerts -
-is processed for at most this many expired items per call; items
-beyond the bound stay pending and are processed on the NEXT
-``tick`` (continuation, not loss), so a mass-expiry wave can
-never wedge one ``tick`` into an over-cap burst or starve the
+share ONE aggregate budget: at most this many expired items IN
+TOTAL per call across all classes combined, never a per-class
+quota; items beyond the bound stay pending and are processed on
+the NEXT ``tick`` (continuation, not loss), so a mass-expiry wave
+can never wedge one ``tick`` into an over-cap burst or starve the
 event loop. Deadline volume can NEVER surface
 ``RESOURCE_EXHAUSTED`` - expiry is liveness bookkeeping, not a
 client request, so backpressure is expressed as deferral, never
@@ -1853,7 +1854,12 @@ reply - the seven methods above plus the non-kernel
 ``{<rows>, has_more, cursor}``: ``has_more`` is ``true`` exactly
 when rows exist past the returned slice and ``cursor`` is the
 adapter's opaque encoding of the authoritative resume offset
-(``null`` when ``has_more`` is false). The kernel surface keeps
+(``null`` when ``has_more`` is false). The derivation is pinned:
+``has_more`` is ``false`` IFF the page returned FEWER than
+``limit`` rows AND the 64 KiB byte cap was not hit - a genuinely
+short page is the only end-of-list signal - while a byte-cap
+truncated page reports ``has_more: true`` with ``cursor``
+resuming at the FIRST DROPPED row. The kernel surface keeps
 returning ``list[T]`` - the slice contract (stable order,
 bounded window) already carries everything the adapter needs to
 stamp the two fields, and a mid-page byte-cap truncation
@@ -3309,12 +3315,18 @@ class ProviderBinding(ContractModel):
     orphan_deadline_at: AwareDatetime | None = None
     """Orphan-grace deadline (round 27, review-17 item 76;
     persistence corrected round 32, SA_swe2_review_2 items
-    14/15): the field IS persisted on the ``provider_bindings``
-    cache row - a restart discards the sockets the deadline
-    guarded but NOT the binding row, which hydrates DEAD with an
-    already-expired deadline so the first ``tick`` runs the
-    orphan cascade deterministically instead of relying on wall
-    time. The deadline is projected verbatim onto the
+    14/15): the field is a KERNEL-side deadline, NOT a durable
+    ``provider_bindings`` column - the cache row persists only
+    the best-effort bookkeeping a restart needs (identity,
+    stamped thresholds, ``channel_seq``, ``last_seen_at``, stamp
+    watermarks), and a deadline written before the process died
+    would be meaningless anyway because the sockets it guarded
+    died with the process. The deadline is therefore RE-DERIVED
+    on hydrate: ``hydrate_lines`` loads every stored binding
+    DEAD (``liveness: ws_disconnected``) and stamps an
+    ALREADY-EXPIRED ``orphan_deadline_at`` so the first ``tick``
+    runs the orphan cascade deterministically instead of relying
+    on wall time. The live value is projected verbatim onto the
     admin-scoped binding listing (``ProviderBindingSummary``
     carries it, round 32 item 24) so an operator can see a
     binding inside its grace window - a ``null`` there means
@@ -6190,18 +6202,24 @@ class LineManager(ABC):
         round 23).
 
         Provider-side compensation (Saga, round 23, review-12 H3;
-        hangup-first sequencing hardened round 30,
-        SA_carbon_review_19 slice-A item 5 / slice-B item 7;
-        dedicated entry point round 31, SA_swe2_review_1 item 5):
-        same rule as :meth:`dial` - ``accept()`` mints the lease and
-        enqueues ``ProviderAnswerCommand`` without a network await;
-        the adapter awaits the provider's ``{accepted}`` on
+        ring-scoped entry pinned round 32, SA_swe2_review_2 item 9):
+        ``accept()`` mints the lease and enqueues
+        ``ProviderAnswerCommand`` without a network await; the
+        adapter awaits the provider's ``{accepted}`` on
         ``line.answer`` with a ~2 s deadline and on
         ``{accepted: false}`` / timeout / transport error MUST call
-        :meth:`compensate_dial` FIRST - its ``ProviderHangupCommand``
-        is the best-effort air-side teardown and ends the lease with
-        ``network_error`` - rather than synthesizing a
-        ``disconnected`` fact the provider never reported."""
+        :meth:`compensate_answer` FIRST - its RING-scoped
+        ``ProviderHangupCommand`` (``call_token`` set,
+        ``lease_id`` ``None`` - the frozen reject vehicle) is the
+        best-effort air-side reject of the still-ringing call, the
+        ``ANSWERING`` lease ends ``network_error`` in the same
+        mutation, and the line stays ``RINGING_LOCKED`` until the
+        provider's ``disconnected`` or the ``ring_drain_ttl_sec``
+        lapse resolves the drain. NOT :meth:`compensate_dial` - the
+        physical inbound ring can outlive the failed answer, so the
+        line is never freed early the way dial compensation frees
+        it. Synthesizing a ``disconnected`` fact the provider never
+        reported stays FORBIDDEN."""
         ...
 
     @abstractmethod
@@ -7256,6 +7274,13 @@ class LineManager(ABC):
         dedupe/no-op (a lost-answer report racing a real
         ``disconnected`` must not resurrect or double-reject); a
         ``call_token`` the line never held is ``STALE_TOKEN``.
+        A lease already in ``TERMINATING`` is likewise a
+        dedupe/no-op (round 32, SA_swe2_review_2 item 26 - the
+        same rule :meth:`compensate_dial` carries): a late
+        rejected-answer report racing a queued ``line.hangup``
+        mints NO second ring-scoped reject and never re-ends the
+        lease - its provider fact or ``hangup_hold_sec`` lapse
+        closes it.
         Synthesizing a ``disconnected``
         :meth:`ingest_call_state` fact stays FORBIDDEN here too -
         the queued reject command IS the teardown, and the drain
@@ -7382,7 +7407,11 @@ class LineManager(ABC):
 
         ``TERMINATING`` hold lapse (round 32, SA_swe2_review_2 item
         1): a lease parked in ``TERMINATING`` by
-        :meth:`hangup`/``compensate_dial`` carries a private
+        :meth:`hangup` - the ONLY parking path; the
+        :meth:`compensate_dial`/:meth:`compensate_answer` saga
+        entries end their lease ``network_error`` INSIDE the same
+        mutation that queues the command, so they never leave a
+        ``TERMINATING`` tenant behind - carries a private
         hold deadline stamped at transition time; at
         ``now >= hold_deadline`` ``tick`` ends it with
         ``CallEndReason.NETWORK_ERROR`` as a KERNEL-side timeout
@@ -7509,7 +7538,12 @@ class LineManager(ABC):
 
         Bounded deadline processing (round 32, SA_swe2_review_2
         item 2): ONE ``tick`` call processes at most
-        :data:`MAX_TICK_DEADLINES` expired items in total - a
+        :data:`MAX_TICK_DEADLINES` expired items IN TOTAL across
+        ALL deadline classes combined - the bound is on the
+        aggregate work slice, never a per-class quota (a tick
+        facing 256 expired grant TTLs AND 256 expired orphan
+        deadlines processes 256 items from the merged deadline
+        set, not 512) - a
         mass-expiry wave (every line's accept window lapsing at
         once, a restart-expired orphan deadline on every hydrated
         binding) is split across consecutive ``tick`` calls with

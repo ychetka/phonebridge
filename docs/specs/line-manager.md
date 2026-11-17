@@ -110,7 +110,7 @@ would confuse dedup; a late provider fact about the ended lease is
 deduplicated through the `_closed_leases` ring afterwards (a
 dedupe/no-op, never `STALE_TOKEN`).
 `TERMINATING` is a dedupe/no-op for `compensate_dial` (round 32,
-swe2_review_2 item 9): a second compensation call while the hold
+swe2_review_2 item 26): a second compensation call while the hold
 is already armed neither re-queues a hangup nor re-ends the lease.
 
 ### Requirement: Answer compensation is ring-scoped (round 32, item 9)
@@ -127,8 +127,11 @@ mutation, and keeps the line `RINGING_LOCKED` — never FREE —
 until the provider's `disconnected` or the `ring_drain_ttl_sec`
 lapse confirms the air side cleared. A `line.hangup` issued
 against the physical ring a failed answer left behind is the same
-reject vehicle; a second `compensate_answer` on an ended lease is
-a dedupe/no-op through `_closed_leases`.
+reject vehicle; a second `compensate_answer` on an ended lease —
+or on a lease already parked in `TERMINATING` (round 32,
+swe2_review_2 item 26, the same dedupe rule `compensate_dial`
+carries) — is a dedupe/no-op through `_closed_leases`/the parked
+state: it mints no second reject and never re-ends the lease.
 
 ### Requirement: Call-lease phases and the grant TTL (round 31)
 
@@ -269,7 +272,9 @@ MUST reject a backwards `now` with
 invariant, not an implementation option. The per-call work a
 single `tick` performs on expired deadlines is BOUNDED (round
 32, swe2_review_2 item 2): at most `MAX_TICK_DEADLINES` = 256
-expired-deadline items are processed per invocation, the
+expired-deadline items are processed per invocation IN TOTAL
+across all deadline classes combined — never a per-class quota —
+the
 remainder stays pending and continues on the NEXT tick — the
 cap makes one tick's cost independent of accumulated backlog,
 and deferral is continuation, never `RESOURCE_EXHAUSTED` (a
