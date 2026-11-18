@@ -24,8 +24,13 @@ fallback suppression, positive-evidence `caller_id` attribution +
 `external_call`, durable `ProviderBinding` stamp watermarks +
 channel-local `orphan_deadline_at`, `WakeAudience` zero-subscriber
 routing, adapter-owned listing `cursor`, `media_epoch` on the
-call-lease tuple, ISO-3166 `default_region` and unique
-`adapter_mac` provisioning validation).
+call-lease tuple, phonenumbers-region `default_region` and unique
+`adapter_mac` provisioning validation; PR #82 review fixes add the
+tokenless `IncomingCallWakeEvent` wake payload, the dial-only
+`provider_call_id` restriction on `ProviderCommandAck`, the
+atomic pending-command teardown semantics, the in-flight
+idempotency join rule, and the corrected telephony-region
+vocabulary).
 Prose sections carry the
 requirements; each is cited by `.changes` fragments via its heading
 anchor (see `docs/specs/README.md`).
@@ -43,7 +48,8 @@ when no lease exists yet.
 
 `ForwardViaLineFallback` MUST carry `forward.line_id`,
 `target_number` (strict E.164, `RedactedString`) and
-`target_country` (ISO alpha-2), pre-validated at `configure_line`
+`target_country` (uppercase alpha-2 phonenumbers-supported region),
+pre-validated at `configure_line`
 with the same checks `call.dial` applies, because the FallbackWorker
 holds no admin scope to resolve missing pieces at runtime. The
 `forward.line_id` target MUST resolve to an existing configured line
@@ -511,6 +517,18 @@ the typed detail replaces the bare INVALID_ARGUMENT of round 28).
 Every recorded outcome expires `IDEMPOTENCY_TTL_SEC` = 3600 s
 after recording — a retry AFTER the window re-executes fresh: the
 contract is a bounded retry window, not a permanent alias.
+In-flight idempotency (round 33, PR #82 review): the adapter MUST
+create the `(method, session_id, idempotency_key)` dedup entry
+BEFORE the kernel mutation or provider command is dispatched —
+dedup is an ingress gate, not a post-completion index. A retry
+carrying the same key with IDENTICAL parameters while the first
+request is still in flight MUST join/wait on that operation and
+receive the same outcome: it MUST NOT re-enter the kernel or
+dispatch a second `line.dial`/`line.answer`. Once the first
+request resolves the entry replays the recorded outcome verbatim
+until TTL/eviction. `drop_session` kills any in-flight waiter
+together with the session's dedup table — a join never outlives
+the session and no dedup ever spans a reconnect.
 The per-session dedup table is BOUNDED (round 29; eviction rule
 changed round 32, item 17): at most
 `MAX_IDEMPOTENCY_KEYS_PER_SESSION` (256) recorded outcomes per
@@ -981,8 +999,11 @@ hciX names are unstable across reboots), `paired_phone_mac` (the
 handset the line serves — `admin.pair_window` runs the bounded
 pairing window against it), `transport_profile` (the closed
 `loopback | direct_mtls | wireguard` vocabulary naming how the
-provider reaches the gateway) and `line_home_country` (the ISO
-alpha-2 display/caller-id normalization region ONLY — round 32,
+provider reaches the gateway) and `line_home_country` (the uppercase alpha-2
+phonenumbers-supported display/caller-id normalization region ONLY
+— the accepted vocabulary is the phonenumbers region set, the
+ISO 3166-1-style codes PLUS telephony extensions like
+`"XK"`/`"AC"`/`"TA"`, not strict ISO 3166-1 only — round 32,
 swe2_review_2 item 22: it renders numbers for admin/diagnostic
 surfaces; `call.dial` still requires its explicit `country`
 parameter and no dial input is ever normalized from this field);
@@ -1252,6 +1273,15 @@ and ≤ 60 s, patched through `configure_line` like every timeout
 knob). `command` is the closed `CommandAckKind` vocabulary —
 `"dial"`/`"answer"` — and `call_token` echoes the ring token ONLY
 on the answer handshake (the ring-scoped reject needs it).
+The acknowledgement shape is command-specific (round 33, PR #82
+review): `provider_call_id` is legal ONLY on an ACCEPTED
+`command="dial"` acknowledgement — `line.dial` returns
+`{accepted, provider_call_id?, reason?}` — and is FORBIDDEN on
+every `command="answer"` acknowledgement, accepted or refused:
+`line.answer` returns `{accepted, reason?}` and carries no
+provider-call-handle because ring correlation stays
+`call_token`/`line_id`. `reason` remains refusal-only on both
+commands: an accepted ack never carries one.
 
 From command-dispatch until the handshake resolves the lease
 carries `pending_command` (phase-coherent: `"dial"` on DIALING
@@ -1284,13 +1314,34 @@ an already-resolved or ended lease is a dedupe/no-op.
 Synthesizing a `disconnected` provider fact for any ack failure
 stays FORBIDDEN.
 
+Pending-command teardown (round 33, PR #82 review): whenever a
+lease leaves `DIALING` or `ANSWERING` through ANY path — agent
+`hangup`/`release`/`drop_session`, provider/binding death,
+adapter compensation, or a `tick` deadline — the mutation MUST
+clear `pending_command` and `provider_command_ack_deadline_at`
+ATOMICALLY with the teardown: a lease can never carry a live
+command-pending marker past its own teardown, and a command
+acknowledgement arriving afterwards is STALE — a dedupe/no-op
+through the closed-lease ring that can never resurrect or mutate
+the torn-down lease. The teardown's hangup vehicle keeps its
+command scope: a pending `line.dial` teardown queues the
+LEASE-scoped `ProviderHangupCommand{lease_id}`, while a pending
+`line.answer` teardown queues the RING-scoped
+`ProviderHangupCommand{call_token}`.
+
 The agent-facing consequence is handshake-locked wire replies:
 the `call.dial`/`call.accept` answer is withheld until the
 bounded handshake resolves — it waits ONLY for the command ack,
 never for cellular alerting or answer — and a refused, timed-out
 or unreachable handshake answers `PROVIDER_UNREACHABLE` (all
 three command-handshake failures collapse to the one existing
-code; no new error code is minted).
+code; no new error code is minted). While the caller session is
+alive the withheld answer stays handshake-bound across a racing
+teardown (round 33, PR #82 review): `{accepted:true}` yields the
+normal `DialResult`/`AcceptResult` even when a teardown raced
+after the provider's acceptance; `{accepted:false}`/timeout/
+unreachable yields `PROVIDER_UNREACHABLE`; a session that died
+while the handshake was open receives no answer at all.
 
 ### Requirement: Answer-pending rings suppress the fallback decision (round 33)
 
@@ -1361,7 +1412,17 @@ ZERO live sessions stamps a `WakeAudience` envelope ONLY when at
 least one wake hook is configured — socket fan-out is empty by
 construction and only the `escalation_hooks` delivery leg
 consumes it, carrying the masked/bounded wake payload (never a
-live `call_token`). With no hooks configured, NO `incoming_call`
+live `call_token`). The tokenless shape is STRUCTURAL, not
+procedural (round 33, PR #82 review): a `wake`-audience
+`incoming_call` envelope MUST carry the dedicated
+`IncomingCallWakeEvent` projection `{line_id, caller_id?,
+expires_at}` — the one-shot `call_token` field does not exist on
+the model — while every live `agent`/`session`/`fanout` audience
+keeps the token-bearing `IncomingCallEvent`; `EventEnvelope`
+enforces the split at construction, so a token-bearing payload on
+`wake` — or the tokenless projection on a live audience — is not
+constructible. `MissedCallEvent` already carries no token and
+needs no sibling projection. With no hooks configured, NO `incoming_call`
 envelope is emitted at all — the ring still waits out
 `accept_window_sec` so a sleeping agent can wake and answer.
 `wake` is legal ONLY on `incoming_call`/`missed_call`; PII-bearing

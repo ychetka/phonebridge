@@ -160,6 +160,7 @@ __all__ = [
     "ForwardViaLineFallback",
     "IdleAlertEvent",
     "IncomingCallEvent",
+    "IncomingCallWakeEvent",
     "IncomingRingIngress",
     "Intent",
     "LeaseId",
@@ -792,10 +793,14 @@ _CheckedMacAddress = Annotated[str | None, AfterValidator(_check_mac_address)]
 
 
 def _check_country_alpha2(value: str | None) -> str | None:
-    """ISO 3166-1 alpha-2 country field (round 31, SA_swe2_review_1
-    item 10; region membership added round 33): ``line_home_country``
+    """Telephony region field (round 31, SA_swe2_review_1
+    item 10; region membership added round 33; vocabulary wording
+    corrected in the PR #82 review round): ``line_home_country``
     carries exactly two uppercase ASCII letters or ``None``, AND the
-    code must be a KNOWN ISO 3166-1 alpha-2 region - an
+    code must be a KNOWN phonenumbers-supported alpha-2 region -
+    the ISO 3166-1-style region vocabulary PLUS its telephony
+    extensions (e.g. ``"XK"``, ``"AC"``, ``"TA"``), NOT strict ISO
+    3166-1 only. An
     alpha-2-shaped but unassigned code (``"ZZ"``, ``"AA"``) would
     silently pass the shape gate and feed a nonsense region into the
     dial-normalization default. Membership is checked against
@@ -805,14 +810,16 @@ def _check_country_alpha2(value: str | None) -> str | None:
     if value is None:
         return None
     if not re.fullmatch(r"[A-Z]{2}", value):
-        raise ValueError("expected an ISO alpha-2 country code (two uppercase letters)")
+        raise ValueError("expected an uppercase alpha-2 region code (two uppercase letters)")
     if value not in _ISO_REGION_CODES:
-        raise ValueError("expected a known ISO 3166-1 alpha-2 region")
+        raise ValueError("expected a known phonenumbers-supported alpha-2 region")
     return value
 
 
 _CheckedCountryAlpha2 = Annotated[str | None, AfterValidator(_check_country_alpha2)]
-"""Optional ISO alpha-2 country code."""
+"""Optional uppercase alpha-2 telephony region code (phonenumbers
+vocabulary - ISO-style regions plus telephony extensions such as
+``"XK"``/``"AC"``/``"TA"``)."""
 
 
 _ANNOUNCEMENT_REF_CHARSET: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
@@ -1559,9 +1566,13 @@ CommandAckKind: TypeAlias = Literal["dial", "answer"]
 """The provider commands carrying a bounded ``{accepted}`` handshake
 (round 33): ``line.dial`` and ``line.answer`` are the two
 down-channel commands whose reply is a first-class kernel FACT -
-the adapter reports the distilled ``{accepted, provider_call_id?,
-reason?}`` through :class:`ProviderCommandAck` /
-:meth:`LineManager.ingest_command_ack`, and :attr:`CallLease.pending_command`
+the adapter reports the distilled reply through
+:class:`ProviderCommandAck` /
+:meth:`LineManager.ingest_command_ack` -
+``{accepted, provider_call_id?, reason?}`` on ``line.dial``,
+``{accepted, reason?}`` on ``line.answer`` (the answer reply has
+no provider-call-handle field - ring correlation stays
+``call_token``/``line_id``, PR #82 review) - and :attr:`CallLease.pending_command`
 records which of the two is still awaiting its bounded reply
 (:attr:`LineTimeouts.provider_command_ack_sec`). ``line.hangup``
 and ``line.send_dtmf`` are fire-and-forget command surfaces -
@@ -1639,7 +1650,14 @@ result verbatim (``replay-after-completion`` - the recorded
 outcome is served, never re-derived), and the same key under
 DIFFERENT params inside the live entry's window is
 ``INVALID_ARGUMENT`` with
-``ErrorReason.IDEMPOTENCY_CONFLICT``."""
+``ErrorReason.IDEMPOTENCY_CONFLICT``. In-flight semantics
+(round 33, PR #82 review): the adapter creates the
+``(method, session_id, key)`` entry BEFORE the kernel
+mutation/provider command is dispatched, so a same-key +
+identical-params retry arriving while the first request is
+still in flight JOINS/WAITS on that operation - never a second
+kernel entry or a second ``line.dial``/``line.answer`` - and a
+session drop kills the waiter with the table."""
 
 MAX_PENDING_CLAIMS_PER_AGENT: int = 8
 """Bounded pending ``call.claim_exclusive`` requests per agent
@@ -2213,10 +2231,16 @@ _ISO_REGION_CODES: frozenset[str] = frozenset().union(
     *phonenumbers.COUNTRY_CODE_TO_REGION_CODE.values()
 )
 """Every region code phonenumbers knows (round 25, review-15 item
-36): this phonenumbers release exposes no ``is_valid_region_code``
+36; vocabulary wording corrected in the PR #82 review round): this
+phonenumbers release exposes no ``is_valid_region_code``
 helper, so the known-region set is derived as the union of
 ``COUNTRY_CODE_TO_REGION_CODE`` values - the same derivation the
-helper itself performs upstream. A syntactically-alpha-2 code like
+helper itself performs upstream. The accepted vocabulary is the
+PHONENUMBERS-SUPPORTED uppercase alpha-2 region set - the ISO
+3166-1-style regions PLUS phonenumbers' telephony extensions such
+as ``"XK"`` (Kosovo), ``"AC"`` (Ascension) and ``"TA"`` (Tristan
+da Cunha) - NOT strict ISO 3166-1 only. A syntactically-alpha-2
+code like
 ``"ZZ"`` that is not in this set is an UNKNOWN_COUNTRY_CODE, not a
 COUNTRY_MISMATCH - keeping the two failure branches distinct lets
 the kernel map them to different typed ``ErrorReason`` sub-codes."""
@@ -2237,7 +2261,7 @@ can never be produced by ``number_type()`` and is an
 
 
 def validate_e164_country(number: RedactedString, country: str) -> str:
-    """Pure E.164 + ISO alpha-2 cross-check (round 24, review-13 M1;
+    """Pure E.164 + alpha-2 region cross-check (round 24, review-13 M1;
     region-membership and ``"001"`` handling added in round 25,
     review-15 item 36).
 
@@ -2257,8 +2281,8 @@ def validate_e164_country(number: RedactedString, country: str) -> str:
 
     - number not strict E.164 / unparseable ->
       ``INVALID_FORMAT_NOT_E164``;
-    - ``country`` not ISO alpha-2 in shape, or alpha-2 but not a
-      KNOWN ISO 3166-1 region (e.g. ``"ZZ"``) ->
+    - ``country`` not uppercase alpha-2 in shape, or alpha-2 but not
+      a KNOWN phonenumbers-supported region (e.g. ``"ZZ"``) ->
       ``UNKNOWN_COUNTRY_CODE``;
     - parse succeeds but the number is not a valid subscriber
       number -> ``INVALID_NUMBER``;
@@ -2300,7 +2324,7 @@ def validate_e164_country(number: RedactedString, country: str) -> str:
             ErrorCode.INVALID_ARGUMENT,
             ErrorData(
                 reason=ErrorReason.UNKNOWN_COUNTRY_CODE,
-                detail="country is not ISO 3166-1 alpha-2",
+                detail="country is not uppercase alpha-2",
             ),
         )
     if country != _NON_GEO_REGION and country not in _ISO_REGION_CODES:
@@ -2308,7 +2332,7 @@ def validate_e164_country(number: RedactedString, country: str) -> str:
             ErrorCode.INVALID_ARGUMENT,
             ErrorData(
                 reason=ErrorReason.UNKNOWN_COUNTRY_CODE,
-                detail="country is not a known ISO 3166-1 alpha-2 region",
+                detail="country is not a known phonenumbers-supported alpha-2 region",
             ),
         )
     try:
@@ -2457,8 +2481,8 @@ class ForwardViaLineFallback(ContractModel):
     to query line config, so the policy model itself MUST carry the
     full dial target (same ``number`` + ``country`` pair semantics
     as ``call.dial``: ``target_number`` is a strict-E.164
-    RedactedString, ``target_country`` the ISO 3166-1 alpha-2
-    cross-check assertion). Round 24 (review-13 M1) moves the check
+    RedactedString, ``target_country`` the uppercase alpha-2
+    phonenumbers-supported region cross-check assertion). Round 24 (review-13 M1) moves the check
     INTO the model: ``_valid_dial_target`` runs
     :func:`validate_e164_country` at construction, so a corrupt
     SQLite/config row can never hydrate an invalid policy that would
@@ -3143,10 +3167,14 @@ class LineAssignment(ContractModel):
     (hci-agent.md tunnel profiles) carried on the ``lines`` row so
     the provider adapter picks the right listener/dialer."""
     line_home_country: _CheckedCountryAlpha2 = None
-    """ISO alpha-2 home country of the line's number range (round
+    """Uppercase alpha-2 telephony home region of the line's number
+    range (round
     31, SA_swe2_review_1 item 10): the default region for dial
     normalization when the caller omits a country hint, ``None``
-    until configured."""
+    until configured. Vocabulary (PR #82 review round): the
+    phonenumbers-supported region set - ISO-style regions plus
+    telephony extensions like ``"XK"``/``"AC"``/``"TA"`` - not
+    strict ISO 3166-1 only."""
     accept_window_sec: float = Field(default=30.0, gt=0, le=86400.0)
     """Ring accept window (``IncomingCallEvent.expires_at``); one-day
     ceiling like every float time knob (round 25, review-15 item
@@ -3640,7 +3668,14 @@ class CallLease(ContractModel):
     while ``pending_command`` is armed: the pair is set and
     cleared atomically, so a lease can never carry a deadline
     with nothing pending nor a pending command with no
-    deadline."""
+    deadline. Teardown atomicity (round 33, PR #82 review):
+    whenever a lease leaves ``DIALING``/``ANSWERING`` through ANY
+    path - agent hangup/release/drop_session, provider/binding
+    death, adapter compensation, or a ``tick`` deadline - the pair
+    clears WITH the teardown, and a command acknowledgement
+    arriving afterwards is stale (dedupe/no-op through
+    ``_closed_leases``): it can never resurrect or mutate the
+    torn-down lease."""
     media_epoch: int = Field(default=0, ge=0)
     """Durable per-pair media stream epoch (round 33): the epoch of
     the CURRENT media credential pair on this lease. ``0`` means no
@@ -4342,7 +4377,9 @@ against the ``line.*`` table in docs/api-contract.md is caught by
 class ProviderCommandAck(ContractModel):
     """Typed provider-command acknowledgement FACT (round 33): the
     adapter-distilled ``{accepted, provider_call_id?, reason?}``
-    reply to a down-channel ``line.dial``/``line.answer``, reported
+    reply to a down-channel ``line.dial`` (``{accepted, reason?}``
+    on ``line.answer`` - the answer reply carries no
+    provider-call-handle field, PR #82 review), reported
     to the kernel through :meth:`LineManager.ingest_command_ack`.
 
     The acknowledgement is a first-class kernel fact, not a
@@ -4359,7 +4396,12 @@ class ProviderCommandAck(ContractModel):
     answer); ``provider_call_id`` is the provider's own call handle
     echoed on success - :meth:`ingest_command_ack` records it as
     the lease's durable external-handle evidence
-    (:attr:`CallLease.provider_call_id`). ``reason`` is bounded
+    (:attr:`CallLease.provider_call_id`) - and is legal ONLY on an
+    ACCEPTED ``command:"dial"`` acknowledgement (round 33, PR #82
+    review): ``line.answer`` carries no provider-call-handle field
+    at all because ring correlation stays ``call_token``/
+    ``line_id``, so an answer ack - accepted OR refused - MUST NOT
+    carry it. ``reason`` is bounded
     free text the provider attached to a refusal - never trusted
     as anything but bounded diagnostic input (rule 10: it may
     carry provider-controlled text, so it is never logged raw
@@ -4390,16 +4432,25 @@ class ProviderCommandAck(ContractModel):
 
     @model_validator(mode="after")
     def _ack_shape(self) -> ProviderCommandAck:
-        """Reply-shape coherence (round 33): ``call_token`` echoes
-        the ring token ONLY on the ``answer`` handshake - a dial
-        has no ring to correlate; a REFUSED command mints no
-        ``provider_call_id`` (there is no call object to name);
+        """Reply-shape coherence (round 33; answer-ack handle
+        restriction added in the PR #82 review round): ``call_token``
+        echoes the ring token ONLY on the ``answer`` handshake - a
+        dial has no ring to correlate; ``provider_call_id`` is
+        legal ONLY on an ACCEPTED ``"dial"`` ack - the provider's
+        call handle exists only where a dial could have minted a
+        call object, so EVERY ``"answer"`` ack (accepted or
+        refused) forbids it, and a refused command of either kind
+        mints no handle;
         and ``reason`` is the refusal explanation - an accepted
         reply carries none."""
         if self.command == "dial" and self.call_token is not None:
             raise ValueError("call_token is ring-scoped - never set on a dial ack")
         if self.command == "answer" and self.call_token is None:
             raise ValueError("an answer ack must echo the ring's call_token")
+        if self.command == "answer" and self.provider_call_id is not None:
+            raise ValueError(
+                "provider_call_id is dial-only - ring correlation stays call_token/line_id"
+            )
         if self.accepted:
             if self.reason is not None:
                 raise ValueError("reason carries the refusal detail - never set on accepted")
@@ -4582,10 +4633,11 @@ class WakeAudience(ContractModel):
     hooks still exist to fire. The audience carries no member list
     - socket fan-out is empty BY CONSTRUCTION - and only the
     ``escalation_hooks``/wake-hook delivery leg consumes the
-    envelope (with the same masked/bounded wake payload the hook
-    contract already specifies - a wake delivery MUST NOT carry the
-    raw ``call_token``, which is meaningless to a non-session
-    recipient and is a one-shot credential). The kernel stamps it
+    envelope - on ``incoming_call`` the payload is the tokenless
+    :class:`IncomingCallWakeEvent` projection (round 33, PR #82
+    review), so a wake delivery STRUCTURALLY cannot carry the raw
+    ``call_token``, which is meaningless to a non-session
+    recipient and is a one-shot credential. The kernel stamps it
     exactly when
     a ring arrives on a line with zero live receive-intent sessions
     AND at least one configured wake hook: a pool line with no
@@ -4646,7 +4698,11 @@ be stamped with, enforced by :class:`EventEnvelope` at construction:
   2 - ONE envelope carrying the whole RECEIVE_INBOUND member list,
   so a line-wide wave is O(lines) envelopes, not O(sessions)) or
   ``wake`` (round 33 - the zero-live-member case: configured wake
-  hooks still fire while socket fan-out is empty by construction) -
+  hooks still fire while socket fan-out is empty by construction;
+  on ``incoming_call`` the wake envelope carries ONLY the
+  tokenless :class:`IncomingCallWakeEvent` projection - PR #82
+  review - while every non-wake audience keeps the token-bearing
+  :class:`IncomingCallEvent`) -
   NEVER ``broadcast``;
 - ``fallback_triggered`` carries the worker's
   ``fallback_call_token``: ``agent`` only (the reserved
@@ -4715,8 +4771,22 @@ class EventEnvelope(ContractModel, Generic[PayloadT]):
         position (it is defined after the event classes below) is
         fine. A broadcast-audience legal name carrying a PII
         payload, or any other mis-typed pair, is a defect, not a
-        routing choice."""
+        routing choice. Round 33 (PR #82 review): ``incoming_call``
+        additionally splits by audience - :class:`WakeAudience`
+        accepts ONLY the tokenless :class:`IncomingCallWakeEvent`
+        projection while ``agent``/``session``/``fanout`` keep the
+        token-bearing :class:`IncomingCallEvent`, so a live
+        ``call_token`` can never be constructed into a wake-hook
+        delivery (and the credential-free projection can never be
+        fanned out to a session that needs it)."""
         expected = EVENT_PAYLOAD_TYPES.get(self.name)
+        if self.name is EventName.INCOMING_CALL and self.audience.scope == "wake":
+            # Round 33 (PR #82 review): the wake projection is
+            # TOKENLESS - a ``wake``-scoped ``incoming_call`` may
+            # carry ONLY :class:`IncomingCallWakeEvent`, never the
+            # token-bearing :class:`IncomingCallEvent`; the
+            # non-wake audiences keep the table's pin.
+            expected = IncomingCallWakeEvent
         if expected is not None and not isinstance(self.payload, expected):
             raise ValueError(
                 f"payload {type(self.payload).__name__} does not match event {self.name.value!r}"
@@ -4724,19 +4794,54 @@ class EventEnvelope(ContractModel, Generic[PayloadT]):
         return self
 
 
-class IncomingCallEvent(ContractModel):
+class _IncomingCallEventBase(ContractModel):
+    """Shared ring-projection fields of the two ``incoming_call``
+    payload spellings (round 33, PR #82 review): ``line_id`` the
+    ringing line, ``caller_id`` the redacted caller PII when the
+    air side supplied it, ``expires_at`` the absolute accept-window
+    deadline in RFC-3339 UTC. The public subclasses split on ONE
+    axis - whether the one-shot ``call_token`` may ride the
+    payload: session/agent/fanout delivery needs it for
+    ``call.accept``, the wake-hook projection must never carry it."""
+
+    line_id: _CheckedLineId
+    caller_id: _CheckedCallerNumber | None = None
+    expires_at: AwareDatetime
+
+
+class IncomingCallEvent(_IncomingCallEventBase):
     """incoming_call payload: first valid call.accept(call_token) wins
     (wake-and-grant, §4.3/§5.2). ``caller_id`` is redacted PII
     (round-22 wire-name fix: the wire field is ``caller_id``, not
     ``caller``); ``expires_at`` is the absolute accept-window
     deadline in RFC-3339 UTC - the earlier ``expires_in_ms`` relative
     form would skew by queue delay unless recomputed against
-    ``emitted_at`` at outbox drain (round 22, review-10 HIGH-1)."""
+    ``emitted_at`` at outbox drain (round 22, review-10 HIGH-1).
 
-    line_id: _CheckedLineId
+    This is the token-BEARING spelling (round 33, PR #82 review):
+    legal on every non-``wake`` ``incoming_call`` audience
+    (``agent``/``session``/``fanout``) where the recipient can act
+    on the ring. :class:`EventEnvelope` enforces the split at
+    construction - a token-bearing payload can never ride a
+    ``wake`` audience, and the tokenless projection can never ride
+    a live-socket one."""
+
     call_token: _CheckedCallToken
-    caller_id: _CheckedCallerNumber | None = None
-    expires_at: AwareDatetime
+
+
+class IncomingCallWakeEvent(_IncomingCallEventBase):
+    """Tokenless ``incoming_call`` wake projection (round 33, PR #82
+    review): the ONLY payload spelling legal on a
+    :class:`WakeAudience` ``incoming_call`` envelope. The
+    escalation-hook delivery leg is outside the authenticated
+    control path - a hook subscriber can never call ``call.accept``
+    - so the wake payload carries only the fields a wake signal
+    needs (``line_id``, ``caller_id?``, ``expires_at``) and
+    STRUCTURALLY cannot leak the one-shot ``call_token``: the field
+    simply does not exist on this model, so no serialization path
+    can ever emit a live ring token to an unauthenticated hook.
+    :class:`MissedCallEvent` needs no sibling projection - it
+    already carries no token."""
 
 
 class CallStateChangedEvent(ContractModel):
@@ -5321,7 +5426,11 @@ never ride a mismatched event name (e.g. caller PII under a
 broadcast-legal name). Defined AFTER the event classes because
 every value is a class object; :class:`EventEnvelope` looks names
 up at validation time, so the forward position is safe.
-Completeness is pinned by ``test_event_payload_types_map``."""
+Completeness is pinned by ``test_event_payload_types_map``.
+Round 33 (PR #82 review): the table pins the LIVE-socket
+``incoming_call`` payload - :class:`EventEnvelope` overrides the
+lookup to :class:`IncomingCallWakeEvent` on a ``wake`` audience,
+so the tokenless projection needs no row of its own."""
 
 
 # ---------------------------------------------------------------------------
@@ -6349,6 +6458,23 @@ class LineManager(ABC):
         window, not a permanent alias; entries die with the
         session as documented below.
 
+        In-flight idempotency (round 33, PR #82 review): the
+        adapter creates the per-``(method, session_id)``
+        idempotency entry BEFORE the kernel mutation or provider
+        command is dispatched. A retry carrying the same
+        ``idempotency_key`` with IDENTICAL parameters while the
+        first request is still in flight JOINS/WAITS on that
+        operation and receives the same outcome - it MUST NOT
+        re-enter the kernel or dispatch a second
+        ``line.dial``/``line.answer``. The same key carrying
+        DIFFERENT parameters is ``INVALID_ARGUMENT`` with
+        ``ErrorReason.IDEMPOTENCY_CONFLICT`` as always. Once the
+        first request resolves the entry replays the recorded
+        outcome verbatim until TTL/eviction. ``drop_session``
+        kills any in-flight waiter with the session table - the
+        join never outlives the session, and no dedup ever spans
+        a reconnect.
+
         ``system:fallback_worker`` (round 22, review-10 MEDIUM-2; the
         reserved :data:`SYSTEM_FALLBACK_WORKER` identity, round 25
         item 21): a session owned by that agent id BYPASSES
@@ -6467,6 +6593,16 @@ class LineManager(ABC):
         ``disconnected`` already end the lease implicitly, so a
         trailing ``release`` after them is an idempotent no-op.
         OWNER_MISMATCH on a foreign ``(session_id, lease_id)`` pair.
+        Like every lease teardown (round 33, PR #82 review),
+        releasing a lease still carrying an armed
+        :attr:`CallLease.pending_command` clears the
+        ``pending_command``/``provider_command_ack_deadline_at``
+        pair atomically and queues the scoped
+        :class:`ProviderHangupCommand` (lease-scoped for a pending
+        ``"dial"``, RING-scoped ``call_token`` for a pending
+        ``"answer"``); a late command acknowledgement is stale and
+        can never resurrect or mutate the torn-down lease (see
+        :meth:`ingest_command_ack`).
 
         The wire ``call.release`` carries exactly ONE target
         (``lease_id`` XOR ``assignment_id``, round 22); a request
@@ -6516,7 +6652,10 @@ class LineManager(ABC):
         """call.dial: issue line.dial to the owning provider ->
         server-issued media attachment. ``number`` is PII: it arrives
         wrapped in RedactedString and must be unwrapped ONLY at the
-        provider boundary. ``country`` (ISO 3166-1 alpha-2, round 12)
+        provider boundary. ``country`` (uppercase alpha-2
+        phonenumbers-supported region, round 12 - incl. telephony
+        extensions like ``"XK"``/``"AC"``/``"TA"``, not strict ISO
+        3166-1 only)
         is the caller's assertion cross-checked against the number via
         phonenumbers BEFORE the line is touched (DIAL_REJECTED with a
         typed reason); per-line ``allowed_number_types`` on the
@@ -6679,7 +6818,23 @@ class LineManager(ABC):
         an agent forgot to release). A provider ``disconnected``
         report ends the lease the same way. Dead-man switch /
         orphan grace follow §5.4. OWNER_MISMATCH on a foreign
-        ``(session_id, lease_id)`` pair."""
+        ``(session_id, lease_id)`` pair.
+
+        Pending-command teardown (round 33, PR #82 review): a
+        hangup on a lease still carrying an armed
+        :attr:`CallLease.pending_command` clears
+        ``pending_command``/``provider_command_ack_deadline_at``
+        atomically with the teardown - the queued
+        ``ProviderHangupCommand`` keeps its usual scope for the
+        phase (a pending ``"dial"`` ends its DIALING lease through
+        the same lease-scoped command; a pending ``"answer"`` on
+        the ``ANSWERING`` lease likewise tears the lease down -
+        the ring's own fate stays governed by the consumed-ring
+        bookkeeping, never by the stale handshake) - and a command
+        acknowledgement arriving afterwards is STALE: it resolves
+        through ``_closed_leases`` as a dedupe/no-op and can never
+        resurrect or mutate the torn-down lease (see
+        :meth:`ingest_command_ack`)."""
         ...
 
     @abstractmethod
@@ -7303,7 +7458,11 @@ class LineManager(ABC):
         ``incoming_call`` through the typed :class:`WakeAudience`
         audience when the line carries configured wake hooks - the
         envelope has no socket member by construction and only the
-        hook delivery leg consumes it; with no hooks configured at
+        hook delivery leg consumes it, carrying the TOKENLESS
+        :class:`IncomingCallWakeEvent` projection (round 33, PR #82
+        review: the model has no ``call_token`` field, so a wake
+        delivery can never leak the live ring token to an
+        unauthenticated hook); with no hooks configured at
         all the ring emits no ``incoming_call`` envelope and simply
         waits out its accept window.
 
@@ -7842,6 +8001,30 @@ class LineManager(ABC):
         or any ack with no pending marker at all - is dropped as a
         stale/foreign fact, never applied.
 
+        Pending-command teardown atomicity (round 33, PR #82
+        review): whenever a lease leaves ``DIALING``/``ANSWERING``
+        through ANY path - agent :meth:`hangup`/:meth:`release`/
+        :meth:`drop_session`, provider or binding death, adapter
+        compensation, or a ``tick`` deadline - ``pending_command``
+        and ``provider_command_ack_deadline_at`` are cleared
+        atomically with the teardown, and a command
+        acknowledgement arriving afterwards is STALE: it resolves
+        through ``_closed_leases`` as the same dedupe/no-op above
+        and can never resurrect or mutate the torn-down lease. A
+        pending ``"dial"`` teardown still queues the lease-scoped
+        :class:`ProviderHangupCommand`; a pending ``"answer"``
+        teardown queues the RING-scoped
+        ``ProviderHangupCommand{call_token}`` reject. The withheld
+        ``call.dial``/``call.accept`` wire reply stays
+        handshake-bound while the caller session is alive:
+        ``{accepted: true}`` answers the normal
+        ``DialResult``/``AcceptResult`` even when the teardown
+        raced ahead after the provider accepted (the reply
+        reflects the handshake outcome, not the lease's later
+        fate), while refused/timeout/unreachable still answers
+        ``PROVIDER_UNREACHABLE`` - and a session that died before
+        the handshake resolved gets no response at all.
+
         ``{accepted: true}`` effects: the kernel clears
         ``pending_command`` (releasing the command-ack gate - the
         lease becomes snapshot-reconcilable under the
@@ -7956,7 +8139,24 @@ class LineManager(ABC):
         disconnected}`` event drained afterwards can never precede
         the media teardown it announces; no socket outlives its
         ``lease_id`` even for an instant observable outside the
-        mutation."""
+        mutation.
+
+        Pending-command and in-flight-idempotency teardown (round
+        33, PR #82 review): the dead-man teardown of a lease still
+        carrying an armed :attr:`CallLease.pending_command` clears
+        ``pending_command``/``provider_command_ack_deadline_at``
+        atomically and queues the scoped
+        :class:`ProviderHangupCommand` (lease-scoped for a pending
+        ``"dial"``, RING-scoped ``call_token`` for a pending
+        ``"answer"``) - a late command acknowledgement is stale
+        and can never resurrect or mutate the torn-down lease (see
+        :meth:`ingest_command_ack`). Session death also KILLS the
+        withheld ``call.dial``/``call.accept`` wire reply for an
+        unresolved handshake (a dead session is owed no response)
+        and kills every in-flight ``idempotency_key`` waiter the
+        session held: the dedup table dies with the session, so an
+        in-flight join never outlives it and no dedup survives a
+        reconnect."""
         ...
 
     @abstractmethod
@@ -8069,7 +8269,18 @@ class LineManager(ABC):
         :data:`MAX_TICK_DEADLINES` like every other class - the
         adapter's bounded await is the fast path, this lapse is
         the backstop that keeps an ack-pending lease from wedging
-        when no adapter call ever arrives.
+        when no adapter call ever arrives. Pending-command
+        teardown atomicity (round 33, PR #82 review): EVERY
+        tick-driven end of a command-pending lease - the ack
+        lapse above, ``max_call_duration_sec``, a media-pair
+        deadline, the orphan cascade, or a ``hangup_hold_sec``
+        lapse racing the armed handshake - clears
+        ``pending_command``/``provider_command_ack_deadline_at``
+        atomically with the teardown, and a command
+        acknowledgement arriving afterwards is STALE: a
+        dedupe/no-op through ``_closed_leases`` that can never
+        resurrect or mutate the torn-down lease (see
+        :meth:`ingest_command_ack`).
         ``tick`` also drives idle bookkeeping: an EXCLUSIVE
         line whose ``owner_agent_id`` holds at least one open
         session is never idle; ``last_seen_at`` is stamped by
@@ -8856,8 +9067,10 @@ class LineAdminKernel(ABC):
         Hardware fields (round 31, SA_swe2_review_1 item 10):
         ``adapter_mac``/``paired_phone_mac`` follow the
         ``_check_mac_address`` grammar (``AA:BB:CC:DD:EE:FF`` or
-        ``None``) and ``line_home_country`` the ISO alpha-2
-        ``_check_country_alpha2`` grammar; ``transport_profile``
+        ``None``) and ``line_home_country`` the uppercase alpha-2
+        ``_check_country_alpha2`` grammar (phonenumbers-supported
+        regions incl. telephony extensions, not strict ISO 3166-1
+        only); ``transport_profile``
         takes the :data:`TransportProfile` vocabulary
         (``loopback``/``direct_mtls``/``wireguard``, default
         ``loopback``). They persist on the ``lines`` row: the
@@ -9053,7 +9266,8 @@ class LineAdminKernel(ABC):
         same-named :class:`LineAssignment` fields under the same
         ``None``-means-unchanged convention - a set MAC must match
         the ``AA:BB:CC:DD:EE:FF`` grammar, a set country two
-        uppercase alpha-2 letters that name a KNOWN ISO 3166-1
+        uppercase alpha-2 letters that name a KNOWN
+        phonenumbers-supported
         region (``_check_country_alpha2`` rejects an unassigned
         code like ``"ZZ"`` - a nonsense region would silently feed
         the dial-normalization default), a set profile the
@@ -9125,7 +9339,8 @@ class LineAdminKernel(ABC):
         round 24, review-13 M1): a ``forward_via_line`` policy is
         pre-validated HERE, at config time -
         ``target_number``/``target_country`` go through the same
-        strict-E.164 + ISO alpha-2 checks ``call.dial`` applies -
+        strict-E.164 + alpha-2 region checks ``call.dial``
+        applies -
         and are additionally enforced INSIDE
         :class:`ForwardViaLineFallback` itself via
         :func:`validate_e164_country`, so a corrupt hydrated row can

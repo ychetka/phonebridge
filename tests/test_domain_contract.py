@@ -98,6 +98,7 @@ from phonebridge.domain.contract import (
     ForwardViaLineFallback,
     IdleAlertEvent,
     IncomingCallEvent,
+    IncomingCallWakeEvent,
     IncomingRingIngress,
     Intent,
     LeaseId,
@@ -6359,8 +6360,13 @@ def test_round33_command_ack_kind_vocabulary() -> None:
 
 
 def test_round33_provider_command_ack_shape_coherence() -> None:
-    """GWT: the distilled ``{accepted, provider_call_id?, reason?}``
-    reply obeys its shape rules - ``call_token`` is answer-only
+    """GWT: the distilled acknowledgement obeys its command-specific
+    shape rules (PR #82 review) - ``line.dial`` acks are
+    ``{accepted, provider_call_id?, reason?}`` while ``line.answer``
+    acks are ``{accepted, reason?}`` only: ``provider_call_id`` is
+    legal ONLY on an accepted dial (the answer path has no
+    provider-call-handle because ring correlation stays
+    ``call_token``/``line_id``), ``call_token`` is answer-only
     (the ring-scoped reject needs it), a refused command mints no
     provider_call_id, and an accepted reply carries no reason."""
     # Legal shapes: accepted dial (+optional provider_call_id),
@@ -6387,6 +6393,22 @@ def test_round33_provider_command_ack_shape_coherence() -> None:
     # A refused command mints no provider handle.
     with pytest.raises(ValidationError):
         _dial_ack(accepted=False, provider_call_id="/ofono/voicecall01")
+    # provider_call_id is DIAL-ONLY (PR #82 review): an answer ack
+    # carrying any provider handle is a contract violation -
+    # accepted AND refused alike.
+    with pytest.raises(ValidationError):
+        _dial_ack(
+            command="answer",
+            call_token=CallToken(RedactedString("tok-1")),
+            provider_call_id="/ofono/voicecall01",
+        )
+    with pytest.raises(ValidationError):
+        _dial_ack(
+            command="answer",
+            call_token=CallToken(RedactedString("tok-1")),
+            accepted=False,
+            provider_call_id="/ofono/voicecall01",
+        )
     # reason rides the shared MAX_REASON_LEN bound.
     _dial_ack(accepted=False, reason="x" * MAX_REASON_LEN)
     with pytest.raises(ValidationError):
@@ -6533,14 +6555,16 @@ def test_round33_wake_audience_scope() -> None:
     wake = contract.WakeAudience()
     assert wake.scope == "wake"
     # It is a member of the audience union - an EventEnvelope accepts
-    # it through the discriminated EventAudience annotation.
-    EventEnvelope[IncomingCallEvent](
+    # it through the discriminated EventAudience annotation. On
+    # ``incoming_call`` the wake envelope carries ONLY the tokenless
+    # ``IncomingCallWakeEvent`` projection (PR #82 review).
+    EventEnvelope[IncomingCallWakeEvent](
         name=EventName.INCOMING_CALL,
         audience=wake,
         emitted_at=NOW_UTC,
-        payload=IncomingCallEvent(
+        payload=IncomingCallWakeEvent(
             line_id=LineId("line-main"),
-            call_token=CallToken(RedactedString("tok-1")),
+            caller_id=RedactedString(_RAW_NUMBER),
             expires_at=NOW_UTC,
         ),
     )
@@ -6580,6 +6604,77 @@ def test_round33_wake_audience_scope() -> None:
     # audience re-validates as WakeAudience.
     env_adapter = TypeAdapter(EventAudience)
     assert isinstance(env_adapter.validate_python({"scope": "wake"}), contract.WakeAudience)
+
+
+def test_round33_incoming_call_wake_payload_split() -> None:
+    """GWT (PR #82 review): the ``incoming_call`` payload splits by
+    audience - ``IncomingCallWakeEvent`` is the TOKENLESS
+    ``{line_id, caller_id?, expires_at}`` projection, the ONLY
+    spelling legal on a ``wake`` envelope, while live
+    ``agent``/``session``/``fanout`` audiences keep the token-bearing
+    ``IncomingCallEvent``. The split is structural: the wake model
+    has no ``call_token`` field at all, and ``EventEnvelope``
+    rejects every crossed (audience, payload) pairing."""
+    assert "IncomingCallWakeEvent" in contract.__all__
+    # The token field does not EXIST on the wake model - no
+    # serialization path can emit a live ring token to a hook.
+    assert "call_token" not in IncomingCallWakeEvent.__pydantic_fields__
+    assert set(IncomingCallWakeEvent.__pydantic_fields__) == {
+        "line_id",
+        "caller_id",
+        "expires_at",
+    }
+    wake_payload = IncomingCallWakeEvent(
+        line_id=LineId("line-main"),
+        expires_at=NOW_UTC,
+    )
+    live_payload = IncomingCallEvent(
+        line_id=LineId("line-main"),
+        call_token=CallToken(RedactedString("tok-1")),
+        expires_at=NOW_UTC,
+    )
+    # Legal: wake audience + tokenless projection.
+    EventEnvelope[IncomingCallWakeEvent](
+        name=EventName.INCOMING_CALL,
+        audience=contract.WakeAudience(),
+        emitted_at=NOW_UTC,
+        payload=wake_payload,
+    )
+    # Legal: every live audience keeps the token-bearing spelling.
+    for live_audience in (
+        AgentAudience(agent_id="agent-1"),
+        SessionAudience(session_id=SessionId("sess-1")),
+        contract.FanoutAudience(members=(SessionAudience(session_id=SessionId("sess-1")),)),
+    ):
+        EventEnvelope[IncomingCallEvent](
+            name=EventName.INCOMING_CALL,
+            audience=live_audience,
+            emitted_at=NOW_UTC,
+            payload=live_payload,
+        )
+    # A token-bearing payload on a wake envelope leaks a live
+    # credential to an unauthenticated hook - unconstructible.
+    with pytest.raises(ValidationError):
+        EventEnvelope[IncomingCallEvent](
+            name=EventName.INCOMING_CALL,
+            audience=contract.WakeAudience(),
+            emitted_at=NOW_UTC,
+            payload=live_payload,
+        )
+    # ...and the tokenless projection can never ride a live
+    # audience - a session needs the token to accept.
+    for live_audience in (
+        AgentAudience(agent_id="agent-1"),
+        SessionAudience(session_id=SessionId("sess-1")),
+        contract.FanoutAudience(members=(SessionAudience(session_id=SessionId("sess-1")),)),
+    ):
+        with pytest.raises(ValidationError):
+            EventEnvelope[IncomingCallWakeEvent](
+                name=EventName.INCOMING_CALL,
+                audience=live_audience,
+                emitted_at=NOW_UTC,
+                payload=wake_payload,
+            )
 
 
 def test_round33_provider_binding_watermark_fields() -> None:
@@ -6641,14 +6736,32 @@ def test_round33_e164_ascii_digit_gate() -> None:
 
 def test_round33_region_membership_on_line_country() -> None:
     """GWT: ``_check_country_alpha2`` carriers reject an
-    alpha-2-SHAPED but unassigned region - ``"ZZ"`` is not an ISO
-    3166-1 region and must never silently feed the dial
+    alpha-2-SHAPED but unassigned region - ``"ZZ"`` is not a known
+    region and must never silently feed the dial
     normalization default."""
     assert "ZZ" not in contract._ISO_REGION_CODES
     assert "AA" not in contract._ISO_REGION_CODES
     assert "MD" in contract._ISO_REGION_CODES
     provisioned = _assignment(line_home_country="MD")
     assert provisioned.line_home_country == "MD"
+    for bad_region in ("ZZ", "AA"):
+        with pytest.raises(ValidationError):
+            _assignment(line_home_country=bad_region)
+
+
+def test_round33_line_country_accepts_telephony_extensions() -> None:
+    """GWT (PR #82 review): ``line_home_country`` accepts the
+    PHONENUMBERS-SUPPORTED region vocabulary - the ISO 3166-1-style
+    codes PLUS telephony extensions like ``"XK"`` (Kosovo),
+    ``"AC"`` (Ascension) and ``"TA"`` (Tristan da Cunha), which are
+    not strict ISO 3166-1 entries but ARE libphonenumber regions -
+    while unassigned codes stay rejected."""
+    for ext_region in ("XK", "AC", "TA"):
+        assert ext_region in contract._ISO_REGION_CODES
+        provisioned = _assignment(line_home_country=ext_region)
+        assert provisioned.line_home_country == ext_region
+    # The reject coverage is unchanged: an alpha-2-shaped code the
+    # vocabulary does not know never passes.
     for bad_region in ("ZZ", "AA"):
         with pytest.raises(ValidationError):
             _assignment(line_home_country=bad_region)
