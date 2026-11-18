@@ -30,11 +30,17 @@ exist inside an isolated network namespace; see
 
 The agent is deliberately *dumb* — it owns hardware and moves frames:
 
-- **USB ownership** — binds the dongle in userspace via libusb/pyusb
+- **USB ownership** — binds the dongle in userspace via libusb
   after detaching the kernel `btusb` driver, so no `hci0` is created on
   the agent host at all (zero interference with a host `bluetoothd`,
-  which may keep serving the host's own devices). Base implementation:
-  the USB transport of Google Bumble. **Dongle matching (round 30,
+  which may keep serving the host's own devices). Production baseline
+  (issue #89, `docs/adr/0004-hci-agent-runtime.md`): a **Rust
+  implementation on top of libusb** — Python/pyusb and the USB
+  transport of Google Bumble are the protocol reference and optional
+  development tooling only, never the production data path (a GC
+  pause on the isochronous endpoint is a lost SCO microframe, and
+  the Python bindings do not expose the per-packet isoc control the
+  SCO path requires — see §1a). **Dongle matching (round 30,
   review-19 B2b#1):** `usb_path` is the PRIMARY stable selector —
   USB descriptors carry no `BD_ADDR` (`iSerialNumber` is empty or a
   chip serial, and `bdaddr` in sysfs vanishes with `btusb`
@@ -79,6 +85,37 @@ monitoring is scoped by an adapter filter, or its telephony support
 is disabled outright, so it can never double-register the AG and
 race the Telephony plugin — consistent with the static
 `node.autoconnect=false` routing rule of design §6.4.
+
+### §1a. Implementation runtime — Rust + libusb (issue #89, ADR-0004)
+
+The production agent is a **Rust process on top of libusb**
+(`docs/adr/0004-hci-agent-runtime.md`). The runtime shape the
+wire contract above assumes:
+
+- a **dedicated USB isochronous pump thread** owns every isoc
+  transfer — it never shares an executor or event loop with the
+  tunnel tasks, because USB service windows and network pacing are
+  different clocks with different deadlines;
+- bounded queues and pooled buffers sit between the pump and the
+  tunnel I/O — no unbounded allocation and no GC anywhere on the
+  data path;
+- the safe `rusb` API covers enumeration, descriptors,
+  configuration/altsetting selection and the
+  control/interrupt/bulk endpoints; a narrow audited `IsoPump`
+  module is the ONLY place `rusb::ffi`/`libusb1-sys` (and `unsafe`)
+  may appear — isochronous submission, per-packet descriptors,
+  per-packet `status`/`actual_length`, completion callbacks and
+  the transfer pool;
+- malformed isoc input fails closed (counted + dropped, never
+  forwarded), and shutdown cancels/drains in-flight transfers in a
+  bounded window before releasing the claim and restoring `btusb`;
+- acceptance is gated on real hardware (x86_64 AND ARM):
+  `usb_path` enumeration + VID/PID/serial/MAC verification,
+  dongle-scoped `btusb` detach, interfaces 0/1 claim, `HCI Reset` →
+  Command Complete, SCO altsetting selection, continuous isoc RX,
+  paced outbound SCO, complete-record preservation, safe
+  cancel/drain, `btusb` restore, and measured CPU/jitter/lost
+  frames — the full gate is enumerated in ADR-0004.
 
 ## §2. Wire protocol (V1)
 
@@ -514,6 +551,44 @@ buffer MUST compensate rather than hoping a gap re-centres it
   continuous); no adaptive DSP resampling is implemented or
   planned for V1.
 
+**Feeder-side ingress playout — the downlink twin (issue #89).**
+The uplink buffer above lives on the AGENT and paces frames into
+the USB isoc OUT endpoint; the symmetric problem exists on the
+CONTAINER side for the phone→agent direction: on the UDP
+transport profiles, agent-originated SCO records arrive at the
+`vhci-feeder` with network jitter and reordering, while
+`/dev/vhci` expects a continuous SCO stream — feeding it straight
+from the socket would turn WAN jitter directly into kernel-side
+clicks and underruns. The feeder therefore keeps a bounded
+**reorder/playout buffer on its media ingress, in front of
+`/dev/vhci`**, that is independent of the agent-side buffer:
+
+- depth is bounded at ~**30–45 ms** of SCO audio (the same order
+  of magnitude as the agent's buffer — a different value is legal
+  only with a documented justification, never an unbounded one);
+- `media_seq` (wrap-aware) drives **dedup and gap accounting**:
+  duplicates are dropped, small reorders are sorted inside the
+  window, and a gap that is still open when the playout cursor
+  reaches it is filled with **codec-correct PLC/silence** — a
+  valid mSBC silence frame for `air_mode == "msbc"`, or the
+  matching CVSD/PCM silence for CVSD links — so the kernel never
+  sees a stall and the container-side decoder/downlink path never
+  sees an H2 discontinuity (these are phone→agent downlink frames;
+  the phone's DSP produced them, it does not consume the stream);
+- **fail-closed on malformed records:** a record that fails the
+  nonce/length/payload checks (bad `session_nonce`,
+  `rec_len`/`payload_len` mismatch, truncated HCI SCO header)
+  is counted and dropped — it must never reach
+  `write("/dev/vhci")`, consistent with the frame-validation
+  rules below;
+- underflow, overflow and reorder events are counted and reported
+  through the media-health telemetry vocabulary below (feeding
+  the same `SCO_*` health surface as the handle gate);
+- on `loopback` the SOCK_STREAM media channel cannot reorder or
+  jitter at the transport layer, but the same buffer code path
+  applies uniformly — the alternative (two ingress pipelines) is
+  a drift source, not a simplification.
+
 ### vhci feeder — SCO handle gate and MTU alignment (round 25)
 
 **Attach serialization (round 29, review-1 B4; hardened round
@@ -943,6 +1018,14 @@ Field rules:
 - `line_id` + the credential in `agent_token_file` bind the agent to
   exactly one line at the container; mismatch → `HELLO` rejected,
   connection closed.
+- `channels.control`/`channels.media` are **provisioned per line at
+  line provisioning time** (issue #89): the endpoint pair is minted
+  by the admin surface (`admin.provision_line`/`configure_line`),
+  stored in the line's `lines` row, and shipped to the agent inside
+  its config — the agent never learns its endpoints through a
+  separate dynamic discovery API, and there is no protocol message
+  that reallocates them. The pair above is only the canonical
+  allocation example (one control+media pair per line).
 - `dongle.match.usb_path` is REQUIRED for normal operation (hciN-style
   indices are unstable and USB descriptors carry no `BD_ADDR` —
   `usb_path` is the only non-invasive stable selector, §1);

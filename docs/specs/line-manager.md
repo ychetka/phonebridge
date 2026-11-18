@@ -1117,7 +1117,11 @@ ISO 3166-1-style codes PLUS telephony extensions like
 `"XK"`/`"AC"`/`"TA"`, not strict ISO 3166-1 only — round 32,
 swe2_review_2 item 22: it renders numbers for admin/diagnostic
 surfaces; `call.dial` still requires its explicit `country`
-parameter and no dial input is ever normalized from this field);
+parameter and no dial input is ever normalized from this field —
+it is normalization/diagnostic metadata ONLY and carries no
+cellular-health semantics: signal strength, battery and network
+registration are post-MVP observability, never part of this
+field, round 35 / issue #89);
 `configure_line` patches them
 with the same `None` = unchanged PATCH semantics as its other
 fields. `admin.configure_line`
