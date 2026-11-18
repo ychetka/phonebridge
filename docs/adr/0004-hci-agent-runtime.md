@@ -68,23 +68,45 @@ one process, one audited unsafe surface.
 - Bounded queues and pooled buffers between the pump and the tunnel
   I/O — no unbounded allocation on the data path, no GC anywhere on
   it.
+- A bounded **outbound playout buffer** sits between the tunnel
+  media reader and `IsoPump` TX, drained by the isochronous
+  completion callback clock (the eSCO service interval, delivered
+  in `SCO_SETUP.service_interval_ms`) — drift compensation is
+  whole-packet drop/dup only, NO ASRC, because HCI SCO payloads
+  are transparent codec frames (issue #91, iteration-4 audit
+  item 14; `docs/hci-agent.md` §2 "Uplink playout jitter buffer").
 - Malformed isoc input fails closed: incomplete or length-mismatched
   HCI SCO reassembly is counted and dropped, never forwarded
   (consistent with the wire contract's framing rules).
 - Shutdown cancels and drains in-flight transfers inside a bounded
-  window, releases the claim, and restores `btusb`.
+  window, releases the claim, and restores `btusb`. Startup runs
+  the symmetric **wedge recovery** (issue #91, iteration-4 audit
+  item 15): the agent detects a dongle left detached from `btusb`
+  or on a stale non-zero altsetting by a previous unclean exit and
+  restores `btusb` BEFORE re-attempting the claim sequence, so a
+  crashed predecessor never leaves the device half-owned.
 
 ### Hardware acceptance gate
 
 Before the runtime is accepted for production the implementation
 must demonstrate, on both x86_64 and an ARM target:
 
-1. enumerate the dongle by `usb_path`, verify VID/PID/serial and
-   the adapter MAC;
+1. enumerate the dongle by `usb_path` and verify VID/PID/serial;
 2. detach `btusb` for the configured dongle only and claim
    interfaces 0/1;
-3. send `HCI Reset` and read `Command Complete`;
-4. select the SCO alternate setting per the negotiated `air_mode`;
+3. send `HCI Reset`, read `Command Complete`, then issue
+   `HCI_Read_BD_ADDR` and verify the returned adapter MAC against
+   the configured `adapter_mac` — the MAC check is POST-CLAIM by
+   construction: `BD_ADDR` is not carried in USB descriptors and
+   only the live controller answers `0x1009` (issue #91,
+   iteration-4 audit item 15);
+4. select the SCO alternate setting per the negotiated `air_mode`
+   on the explicit `SCO_SETUP`/`SCO_TEARDOWN` control messages —
+   the actuation pair is the altsetting trigger mechanism, so the
+   agent needs no HCI-event parsing to time Interface-1 switches
+   (issue #91, iteration-4 audit item 5; sniffing
+   `Synchronous Connection Complete 0x2c` is a consistency check
+   only, never a dependency);
 5. keep isochronous RX transfers continuously in flight and pace
    outbound SCO to the eSCO service interval;
 6. preserve complete HCI SCO records end to end and expose

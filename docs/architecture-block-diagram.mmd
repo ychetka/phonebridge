@@ -1,4 +1,5 @@
-%% phonebridge - deployment architecture (canonical Mermaid source, issue #89).
+%% phonebridge - deployment architecture (canonical Mermaid source, issue #89;
+%% topology corrections applied under issue #91 / iteration-4 audit).
 %% Rendered copies: docs/architecture-block-diagram.svg / .png.
 %% Regenerate (mermaid-cli):
 %%   mmdc -i docs/architecture-block-diagram.mmd -o docs/architecture-block-diagram.svg -b white
@@ -19,7 +20,7 @@ flowchart LR
             direction LR
             API["APICallService<br/>UDS / WSS<br/>agent.* call.* event.*"]
             MGR["Manager<br/>UDS / WSS<br/>provider.* up · line.* down"]
-            ADM["AdminService<br/>admin.sock 0600 / WSS<br/>admin.*"]
+            ADM["AdminService<br/>admin.sock 0660 group / WSS<br/>admin.*"]
             INT["InternalService<br/>internal.sock 0600<br/>system:* via SO_PEERCRED"]
         end
 
@@ -27,23 +28,24 @@ flowchart LR
         BUS["EventBus<br/>typed EventEnvelope · bounded fan-out"]
         FB["FallbackWorker<br/>system:fallback_worker<br/>fallback policies · recordings"]
         MR["MediaRouter<br/>dedicated media worker / event-loop layer<br/>20 ms pacer · bounded rings · flush/drain<br/>never the kernel lock · never SQLite I/O"]
-        WRITER["ordered writer task<br/>single serialization point for persistence"]
+        WRITER["ordered writer task<br/>single serialization point for persistence<br/>write-through first, then drained dispatch"]
         DB[("SQLite<br/>lines · assignments · bindings<br/>api keys · hooks/secrets")]
+        STACKSUP["container init / stack supervisor<br/>supervises bluetoothd · oFono · PipeWire ·<br/>WirePlumber · dbus-daemons · FallbackWorker"]
 
         subgraph BUNDLE["LINE BUNDLE × N — one bundle per line"]
             direction TB
             SUP["Line bundle supervisor<br/>spawn · watch · restart both children<br/>+ the bundle IPC itself"]
             LP["LineProvider<br/>oFono call control · PipeWire routing<br/>DTMF implementation owner"]
-            VF["vhci-feeder<br/>control + media endpoints<br/>per transport_profile<br/>/dev/vhci writer · heartbeat/reset<br/>ingress jitter/PLC buffer"]
+            VF["vhci-feeder<br/>control + media endpoints<br/>per transport_profile<br/>/dev/vhci reader+writer · heartbeat/reset<br/>ingress jitter/PLC buffer"]
         end
 
         subgraph STACK["TELEPHONY AND AUDIO STACK"]
             direction TB
             VN["Virtual audio nodes<br/>phonebridge_uplink/downlink_<line_id>"]
             PW["PipeWire + WirePlumber<br/>session D-Bus"]
-            OF["oFono<br/>VoiceCallManager · AT+VTS"]
+            OF["oFono<br/>VoiceCallManager · AT+VTS ·<br/>HandsfreeAudioAgent (SCO socket owner)"]
             BTD["bluetoothd<br/>kernel hciN · system D-Bus"]
-            AG1["BlueZ Pairing Agent<br/>org.bluez.Agent1"]
+            AG1["BlueZ Pairing Agent<br/>org.bluez.Agent1<br/>PairableTimeout/DiscoverableTimeout<br/>crash backstop"]
             VHCI["/dev/vhci → hciN<br/>virtual adapter"]
         end
 
@@ -58,7 +60,7 @@ flowchart LR
     subgraph AGENTHOST["HCI-AGENT HOST — OPTIONAL REMOTE BOUNDARY (co-located case = loopback profile)"]
         direction TB
         HA["hci-agent<br/>Rust + libusb (ADR-0004)<br/>btusb detached · no bluetoothd"]
-        DONGLE["BT USB dongle<br/>usb_path selector · post-claim MAC verify"]
+        DONGLE["BT USB dongle<br/>usb_path selector · post-claim<br/>HCI_Read_BD_ADDR MAC verify"]
     end
 
     PHONE["PAIRED PHONE<br/>Bluetooth HFP + cellular network"]
@@ -72,19 +74,27 @@ flowchart LR
     MGR <--> KERNEL
     ADM <--> KERNEL
     INT <--> KERNEL
-    INT -->|"system:* agent session"| FB
+    INT <-->|"system:* session · agent commands"| FB
     MGR <-->|"provider.* up / line.* down"| LP
-    KERNEL -->|"pairing/configuration only:<br/>MediaAllocator"| MR
+    WRITER -->|"drained media commands:<br/>MediaAllocator · token revoke ·<br/>lease teardown · epoch invalidate"| MR
     MR -->|"ingest_media_state ·<br/>ingest_media_overflow facts"| KERNEL
     ADM -->|"admin.pair_window request"| KERNEL
-    KERNEL -->|"validated pair window"| AG1
-    KERNEL -->|"line lifecycle commands<br/>spawn · restart · retire bundle"| SUP
+    WRITER -->|"validated pair window"| AG1
+    WRITER -->|"drained provider commands"| MGR
+    WRITER -->|"drained lifecycle +<br/>pair-window commands"| SUP
     SUP ==>|"supervises"| LP
     SUP ==>|"supervises"| VF
     LP <-->|"bundle IPC: liveness · SCO facts"| VF
+    VF -->|"allocated hciN + adapter addr"| SUP
+    SUP -->|"hciN map + liveness facts"| KERNEL
+    STACKSUP ==>|"supervises + restart"| BTD
+    STACKSUP ==>|"supervises"| OF
+    STACKSUP ==>|"supervises"| PW
+    STACKSUP ==>|"supervises"| FB
+    STACKSUP -->|"shared-fate restart →<br/>full reconciliation trigger"| KERNEL
 
     %% ===== typed events / wake =====
-    KERNEL -->|"typed envelopes"| BUS
+    WRITER -->|"drained typed envelopes"| BUS
     BUS -->|"event.* fan-out"| API
     BUS -->|"event.* fan-out"| INT
     BUS -->|"event.* fan-out"| ADM
@@ -93,26 +103,28 @@ flowchart LR
 
     %% ===== packetized media =====
     Agents <-->|"binary PCM 20 ms frames<br/>WS over UDS / WSS"| MR
-    FB -->|"announcement / recording audio"| MR
+    FB <-->|"announcement/record PCM both ways"| MR
     MR <-->|"PCM pair per lease"| LP
+    LP -->|"0x05 DTMF pause · 0x06 resume"| MR
     LP <-->|"owned PipeWire routing"| VN
     VN --- PW
-    PW <-->|"bluez SCO nodes"| BTD
-    BTD <-->|"Bluetooth HFP + SCO"| PHONE
+    OF <-->|"org.ofono.HandsfreeAudioAgent:<br/>SCO fd + negotiated codec"| PW
+    DONGLE <-->|"Bluetooth HFP + eSCO RF"| PHONE
 
     %% ===== HCI/SCO tunnel =====
-    HA <-->|"control + media channels per transport_profile<br/>wireguard / direct_mtls: control TCP + media UDP<br/>loopback: connected SOCK_STREAM UDS<br/>HELLO{line_id, token, agent_version,<br/>dongle:{usb_path, adapter_mac}, caps}<br/>→ HELLO_ACK{accepted, heartbeat_interval_ms,<br/>server_time, session_nonce}"| VF
-    VF -->|"HCI write"| VHCI
+    HA <-->|"control + media channels per transport_profile<br/>wireguard · direct_mtls: control TCP(mTLS) + media DTLS<br/>loopback: control UDS + media SOCK_SEQPACKET UDS<br/>HELLO{line_id, token, agent_version,<br/>dongle:{usb_path, adapter_mac}, caps}<br/>→ HELLO_ACK{accepted, heartbeat_interval_ms,<br/>server_time, session_nonce}<br/>SCO_SETUP{air_mode, esco_handle, service_interval_ms}<br/>/ SCO_TEARDOWN"| VF
+    VF <-->|"HCI write + kernel read-back<br/>(cmd/ACL/SCO out · evt/ACL/SCO in)"| VHCI
     VHCI -->|"kernel hciN"| BTD
     HA <-->|"USB claim · isoc SCO"| DONGLE
 
     %% ===== D-Bus / OS-level / storage =====
-    KERNEL -->|"mutations (never direct writes)"| WRITER
+    KERNEL -->|"mutations + outbox items<br/>(never direct writes)"| WRITER
     WRITER -->|"ordered write-through"| DB
-    SUP -->|"force-clear Pairable/Discoverable<br/>on any window close"| BTD
+    SUP -->|"force-clear Pairable/Discoverable<br/>on own adapter (hciN-scoped)"| BTD
     LP <-->|"oFono D-Bus · call control + AT+VTS"| OF
     OF <-->|"system D-Bus"| BTD
     AG1 <-->|"system D-Bus"| BTD
+    PW <-->|"profile/adapter facts"| BTD
     BTD <--> BTLIB
     DB --- PBLIB
     FB <-->|"WAV + dead-letter spool"| MEDLIB
@@ -129,7 +141,7 @@ flowchart LR
 
     class Agents,Admins,Wakes client
     class API,MGR,ADM,INT surface
-    class KERNEL,BUS,FB kernel
+    class KERNEL,BUS,FB,STACKSUP kernel
     class MR media
     class LP,VF,SUP provider
     class VN,PW,OF,BTD,AG1,VHCI stack
@@ -137,13 +149,13 @@ flowchart LR
     class DB,WRITER,BTLIB,PBLIB,MEDLIB storage
     class LEGEND legend
 
-    %% blue = JSON-RPC control (edges 0-15)
-    linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 stroke:#1d4ed8,stroke-width:2px
-    %% green = typed events / wake (edges 16-21)
-    linkStyle 16,17,18,19,20,21 stroke:#047857,stroke-width:2px
-    %% purple = packetized media (edges 22-28)
-    linkStyle 22,23,24,25,26,27,28 stroke:#6d28d9,stroke-width:2px
-    %% orange = HCI/SCO tunnel (edges 29-32)
-    linkStyle 29,30,31,32 stroke:#c2410c,stroke-width:2px
-    %% gray = D-Bus / storage (edges 33-41)
-    linkStyle 33,34,35,36,37,38,39,40,41 stroke:#475569,stroke-width:2px,stroke-dasharray:6 4
+    %% blue = JSON-RPC control (edges 0-23)
+    linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 stroke:#1d4ed8,stroke-width:2px
+    %% green = typed events / wake (edges 24-29)
+    linkStyle 24,25,26,27,28,29 stroke:#047857,stroke-width:2px
+    %% purple = packetized media (edges 30-37)
+    linkStyle 30,31,32,33,34,35,36,37 stroke:#6d28d9,stroke-width:2px
+    %% orange = HCI/SCO tunnel (edges 38-41)
+    linkStyle 38,39,40,41 stroke:#c2410c,stroke-width:2px
+    %% gray = D-Bus / storage (edges 42-51)
+    linkStyle 42,43,44,45,46,47,48,49,50,51 stroke:#475569,stroke-width:2px,stroke-dasharray:6 4

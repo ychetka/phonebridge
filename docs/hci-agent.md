@@ -59,10 +59,25 @@ The agent is deliberately *dumb* — it owns hardware and moves frames:
   controllers and possibly reading firmware stub MACs on
   Realtek/Broadcom/Intel chips that answer before their firmware
   loads. It exists for onboarding/discovery (`agent scan` command),
-  never as the default runtime mode (§4).
+  never as the default runtime mode (§4). **The hardware gate
+  order is FIXED (round 36, iteration-4 audit item 15):**
+  enumerate (`usb_path` + VID/PID/serial) → detach `btusb` →
+  claim Interfaces 0/1 → `HCI_Reset` → `HCI_Read_BD_ADDR` →
+  verify the returned MAC against the configured `adapter_mac` —
+  the MAC check is POST-CLAIM because `BD_ADDR` is not present
+  in USB descriptors and only the live controller answers
+  `0x1009`. **Wedge recovery (round 36):** an agent that died
+  mid-claim can leave the dongle detached from `btusb` or with
+  Interface 1 still on a non-zero altsetting; on STARTUP the
+  agent MUST detect that wedged state (device present on
+  `usb_path` but unclaimed-by-anyone / `btusb` not bound, or a
+  stale non-zero altsetting) and restore `btusb` BEFORE
+  re-attempting the claim sequence — a clean re-enumeration
+  baseline, never a claim built on a half-owned device.
 - **HCI relay** — forwards HCI frames between the dongle and the
   container: commands/ACL/events on the **control channel** (TCP), SCO
-  audio on the **media channel** (UDP). USB carries each class on its
+  audio on the **media channel** (UDP on tunnel profiles /
+  `SOCK_SEQPACKET` UDS on `loopback`). USB carries each class on its
   own endpoint (control EP = commands, interrupt EP = events, bulk EP =
   ACL, isochronous EP = SCO), so the agent tags each frame with the H4
   type byte implied by its endpoint — no protocol interpretation
@@ -149,16 +164,19 @@ receive_inbound?:bool}` object, never a free-form list).
 | kind | direction | payload |
 |---|---|---|
 | `0x01` HCI_PASSTHRU | both | HCI packet prefixed with its H4 type byte (`0x01` cmd / `0x02` ACL / `0x04` evt); the byte is synthesized from the USB endpoint class |
-| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the **long-lived per-line pre-shared secret** from `agent_token_file` (round 23 fix — earlier drafts wrongly called it a single-use credential; it is re-presented on EVERY control session, sent inside the authenticated tunnel only). On WAN profiles the container validates `token` AND the tunnel peer identity together — WireGuard `/32` peer public key or mTLS client cert CN — both MUST map to the same `line_id`; either check failing rejects the session. On the co-located `loopback` profile the peer-identity factor is `SO_PEERCRED` (round 31, swe-2 item 32 — the earlier "token alone on `127.0.0.1`, UDS may substitute" wording is removed): `token` AND the connecting uid are BOTH REQUIRED and both MUST map to the same `line_id` — there is no token-only loopback variant (§3/§6) |
-| `0x11` HELLO_ACK | container→ | `{accepted:true, line_id, heartbeat_interval_ms, server_time, session_nonce}` or reject+close — `session_nonce` is a fresh `uint32` minted per control session (round 20); the agent MUST echo it in every media-channel frame of this session (UDP datagram on tunnel profiles, a length-prefixed record on the connected SOCK_STREAM UDS of `loopback`). Rejection (round 30): `{accepted:false, reason}` (typed reason string; `session_nonce`/`server_time` ABSENT — no half-issued session state) followed by an immediate FIN — a rejected session is never left half-open. `heartbeat_interval_ms` in this frame is AUTHORITATIVE for the session (round 30 — `agent.yaml`'s `heartbeat.interval_ms` is the FALLBACK used only until the first `HELLO_ACK`; the kernel's per-line negotiated value wins every subsequent session, so `admin.configure_line` cadence changes propagate through the next re-handshake without editing every agent's file) |
+| `0x10` HELLO | agent→ | `{line_id, token, agent_version, dongle:{adapter_mac, usb_path}, caps}` — `token` is the **long-lived per-line pre-shared secret** from `agent_token_file` (round 23 fix — earlier drafts wrongly called it a single-use credential; it is re-presented on EVERY control session, sent inside the authenticated tunnel only — round 36, iteration-4 audit item 16: HELLO is only EVER transmitted inside the authenticated tunnel profile — mTLS / WireGuard / `SO_PEERCRED` — never over a plaintext transport, and the media frames that follow it carry `session_nonce` binding them to the live control session). On WAN profiles the container validates `token` AND the tunnel peer identity together — WireGuard `/32` peer public key or mTLS client cert CN — both MUST map to the same `line_id`; either check failing rejects the session. On the co-located `loopback` profile the peer-identity factor is `SO_PEERCRED` (round 31, swe-2 item 32 — the earlier "token alone on `127.0.0.1`, UDS may substitute" wording is removed): `token` AND the connecting uid are BOTH REQUIRED and both MUST map to the same `line_id` — there is no token-only loopback variant (§3/§6) |
+| `0x11` HELLO_ACK | container→ | `{accepted:true, line_id, heartbeat_interval_ms, server_time, session_nonce}` or reject+close — `session_nonce` is a fresh `uint32` minted per control session (round 20); the agent MUST echo it in every media-channel frame of this session (UDP datagram on tunnel profiles, one seqpacket record on the connected `SOCK_SEQPACKET` UDS of `loopback`, round 36). Rejection (round 30): `{accepted:false, reason}` (typed reason string; `session_nonce`/`server_time` ABSENT — no half-issued session state) followed by an immediate FIN — a rejected session is never left half-open. `heartbeat_interval_ms` in this frame is AUTHORITATIVE for the session (round 30 — `agent.yaml`'s `heartbeat.interval_ms` is the FALLBACK used only until the first `HELLO_ACK`; the kernel's per-line negotiated value wins every subsequent session, so `admin.configure_line` cadence changes propagate through the next re-handshake without editing every agent's file) |
 | `0x12` HEARTBEAT | agent→ | `{seq, usb_ok, hci_ok}` every `heartbeat_interval_ms` — `hci_ok` reports the LOCAL health of the relay path (USB transfer engine alive, isoc state consistent), never a synthesized HCI command result: the dumb agent MUST NOT probe the controller with HCI commands of its own — every probe would consume the real controller's `ncmd` window and desync the kernel's command accounting (round 30) |
 | `0x17` HEARTBEAT_ACK | container→ | `{seq}` — echoes the received `HEARTBEAT.seq` (round 30, review-19 B2b#7): the bidirectional half of liveness — the agent counts missing ACKs against the SAME `missed_limit` the feeder applies to missed heartbeats, so a dead tunnel is detected in ~3 intervals ON BOTH SIDES. Without it the agent could only write into a dead TCP send buffer until `tcp_retries2` (~15 min) noticed, while a read-deadline on an idle-but-healthy line would tear down a perfectly good session — the ACK is what makes `missed_limit` meaningful agent-side |
 | `0x13` RESET | container→ | `{}` — agent power-cycles the dongle, then re-enumerates |
 | `0x14` STATUS | agent→ | `{state: UP|LINK_DEGRADED|DONGLE_DEAD|TUNNEL_FLAP, detail}` — strictly agent→container (round 30): the container never emits STATUS toward the agent — container-side desync/signalling is expressed by CLOSING the control session (the agent re-handshakes), keeping one frame direction per responsibility; `state` vocabulary renamed `DEGRADED`→`LINK_DEGRADED` (round 30 — disambiguated from the kernel-side liveness rung of the same name) |
 | `0x15` SHUTDOWN | both | graceful close |
-| `0x16` SCO_STATE | container→ | `{open: bool, handle?, air_mode?, rx_pkt_len?, tx_pkt_len?}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-21, see below); on `open: true` `handle` carries the 12-bit synchronous connection handle (`uint16`, meaningful bits `0x0FFF`) that the feeder parsed from `Synchronous Connection Complete 0x2c` — `0x2c` ONLY, never legacy `0x03` (round 30): the extended event carries `air_mode`/`rx_pkt_len`/`tx_pkt_len` the plain Connection Complete lacks, so deriving SCO geometry from `0x03` would be guesswork — REQUIRED on `open: true` (round 24) so the agent can form HCI SCO headers and underrun silence packets before the first UDP datagram ever arrives; `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"`) DERIVED from the NUMERIC HCI `air_mode` field in the `0x2c` event — `0x02` = CVSD → `"cvsd"`, `0x03` = transparent (the encoding mSBC rides on eSCO/WBS) → `"msbc"`; the feeder MUST map the numeric code, never expect a string on the air interface (round 25); `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the trailing fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
+| `0x18` SCO_SETUP | container→ | `{air_mode, esco_handle, service_interval_ms}` — explicit Interface-1 altsetting actuation (round 36, iteration-4 audit item 5): `air_mode` selects the `bAlternateSetting` per the fixed `wMaxPacketSize` table below, `esco_handle` is the 12-bit synchronous connection handle, and `service_interval_ms` is the negotiated eSCO service interval the IsoPump paces URB submission and the outbound playout buffer to; the agent needs NO HCI-event parsing to drive altsettings — it MAY sniff `Synchronous Connection Complete 0x2c` on the passthrough stream as a consistency check but MUST NOT depend on it |
+| `0x19` SCO_TEARDOWN | container→ | `{}` — explicit close actuation: stop isoc transfers, Interface-1 back to `altsetting 0` (round 36) |
+| `0x16` SCO_STATE | container→ | `{open: bool, handle?, air_mode?, rx_pkt_len?, tx_pkt_len?}` — the DECLARATIVE negotiated-geometry fact stamped alongside the `SCO_SETUP`/`SCO_TEARDOWN` actuation pair (rounds 19-21, see below; round 36 — this frame never selects an altsetting and never starts/stops isoc transfers; `open` only declares whether the sync link is up); on `open: true` `handle` carries the 12-bit synchronous connection handle (`uint16`, meaningful bits `0x0FFF`) that the feeder parsed from `Synchronous Connection Complete 0x2c` — `0x2c` ONLY, never legacy `0x03` (round 30): the extended event carries `air_mode`/`rx_pkt_len`/`tx_pkt_len` the plain Connection Complete lacks, so deriving SCO geometry from `0x03` would be guesswork — REQUIRED on `open: true` (round 24) so the agent can form HCI SCO headers and underrun silence packets before the first UDP datagram ever arrives; `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"`) DERIVED from the NUMERIC HCI `air_mode` field in the `0x2c` event — `0x02` = CVSD → `"cvsd"`, `0x03` = transparent (the encoding mSBC rides on eSCO/WBS) → `"msbc"`; the feeder MUST map the numeric code, never expect a string on the air interface (round 25); `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the trailing fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
 
-**USB SCO altsetting control (rounds 19-21).** The Bluetooth USB
+**USB SCO altsetting control (rounds 19-21; explicit trigger pair
+round 36, iteration-4 audit item 5).** The Bluetooth USB
 Transport spec keeps Interface 1 (SCO audio) at `altsetting 0` —
 zero bandwidth (`wMaxPacketSize = 0`) — while idle; isochronous
 transfers cannot flow until a working altsetting is selected, and a
@@ -166,11 +184,27 @@ lingering active altsetting reserves isoc bandwidth on the host
 controller forever, even between calls. The kernel `vhci` transport
 (H4) knows nothing about USB altsettings, so the container-side
 feeder — which already parses `Synchronous Connection Complete 0x2c`
-and `Disconnect Complete 0x05` for the SCO handle gate — sends the
-agent `0x16 SCO_STATE`:
+and `Disconnect Complete 0x05` for the SCO handle gate — drives the
+actuation with the explicit `0x18 SCO_SETUP` / `0x19 SCO_TEARDOWN`
+control pair: `SCO_SETUP{air_mode, esco_handle,
+service_interval_ms}` selects the Interface-1 altsetting and arms
+the IsoPump at the negotiated eSCO service interval,
+`SCO_TEARDOWN` stops isoc transfers and returns Interface-1 to
+`altsetting 0`. The agent needs NO HCI-event parsing of its own to
+time these switches — it MAY sniff `Synchronous Connection
+Complete 0x2c` on the relayed event stream as a consistency check
+but MUST NOT depend on it (round 36): control-channel truth only.
+`0x16 SCO_STATE` remains the full negotiated-geometry declaration
+the feeder stamps alongside the actuation (`handle`/`air_mode`/
+`rx_pkt_len`/`tx_pkt_len` for HCI SCO headers and silence
+generation) — DECLARATIVE only: it never selects an altsetting,
+never starts or stops isoc transfers, and performs no teardown;
+every actuation verb below belongs to `SCO_SETUP`/`SCO_TEARDOWN`:
 
-- `open: true` (after a successful sync connection complete): the
-  agent selects the Interface 1 `bAlternateSetting` by `air_mode`
+- `SCO_SETUP{air_mode, esco_handle, service_interval_ms}` (after
+  a successful sync connection complete): the OPEN actuation —
+  the agent selects the Interface 1 `bAlternateSetting` by
+  `air_mode`
   per Bluetooth Core Spec Vol 4 Part B §2.1.1 (round 21 fix — the
   round-20 text wrongly looked up `wMaxPacketSize == rx_pkt_len`,
   which matches nothing). The altsettings have FIXED
@@ -225,38 +259,52 @@ agent `0x16 SCO_STATE`:
   below still applies. **Timeout (round 33):** altsetting
   selection is not open-ended — a descriptor scan completing
   without a usable altsetting reports immediately, and a
-  successful `open:true` followed by no valid SCO traffic is
+  successful `SCO_SETUP` followed by no valid SCO traffic is
   already bounded by the `SCO_RX_STARVATION` gate (~500 ms
   during an active call); no third "selecting forever" state
   exists. The signal joins the media-health event
   vocabulary below — an undeliverable signal would strand the
   sync connection half-open.
-  `rx_pkt_len`/`tx_pkt_len`
+  The agent
+  then starts isoc IN+OUT transfers and chops outgoing HCI SCO
+  packets into `wMaxPacketSize`-sized isoc frames. Alongside the
+  actuation the feeder stamps `SCO_STATE{open:true, handle,
+  air_mode, rx_pkt_len, tx_pkt_len}` — the DECLARED geometry fact
+  the agent forms HCI SCO headers and underrun silence packets
+  from: `rx_pkt_len`/`tx_pkt_len`
   carry the ON-AIR eSCO packet length (e.g. `60` B for 2-EV3
   mSBC, `30` B for HV3) — the round-20 `48/64/128`-byte CVSD sizes
-  were the HCI buffer MTU, not altsetting packet sizes. The agent
-  then starts isoc IN+OUT transfers and chops outgoing HCI SCO
-  packets into `wMaxPacketSize`-sized isoc frames.
-- `open: false` (after disconnect): the agent stops isoc transfers
+  were the HCI buffer MTU, not altsetting packet sizes.
+- `SCO_TEARDOWN{}` (after disconnect — a `Disconnect Complete
+  0x05` matched to the live gate handle): the CLOSE actuation —
+  the agent stops isoc transfers
   and returns Interface 1 to `altsetting 0`, releasing the
-  bandwidth. **Altsetting 0 is the failure default too (round
+  bandwidth; the feeder stamps `SCO_STATE{open:false}` alongside
+  to declare the link down (geometry fields absent). **Altsetting
+  0 is the failure default too (round
   30):** the agent MUST also return Interface 1 to `altsetting 0`
   and cancel isoc transfers on control-session death, watchdog
   teardown, `CTRL_DESYNC`, or a `STATUS{DONGLE_DEAD}` path — a
-  tunnel drop never reaches a `SCO_STATE{open:false}` command, so
+  tunnel drop never delivers a `SCO_TEARDOWN`, so
   without the default the isoc pipeline would keep replaying
   generated silence into the phone forever while holding host
   USB bandwidth hostage; release is unconditional on ANY path
   that ends the media pipeline.
-- **SCO_STATE reissue on media reconnect (round 34, iteration-2
-  audit item 19):** a clean media-channel reconnect is a NEW
-  pipeline — the container MUST re-issue the CURRENT
-  `SCO_STATE{open:true}` (same `handle`/`air_mode`/packet lengths
+- **SCO actuation reissue on media reconnect (round 34, iteration-2
+  audit item 19; actuation pair round 36):** a clean media-channel
+  reconnect is a NEW
+  pipeline — the feeder MUST re-issue
+  `SCO_SETUP{air_mode, esco_handle, service_interval_ms}` (the
+  actuation that re-arms the isoc pipeline) PLUS the CURRENT
+  `SCO_STATE{open:true}` geometry (same `handle`/`air_mode`/packet
+  lengths
   the still-live SCO link negotiated) on every media
   (re)establishment; the agent MUST NOT assume its isoc
-  transfers survived the channel drop. Symmetrically, if the
+  transfers survived the channel drop — `SCO_STATE` alone never
+  re-opens anything. Symmetrically, if the
   SCO link itself closed while the channel was down, the
-  re-issued state is `SCO_STATE{open:false}` — the reconnect
+  reconnect re-issues `SCO_TEARDOWN` +
+  `SCO_STATE{open:false}` — the reconnect
   handshake always re-declares the link truth, and the
   kernel-side geometry stays fixed per the `0x1005` rules above
   (a reopen reselects the same line profile, it never
@@ -350,45 +398,48 @@ live in the vhci experiment. Therefore:
   allocator chase a garbage length field (HCI ACL/event payloads are
   ≲1 KiB; HELLO/STATUS JSON fits easily).
 
-### Media channel — frames (UDP datagrams on tunnel profiles, connected SOCK_STREAM UDS on `loopback`)
+### Media channel — frames (UDP datagrams on tunnel profiles, connected SOCK_SEQPACKET UDS on `loopback`)
 
 The media channel carries one self-contained media frame per
 record; the transport is profile-dependent (§3): UDP inside the
-tunnel profiles, a CONNECTED `SOCK_STREAM` Unix socket at
-`/run/phonebridge/media/<line_id>.sock` on `loopback` (round 32,
-SA_swe2_review_2 item 5 — the earlier UDS-datagram design is
-removed: a `SOCK_DGRAM` UDS has no `connect()`-time peer
+tunnel profiles, a CONNECTED `SOCK_SEQPACKET` Unix socket at
+`/run/phonebridge/media/<line_id>.sock` on `loopback` (round 36,
+iteration-4 audit item 21 — supersedes the round-32 `SOCK_STREAM`
+pinning, SA_swe2_review_2 item 5: a `SOCK_SEQPACKET` UDS
+authenticates its peer at `connect()`/`accept()` exactly like a
+stream socket AND preserves record boundaries natively, so each
+media frame is ONE atomic seqpacket record with no `rec_len`
+framing layer — the earlier UDS-datagram design is still removed:
+a `SOCK_DGRAM` UDS has no `connect()`-time peer
 authentication and its `EDESTADDRREQ`-driven rebind semantics
 duplicated the nonce gate the control session already owns). On
 `loopback` the feeder LISTENS and the agent CONNECTS — the
 media peer is verified at `accept()` by the same `SO_PEERCRED`
 uid ↔ `line_id` check the control socket applies, so the socket
-holds an authenticated full-duplex stream, not a bound datagram
-pair. The record layout below is IDENTICAL on every transport,
-with ONE stream addition: a `SOCK_STREAM` has no packet
-boundaries, so on `loopback` each record is prefixed with
-`uint16 BE rec_len` counting the bytes that follow it
-(`kind·nonce·seq·ts·payload`), and the parser bounds
-`rec_len` before reading — a desynchronized stream must fail
-fast exactly like the control channel's `MAX_CTRL_FRAME_LEN`
-rule. **Hard bound and fail-closed recovery (round 33):** the
-cap is `MAX_MEDIA_FRAME_LEN = 4096` — the same 4 KiB ceiling as
+holds an authenticated full-duplex record channel, not a bound
+datagram pair. The record layout below is IDENTICAL on every
+transport, with ONE seqpacket simplification (round 36): the
+kernel preserves the record boundary on a `SOCK_SEQPACKET`
+socket, so on `loopback` each record arrives as exactly one
+`recvmsg` unit — no `uint16 BE rec_len` prefix, no stream
+reassembly, no desync-offset problem. **Hard bound and
+fail-closed (round 33; seqpacket form round 36):** the cap is
+`MAX_MEDIA_FRAME_LEN = 4096` — the same 4 KiB ceiling as
 `MAX_CTRL_FRAME_LEN`, generous against a real record (≤ ~300 B:
-11 B header + one HCI SCO packet ≤ 258 B) — and `rec_len`
-outside `[11, MAX_MEDIA_FRAME_LEN]` declares the stream
-DESYNCHRONIZED: there is no resync scan on a stream socket (a
-misaligned byte offset can fake a valid header at any offset),
-so the receiver counts the framing error, closes the media
+11 B header + one HCI SCO packet ≤ 258 B) — and a received
+record outside `[11, MAX_MEDIA_FRAME_LEN]`, truncated by
+`MSG_TRUNC`, or failing the inner `payload_len` check is a
+framing violation: the receiver counts it, closes the media
 socket, and lets the agent's reconnect path re-authenticate a
-fresh stream — the malformed connection is NEVER kept alive on
+fresh socket — the malformed connection is NEVER kept alive on
 the hope the next record parses. On reconnect BOTH sides reset
 the media-channel state wholesale: `media_seq` freshness,
 the jitter-buffer occupancy/watermark edges, and the isoc
 plumbing restart from the new session's `HELLO_ACK` — no
 buffered frames, sequence expectations, or watermark state may
-cross a socket boundary. An EOF (orderly FIN) on the stream is
-the same teardown path — a half-closed media socket is not a
-recoverable record state.
+cross a socket boundary. A peer `shutdown`/close on the
+seqpacket socket is the same teardown path — a half-closed
+media socket is not a recoverable record state.
 
 `uint8 kind · uint32 BE session_nonce · uint16 BE media_seq ·
 uint32 BE ts_ms · payload` — one record per media frame (round
@@ -409,8 +460,8 @@ the SYMMETRIC check on container→agent frames: a valid
 required before a frame reaches the USB isoc path — the
 nonce is the session credential in both directions (round 30;
 on `loopback` the `accept()`-time `SO_PEERCRED` check is the
-source identity — a connected stream has no per-record source
-address to verify).
+source identity — a connected seqpacket pair has no per-record
+source address to verify).
 Kinds:
 
 - `0x03` SCO — one **complete HCI SCO packet** per record
@@ -426,7 +477,7 @@ Kinds:
 **Uplink endpoint binding (round 18).** UDP is connectionless: the
 feeder learns the agent's source `(IP, port)` only from received
 datagrams. On `loopback` the media channel is a CONNECTED
-`SOCK_STREAM` pair — the feeder accepts on
+`SOCK_SEQPACKET` pair — the feeder accepts on
 `/run/phonebridge/media/<line_id>.sock` and the endpoint is bound
 and `SO_PEERCRED`-verified at `accept()`, so there is no address
 learning, no rebind window and no `MEDIA_PING`-driven return-path
@@ -466,8 +517,8 @@ endpoint boundary:
   payload length,
 - emit only complete packets, never split a packet across media
   records (a lost UDP datagram would permanently corrupt a
-  reassembled stream; on `loopback` the `rec_len` record boundary
-  is the equivalent atomic unit),
+  reassembled stream; on `loopback` the seqpacket record boundary
+  is the atomic unit),
 - verify `payload_len` equals the actual payload size; malformed
   frames are counted, not forwarded.
 
@@ -487,14 +538,24 @@ into a misaligned packet — the 3-byte-header reassembly above is
 the resync point).
 
 **Uplink playout jitter buffer (round 23, ADR-B; drift rule added
-round 30).** UDP media and USB
+round 30; IsoPump placement pinned round 36, iteration-4 audit
+item 14).** UDP media and USB
 isochronous transfers run on different clocks: datagrams arrive with
 network jitter, while the dongle drains the isoc endpoint on a fixed
 air schedule — feeding it straight from the socket produces
 underruns (clicks) and bursts. The agent therefore keeps a small
 bounded playout buffer for uplink SCO (agent→phone direction) of
 **30–45 ms, i.e. 3–6 eSCO packets**, in front of the USB isoc OUT
-endpoint — and because the kernel emits a CONTINUOUS SCO stream
+endpoint — concretely, it sits BETWEEN the tunnel media reader and
+`IsoPump` TX, drained by the IsoPump's own isochronous completion
+callback clock (the eSCO service interval delivered in
+`0x18 SCO_SETUP.service_interval_ms`), so the buffer is paced by
+the hardware air clock, not by a host timer that would drift
+against it (round 36). Drift compensation is WHOLE-PACKET
+drop/dup only — NO ASRC: HCI SCO payloads are transparent codec
+frames and resampling would corrupt mSBC/CVSD data, so clock skew
+is absorbed by dropping or duplicating complete packets at the
+buffer edges — and because the kernel emits a CONTINUOUS SCO stream
 (one packet every ~7.5 ms for the whole call, no silence
 suppression between "bursts"), clock drift never resets: the
 buffer MUST compensate rather than hoping a gap re-centres it
@@ -569,23 +630,34 @@ clicks and underruns. The feeder therefore keeps a bounded
 - `media_seq` (wrap-aware) drives **dedup and gap accounting**:
   duplicates are dropped, small reorders are sorted inside the
   window, and a gap that is still open when the playout cursor
-  reaches it is filled with **codec-correct PLC/silence** — a
-  valid mSBC silence frame for `air_mode == "msbc"`, or the
-  matching CVSD/PCM silence for CVSD links — so the kernel never
+  reaches it is filled with **codec-correct PLC frames** —
+  never raw zeros (round 36, iteration-4 audit item 6): for
+  `air_mode == "msbc"` the feeder mints a COMPLETE H2 frame that
+  continues the payload's 2-bit sequence counter and marks the
+  HCI SCO header `Packet_Status_Flag = 0b10` (data known to be
+  partially lost — the kernel/upper layers can then treat the
+  fill as PLC rather than decode garbage), for CVSD links it
+  mints the matching codec silence — so the kernel never
   sees a stall and the container-side decoder/downlink path never
   sees an H2 discontinuity (these are phone→agent downlink frames;
-  the phone's DSP produced them, it does not consume the stream);
+  the phone's DSP produced them, it does not consume the stream).
+  The codec state this requires is NOT a layering violation
+  (round 36): the feeder learns `air_mode` per SCO handle from
+  the `SCO_SETUP` replication it issues on the control channel —
+  it parsed `Synchronous Connection Complete 0x2c` itself to mint
+  the actuation, so the `air_mode`/`esco_handle` pair is already
+  in hand when PLC fills are needed;
 - **fail-closed on malformed records:** a record that fails the
   nonce/length/payload checks (bad `session_nonce`,
-  `rec_len`/`payload_len` mismatch, truncated HCI SCO header)
+  record-length/`payload_len` mismatch, truncated HCI SCO header)
   is counted and dropped — it must never reach
   `write("/dev/vhci")`, consistent with the frame-validation
   rules below;
 - underflow, overflow and reorder events are counted and reported
   through the media-health telemetry vocabulary below (feeding
   the same `SCO_*` health surface as the handle gate);
-- on `loopback` the SOCK_STREAM media channel cannot reorder or
-  jitter at the transport layer, but the same buffer code path
+- on `loopback` the `SOCK_SEQPACKET` media channel cannot reorder
+  or jitter at the transport layer, but the same buffer code path
   applies uniformly — the alternative (two ingress pipelines) is
   a drift source, not a simplification.
 
@@ -634,6 +706,24 @@ assignment and MUST NEVER be forwarded onto the control tunnel
 agent would have nowhere meaningful to relay it). Discovery needs
 no `bluetoothd` round-trip: the write/read pair is the whole
 discovery — the lock is released as soon as the index lands.
+**hciN reporting (round 36, iteration-4 audit items 7/10):** the
+freshly minted `hciN` index — and the virtual adapter address
+bluetoothd will read off it — is REPORTED by the feeder over the
+bundle IPC to the line-bundle supervisor, which forwards the
+hciN-map + liveness facts to the domain kernel. The kernel holds
+the AUTHORITATIVE `line_id ↔ hciN` runtime map: `admin.pair_window`
+scoping and the supervisor's force-clear of
+`Pairable`/`Discoverable` are applied to THAT line's OWN adapter
+only (hciN-scoped — a per-line supervisor must never clear the
+global flags and race a sibling line's open window), and the
+oFono binding resolves its modem by the same index. The kernel
+notifies the bundle supervisor of pair-window open/close through
+the ordered writer's drained pair-window commands so the
+force-clear fires only on a notified close — timeout, restart,
+or a daemon crash mid-window — and BlueZ's own
+`PairableTimeout`/`DiscoverableTimeout` are armed as the crash
+backstop so a stale open window can never survive a dead
+supervisor either.
 
 **MTU alignment (round 32 rework — fixed kernel MTU, local first
 answer; SA_swe2_review_2 item 6 — replaces the round-30 "proxy
@@ -794,8 +884,9 @@ explicit health event.
 ### H4 type split
 
 `0x01` command, `0x02` ACL, `0x04` event → control-TCP.
-`0x03` SCO → the media channel (media-UDP on tunnel profiles, a
-`rec_len` record on the `loopback` SOCK_STREAM). Direction is
+`0x03` SCO → the media channel (media-UDP on tunnel profiles, one
+seqpacket record on the `loopback` `SOCK_SEQPACKET` socket,
+round 36). Direction is
 part of the contract (round 32, SA_swe2_review_2 item 7):
 `0x01` commands flow ONLY kernel→agent — the feeder reads them
 off `/dev/vhci` and proxies them down the tunnel, the agent never
@@ -818,28 +909,41 @@ canonical, shipped by the system, and not user-editable.
 | profile | carriage | status |
 |---|---|---|
 | `wireguard` | system-managed `wg0` peer; auth = peer pubkey ↔ line_id | V1 default for remote lines (the contract's model default is `loopback` — co-located, below) |
-| `loopback` | UDS control + UDS `SOCK_STREAM` media at `/run/phonebridge/media/<line_id>.sock`; auth = token + `SO_PEERCRED` uid ↔ line_id on BOTH sockets (media peer verified at `accept()`) | V1 (co-located agent) — round 30; stream media pinned round 32 |
-| `direct_mtls` | plain TCP/UDP + mutual TLS; cert CN ↔ line_id | V1 (LAN/VPN-ready nets) |
+| `loopback` | UDS control + UDS `SOCK_SEQPACKET` media at `/run/phonebridge/media/<line_id>.sock`; auth = token + `SO_PEERCRED` uid ↔ line_id on BOTH sockets (media peer verified at `accept()`) | V1 (co-located agent) — round 30; seqpacket media pinned round 36 |
+| `direct_mtls` | control TCP(mTLS) + media UDP(DTLS, mutual, bound to the mTLS control session); cert CN ↔ line_id | V1 (LAN/VPN-ready nets) |
 | `sstp` | reserved profile — server pack shipped by system | future |
 | `openconnect` | reserved profile | future |
 | `vless_xray` | reserved profile | future |
 
 Interface-creating profiles (wireguard, sstp, openconnect, vless_xray)
 give the agent an L3 path; the two channels then run inside it
-unmodified. `direct_mtls` wraps the TCP control channel in TLS and the
-UDP media channel in DTLS. Line identity is always bound to the tunnel
+unmodified. `direct_mtls` wraps the TCP control channel in mTLS and the
+UDP media channel in DTLS (round 36, iteration-4 audit item 9 —
+DTLS is MANDATORY on the media channel: TLS cannot run over UDP, so
+a "control TCP + media UDP" deployment with no DTLS layer would be
+an unauthenticated plaintext media path; the DTLS association is
+MUTUAL and cryptographically bound to the mTLS control session —
+the media frames an agent sends are provably the same peer the
+control session authenticated, never a stray UDP stream). Line
+identity is always bound to the tunnel
 credential — an agent cannot feed a line it was not provisioned for.
 
 **`loopback` (round 30; media transport re-pinned to
-`SOCK_STREAM` round 32, SA_swe2_review_2 item 5):** the canonical profile for a dongle
+`SOCK_SEQPACKET` round 36, iteration-4 audit item 21 — supersedes
+the round-32 `SOCK_STREAM` pinning, SA_swe2_review_2 item 5):**
+the canonical profile for a dongle
 physically on the gateway host — control rides a per-line
 `unix://` socket (the bind-mounted `0660` agent socket dir, group
-`phonebridge`), media rides a CONNECTED `SOCK_STREAM` Unix socket
+`phonebridge`), media rides a CONNECTED `SOCK_SEQPACKET` Unix socket
 at `/run/phonebridge/media/<line_id>.sock` (same `0660` dir
 discipline, one socket per line; the feeder listens, the agent
-connects — the earlier `SOCK_DGRAM` pair is removed because a
-datagram UDS cannot authenticate its peer at `connect()` and its
-`EDESTADDRREQ` rebind semantics duplicated the nonce gate).
+connects — SEQPACKET authenticates the peer at `connect()`/
+`accept()` exactly like a stream AND preserves frame boundaries
+natively, so one media frame is one record and no `rec_len`
+framing layer exists; the earlier `SOCK_DGRAM` pair is removed
+because a datagram UDS cannot authenticate its peer at
+`connect()` and its `EDESTADDRREQ` rebind semantics duplicated
+the nonce gate).
 `SO_PEERCRED` is the second factor on BOTH
 sockets: the feeder maps the connecting uid to the agent's
 provisioned uid for that `line_id` — the `agent.token` in HELLO
@@ -979,7 +1083,7 @@ channels:                          # container-side endpoint pair for
                                       # unix:// paths instead — the
                                       # 0660-dir control socket and
                                       # /run/phonebridge/media/<line_id>.sock
-                                      # (SOCK_STREAM, agent connects);
+                                      # (SOCK_SEQPACKET, agent connects);
                                       # the pair is stored in the
                                       # line's `lines` row at
                                       # provision time together with
@@ -1067,18 +1171,29 @@ ships a managed BlueZ `org.bluez.Agent1` that REJECTS every pairing
 attempt by default; `admin.pair_window {line_id, duration_sec}`
 (required, `0 < duration_sec <= 300` — `PairWindowRequest` rejects
 out-of-range values, no clamp and no default, round 28) sets
-`Pairable` AND `Discoverable` on that line's adapter and arms
-`PairableTimeout` to the requested window (round 30 — Pairable alone
+`Pairable` AND `Discoverable` on that line's adapter and arms BOTH
+`PairableTimeout` and `DiscoverableTimeout` to the requested window
+(round 36 — the native BlueZ timeouts are the crash backstop, so a
+stale open window cannot outlive a dead supervisor; Pairable alone
 still leaves the adapter invisible to phone-initiated discovery);
 the managed `Agent1`
 auto-confirms the SSP passkey comparison for the window's duration
 solely for the line's `paired_phone_mac` (§6). On a successful pair
 the agent marks `Device1.Trusted = true` (round 30 — otherwise
 BlueZ re-prompts `AuthorizeService` on the phone's own reconnect,
-killing headless recovery), and the supervisor force-clears
-`Pairable`/`Discoverable` on ANY window close — timeout, restart,
+killing headless recovery), and the line-bundle supervisor
+force-clears `Pairable`/`Discoverable` on THAT line's OWN adapter
+on ANY window close — timeout, restart,
 or a daemon crash mid-window (a stale open window is a standing
-MITM invitation).
+MITM invitation). **The force-clear is hciN-scoped and
+kernel-notified (round 36, iteration-4 audit items 7/10):** the
+domain kernel notifies the line-bundle supervisor of every pair
+window open/close through the ordered writer's drained
+pair-window commands, and the clear targets only the line's own
+`hciN` adapter resolved through the kernel's authoritative
+`line_id ↔ hciN` map (§2 — the feeder reports the minted index
+over bundle IPC) — a per-line supervisor clearing the flags
+unscoped would race a sibling line's open window.
 The window, the adapter (by `adapter_mac`), and any discovered
 devices are exposed through the admin surface (`phonebridgectl` /
 admin MCP) — no shell access required. Container-side teardown of a line:
@@ -1112,8 +1227,8 @@ every failure source, because a virtual adapter never wedges the kernel.
   dongle physically co-located with the container the
   `loopback` profile is canonical (§3): control rides a UDS
   socket in the bind-mounted `0660` dir, media rides a CONNECTED
-  `SOCK_STREAM` UDS at `/run/phonebridge/media/<line_id>.sock`
-  (round 32 — the feeder accepts, the agent connects,
+  `SOCK_SEQPACKET` UDS at `/run/phonebridge/media/<line_id>.sock`
+  (round 36 — the feeder accepts, the agent connects,
   `SO_PEERCRED` verified at `accept()`) — the
   profile exposes NO UDP listener at all, so no unauthenticated
   datagram path exists even on loopback (round 31). The
