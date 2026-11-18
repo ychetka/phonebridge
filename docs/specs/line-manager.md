@@ -1798,7 +1798,16 @@ pinned the following edges; each is normative and mirrored on
    LEASE-scoped (`line.hangup{lease_id}`, `network_error`,
    `call_state_changed` — never `missed_call`). A
    `PROVIDER_UNREACHABLE` verdict rendered BEFORE `line.answer`
-   was dispatched leaves the `call_token` unconsumed.
+   was dispatched leaves the `call_token` unconsumed. The
+   mirrored `call.dial` edge: a `PROVIDER_UNREACHABLE` verdict
+   rendered BEFORE `line.dial` was ever dispatched — the binding
+   already `ws_disconnected`/unservable when `dial()` ran —
+   leaves the `ACQUIRED` grant UNSPENT and reusable once a live
+   channel is restored (`provider.reregister` or a fresh
+   `provider.register` supersede), bounded by its
+   `grant_expires_at`; a POST-dispatch handshake failure consumes
+   the grant through compensation — the lease ends
+   `network_error` and the agent re-acquires.
 2. **Dead-channel commands.** No `line.*` command is queued to a
    `ws_disconnected`/dead binding: teardown parks the lease
    `TERMINATING` (the durable intent) and a `provider.reregister`
@@ -1843,8 +1852,11 @@ pinned the following edges; each is normative and mirrored on
 6. **Occupancy union and external calls.** Line occupancy is the
    union of live leases, open rings and `external_call` holds; an
    `external_call` hold minted on an unmatched call-present fact is
-   bounded by `UNMATCHED_CALL_SAFETY_SEC` = 3600 s when
-   `max_call_duration_sec` is unset, a correlated
+   bounded by the flat `UNMATCHED_CALL_SAFETY_SEC` = 3600 s
+   REGARDLESS of the line's `max_call_duration_sec` — a handset
+   call can legitimately outlive the configured cap, so the cap
+   never shortens an unmatched hold but no unmatched record may
+   live forever — a correlated
    `call_token`/`provider_call_id` refresh renews the record
    instead of double-minting, and a tokenless `active` on a
    `RINGING_LOCKED` line is the handset-answer case (external mint,

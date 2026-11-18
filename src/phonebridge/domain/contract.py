@@ -7923,6 +7923,7 @@ class LineManager(ABC):
         ``line.send_dtmf`` that was dispatched but lost when the
         socket dropped: it is simply dropped - no tone replay
         exists."""
+        ...
 
     @abstractmethod
     async def reattach_media(self, session_id: SessionId, lease_id: LeaseId) -> MediaReattachResult:

@@ -20,7 +20,8 @@ dev_summary: >-
   boundary (ring-scoped reject before, lease-scoped
   line.hangup{lease_id} + network_error after, never a retconned
   missed_call), and a pre-dispatch PROVIDER_UNREACHABLE leaves
-  call_token unconsumed; no line.* command is queued to a
+  call_token unconsumed on call.accept and the ACQUIRED grant
+  unspent and reusable on call.dial; no line.* command is queued to a
   ws_disconnected/dead binding — TERMINATING preserves the
   teardown intent and provider.reregister re-mints the hangup on
   the new channel inside the supersede mutation; the ban reaches
