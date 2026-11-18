@@ -76,7 +76,8 @@ The agent is deliberately *dumb* — it owns hardware and moves frames:
   baseline, never a claim built on a half-owned device.
 - **HCI relay** — forwards HCI frames between the dongle and the
   container: commands/ACL/events on the **control channel** (TCP), SCO
-  audio on the **media channel** (UDP). USB carries each class on its
+  audio on the **media channel** (UDP on tunnel profiles /
+  `SOCK_SEQPACKET` UDS on `loopback`). USB carries each class on its
   own endpoint (control EP = commands, interrupt EP = events, bulk EP =
   ACL, isochronous EP = SCO), so the agent tags each frame with the H4
   type byte implied by its endpoint — no protocol interpretation
@@ -172,7 +173,7 @@ receive_inbound?:bool}` object, never a free-form list).
 | `0x15` SHUTDOWN | both | graceful close |
 | `0x18` SCO_SETUP | container→ | `{air_mode, esco_handle, service_interval_ms}` — explicit Interface-1 altsetting actuation (round 36, iteration-4 audit item 5): `air_mode` selects the `bAlternateSetting` per the fixed `wMaxPacketSize` table below, `esco_handle` is the 12-bit synchronous connection handle, and `service_interval_ms` is the negotiated eSCO service interval the IsoPump paces URB submission and the outbound playout buffer to; the agent needs NO HCI-event parsing to drive altsettings — it MAY sniff `Synchronous Connection Complete 0x2c` on the passthrough stream as a consistency check but MUST NOT depend on it |
 | `0x19` SCO_TEARDOWN | container→ | `{}` — explicit close actuation: stop isoc transfers, Interface-1 back to `altsetting 0` (round 36) |
-| `0x16` SCO_STATE | container→ | `{open: bool, handle?, air_mode?, rx_pkt_len?, tx_pkt_len?}` — instructs the agent to enable/disable the USB isochronous path (rounds 19-21, see below); on `open: true` `handle` carries the 12-bit synchronous connection handle (`uint16`, meaningful bits `0x0FFF`) that the feeder parsed from `Synchronous Connection Complete 0x2c` — `0x2c` ONLY, never legacy `0x03` (round 30): the extended event carries `air_mode`/`rx_pkt_len`/`tx_pkt_len` the plain Connection Complete lacks, so deriving SCO geometry from `0x03` would be guesswork — REQUIRED on `open: true` (round 24) so the agent can form HCI SCO headers and underrun silence packets before the first UDP datagram ever arrives; `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"`) DERIVED from the NUMERIC HCI `air_mode` field in the `0x2c` event — `0x02` = CVSD → `"cvsd"`, `0x03` = transparent (the encoding mSBC rides on eSCO/WBS) → `"msbc"`; the feeder MUST map the numeric code, never expect a string on the air interface (round 25); `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the trailing fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
+| `0x16` SCO_STATE | container→ | `{open: bool, handle?, air_mode?, rx_pkt_len?, tx_pkt_len?}` — the DECLARATIVE negotiated-geometry fact stamped alongside the `SCO_SETUP`/`SCO_TEARDOWN` actuation pair (rounds 19-21, see below; round 36 — this frame never selects an altsetting and never starts/stops isoc transfers; `open` only declares whether the sync link is up); on `open: true` `handle` carries the 12-bit synchronous connection handle (`uint16`, meaningful bits `0x0FFF`) that the feeder parsed from `Synchronous Connection Complete 0x2c` — `0x2c` ONLY, never legacy `0x03` (round 30): the extended event carries `air_mode`/`rx_pkt_len`/`tx_pkt_len` the plain Connection Complete lacks, so deriving SCO geometry from `0x03` would be guesswork — REQUIRED on `open: true` (round 24) so the agent can form HCI SCO headers and underrun silence packets before the first UDP datagram ever arrives; `air_mode` is the negotiated encoding (`"cvsd"` \| `"msbc"`) DERIVED from the NUMERIC HCI `air_mode` field in the `0x2c` event — `0x02` = CVSD → `"cvsd"`, `0x03` = transparent (the encoding mSBC rides on eSCO/WBS) → `"msbc"`; the feeder MUST map the numeric code, never expect a string on the air interface (round 25); `rx_pkt_len`/`tx_pkt_len` are the negotiated air packet lengths; on `open: false` the trailing fields are OPTIONAL/absent (`null`) — no mixed-type `0` placeholders (round 21) |
 
 **USB SCO altsetting control (rounds 19-21; explicit trigger pair
 round 36, iteration-4 audit item 5).** The Bluetooth USB
@@ -196,10 +197,14 @@ but MUST NOT depend on it (round 36): control-channel truth only.
 `0x16 SCO_STATE` remains the full negotiated-geometry declaration
 the feeder stamps alongside the actuation (`handle`/`air_mode`/
 `rx_pkt_len`/`tx_pkt_len` for HCI SCO headers and silence
-generation):
+generation) — DECLARATIVE only: it never selects an altsetting,
+never starts or stops isoc transfers, and performs no teardown;
+every actuation verb below belongs to `SCO_SETUP`/`SCO_TEARDOWN`:
 
-- `open: true` (after a successful sync connection complete): the
-  agent selects the Interface 1 `bAlternateSetting` by `air_mode`
+- `SCO_SETUP{air_mode, esco_handle, service_interval_ms}` (after
+  a successful sync connection complete): the OPEN actuation —
+  the agent selects the Interface 1 `bAlternateSetting` by
+  `air_mode`
   per Bluetooth Core Spec Vol 4 Part B §2.1.1 (round 21 fix — the
   round-20 text wrongly looked up `wMaxPacketSize == rx_pkt_len`,
   which matches nothing). The altsettings have FIXED
@@ -254,38 +259,52 @@ generation):
   below still applies. **Timeout (round 33):** altsetting
   selection is not open-ended — a descriptor scan completing
   without a usable altsetting reports immediately, and a
-  successful `open:true` followed by no valid SCO traffic is
+  successful `SCO_SETUP` followed by no valid SCO traffic is
   already bounded by the `SCO_RX_STARVATION` gate (~500 ms
   during an active call); no third "selecting forever" state
   exists. The signal joins the media-health event
   vocabulary below — an undeliverable signal would strand the
   sync connection half-open.
-  `rx_pkt_len`/`tx_pkt_len`
+  The agent
+  then starts isoc IN+OUT transfers and chops outgoing HCI SCO
+  packets into `wMaxPacketSize`-sized isoc frames. Alongside the
+  actuation the feeder stamps `SCO_STATE{open:true, handle,
+  air_mode, rx_pkt_len, tx_pkt_len}` — the DECLARED geometry fact
+  the agent forms HCI SCO headers and underrun silence packets
+  from: `rx_pkt_len`/`tx_pkt_len`
   carry the ON-AIR eSCO packet length (e.g. `60` B for 2-EV3
   mSBC, `30` B for HV3) — the round-20 `48/64/128`-byte CVSD sizes
-  were the HCI buffer MTU, not altsetting packet sizes. The agent
-  then starts isoc IN+OUT transfers and chops outgoing HCI SCO
-  packets into `wMaxPacketSize`-sized isoc frames.
-- `open: false` (after disconnect): the agent stops isoc transfers
+  were the HCI buffer MTU, not altsetting packet sizes.
+- `SCO_TEARDOWN{}` (after disconnect — a `Disconnect Complete
+  0x05` matched to the live gate handle): the CLOSE actuation —
+  the agent stops isoc transfers
   and returns Interface 1 to `altsetting 0`, releasing the
-  bandwidth. **Altsetting 0 is the failure default too (round
+  bandwidth; the feeder stamps `SCO_STATE{open:false}` alongside
+  to declare the link down (geometry fields absent). **Altsetting
+  0 is the failure default too (round
   30):** the agent MUST also return Interface 1 to `altsetting 0`
   and cancel isoc transfers on control-session death, watchdog
   teardown, `CTRL_DESYNC`, or a `STATUS{DONGLE_DEAD}` path — a
-  tunnel drop never reaches a `SCO_STATE{open:false}` command, so
+  tunnel drop never delivers a `SCO_TEARDOWN`, so
   without the default the isoc pipeline would keep replaying
   generated silence into the phone forever while holding host
   USB bandwidth hostage; release is unconditional on ANY path
   that ends the media pipeline.
-- **SCO_STATE reissue on media reconnect (round 34, iteration-2
-  audit item 19):** a clean media-channel reconnect is a NEW
-  pipeline — the container MUST re-issue the CURRENT
-  `SCO_STATE{open:true}` (same `handle`/`air_mode`/packet lengths
+- **SCO actuation reissue on media reconnect (round 34, iteration-2
+  audit item 19; actuation pair round 36):** a clean media-channel
+  reconnect is a NEW
+  pipeline — the feeder MUST re-issue
+  `SCO_SETUP{air_mode, esco_handle, service_interval_ms}` (the
+  actuation that re-arms the isoc pipeline) PLUS the CURRENT
+  `SCO_STATE{open:true}` geometry (same `handle`/`air_mode`/packet
+  lengths
   the still-live SCO link negotiated) on every media
   (re)establishment; the agent MUST NOT assume its isoc
-  transfers survived the channel drop. Symmetrically, if the
+  transfers survived the channel drop — `SCO_STATE` alone never
+  re-opens anything. Symmetrically, if the
   SCO link itself closed while the channel was down, the
-  re-issued state is `SCO_STATE{open:false}` — the reconnect
+  reconnect re-issues `SCO_TEARDOWN` +
+  `SCO_STATE{open:false}` — the reconnect
   handshake always re-declares the link truth, and the
   kernel-side geometry stays fixed per the `0x1005` rules above
   (a reopen reselects the same line profile, it never
@@ -698,7 +717,8 @@ scoping and the supervisor's force-clear of
 only (hciN-scoped — a per-line supervisor must never clear the
 global flags and race a sibling line's open window), and the
 oFono binding resolves its modem by the same index. The kernel
-notifies the bundle supervisor of pair-window open/close so the
+notifies the bundle supervisor of pair-window open/close through
+the ordered writer's drained pair-window commands so the
 force-clear fires only on a notified close — timeout, restart,
 or a daemon crash mid-window — and BlueZ's own
 `PairableTimeout`/`DiscoverableTimeout` are armed as the crash
@@ -1168,7 +1188,8 @@ or a daemon crash mid-window (a stale open window is a standing
 MITM invitation). **The force-clear is hciN-scoped and
 kernel-notified (round 36, iteration-4 audit items 7/10):** the
 domain kernel notifies the line-bundle supervisor of every pair
-window open/close, and the clear targets only the line's own
+window open/close through the ordered writer's drained
+pair-window commands, and the clear targets only the line's own
 `hciN` adapter resolved through the kernel's authoritative
 `line_id ↔ hciN` map (§2 — the feeder reports the minted index
 over bundle IPC) — a per-line supervisor clearing the flags

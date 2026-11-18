@@ -1918,7 +1918,8 @@ the kernel's runtime bookkeeping.
    that adapter only (hciN-scoped — a per-line clear can never
    race a sibling line's open window), and to bind the oFono
    modem for the line. The kernel MUST notify the bundle
-   supervisor of every pair-window open/close so the force-clear
+   supervisor of every pair-window open/close — drained through
+   the ordered writer like every post-mutation dispatch — so the force-clear
    is notified and adapter-scoped, and BlueZ's native
    `PairableTimeout`/`DiscoverableTimeout` are armed as the crash
    backstop.

@@ -12,7 +12,8 @@ dev_summary: >-
   terminates the Bluetooth RF edge at the remote DONGLE, routes all
   post-mutation dispatch through the ordered writer task
   (write-through first, then drained envelopes/commands to
-  EventBus/Manager/bundle supervisor/Agent1), adds the container
+  EventBus/Manager/bundle supervisor+pair-window/Agent1/
+  MediaRouter/internal.sock), adds the container
   init / stack supervisor with a reconciliation edge to the kernel,
   draws the oFono HandsfreeAudioAgent SCO-fd path to PipeWire,
   makes InternalService-FallbackWorker and FallbackWorker-

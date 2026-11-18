@@ -69,7 +69,7 @@ referenced sections.
 | round 33 (iteration-1 architecture audit — contract re-freeze) | The `{accepted}` provider reply is distilled into a first-class kernel fact `ProviderCommandAck` ingested via `LineManager.ingest_command_ack` — `CommandAckKind` `dial\|answer`, `call_token` echo answer-only, `accepted:true` clears the armed handshake and records `provider_call_id` on the dial path, `accepted:false` applies the identical effects of `compensate_dial`/`compensate_answer` in one mutation; `CallLease.pending_command` + `provider_command_ack_deadline_at` arm atomically per down-channel dispatch (phase-coherent, DIALING/ANSWERING only), `provider_command_ack_sec` (default 2 s, ≤ 60 s) joins `TimeoutConfig`/`LineTimeouts`, `tick` is the ack-deadline backstop — the agent's `call.dial`/`call.accept` wire reply is withheld until the bounded handshake resolves (`PROVIDER_UNREACHABLE` on refusal/timeout/unreachable, no new error code); answer-pending ring sub-state — a consumed `call_token` never re-enters the fallback decision; unqualified sole-live-lease attribution requires positive evidence (`provider_call_id` and/or normalized `caller_id` present on both sides AND agreeing, else `external_call` mint); `ProviderBinding` carries durable `liveness_stamp_watermark`/`call_stamp_watermark` (monotone-max, persisted, inherited on reregister, `channel_seq` reseeds, `orphan_deadline_at` channel-local never durable); `WakeAudience` zero-live-subscriber fan-out (hooks-only, no envelope without hooks); adapter-owned listing `cursor` (XOR `offset`, fail-closed `INVALID_ARGUMENT`, kernel keeps `offset`/`limit`); `CallLease.media_epoch` (0 on `ACQUIRED`, ≥ 1 on call-bearing phases); provisioning validation hardens (unique `adapter_mac`, ISO 3166-1 `default_region`, pairing windows require `paired_phone_mac`, E.164 ASCII digit guard, `RedactedString` value-equality/hash) | contract.py, docs/api-contract.md, docs/specs/line-manager.md, §3.3-§3.5, §4.5, §5.2-§5.3 |
 | round 34 (iteration-2 architecture audit — contract hardening, issue #83) | `pending_command` survives provider phase advances (dial → DIALING/ALERTING/ACTIVE, answer → ANSWERING/ACTIVE) so a late ack still records `provider_call_id`; the withheld wire reply is terminal `PROVIDER_UNREACHABLE` when teardown wins the ack race — dead-lease credentials are never delivered; `SERVABLE_LIVENESS_STATES` (`reachable`/`degraded`) split from `CLAIM_VISIBLE_LIVENESS_STATES` — `ws_disconnected` stays claim-visible but never servable (no `line.dial`/`line.answer` until a newer `provider.reregister`), `AdminLineView.orphan_deadline_at` mirrors the live binding, `ws_disconnected` recovery requires a strictly newer `channel_seq`; binding death unifies on `provider_lost` + no queues to dead bindings; media pair TTL arms at `{accepted:true}` with `media_epoch` carried into `media.auth`; per-`(line_id, call_identity, accepted_stamp)` call-state watermarks (bounded 64/line) replace the line-wide live scalar; `call_present`-only `external_call` mint + flat `UNMATCHED_CALL_SAFETY_SEC` = 3600 s safety net; `pending_ring` token return via `pending_rings` incl. `provider.ping`; `WakeAudience` gains kernel-visible `wake_hooks` + masked-str wake `caller_id` + exclusive-line wake routing; per-ticket mutation-coalesced `event.queue_updated` bounded by affected tickets; `call.release` rides the `terminating` leg; `forward_via_line` second-leg FSM — one bounded queued acquire on BUSY/`RINGING_LOCKED`, terminal on unreachable — + `answer_and_announce` terminal announcement; `register_provider` auto-created assignment counts `MAX_LINES_TOTAL` + write-through; split `/run/phonebridge{,-private}` mounts; masked hook payload + HMAC fields; DTMF pacer pause bounded at `DTMF_PAUSE_BUDGET_MS` = 30 000 ms (`MAX_DTMF_STREAM_PAUSE_SEC` = 30 s, sized for the 32-digit `send_dtmf` max); hci-agent `0x1005` local answer `ncmd=1` every issue + fixed SCO geometry across reopen; idempotent replay restricted to granted/queued outcomes; expired grant = `RESOURCE_EXHAUSTED`/`GRANT_TTL_EXPIRED`; single `has_more` formula + context-bound cursors; `_FrozenMeta` serializable provider metadata | contract.py, docs/api-contract.md, docs/specs/line-manager.md, docs/hci-agent.md, §3.4, §4.5, §5.2-§5.4, §6.4, §7 |
 | round 35 (iteration-3 architecture audit — contract hardening, issue #85) | `CallLease.media_epoch` splits into PER-ROLE `agent_media_epoch`/`provider_media_epoch` on both the lease and `MediaCredentials` — a single-role `reissue` burns only the addressed role's token while the sibling socket keeps streaming under its own epoch; `MEDIA_PAIR_TTL_SEC` ack-arm is per-role (`{accepted:true}` arms only unattached roles; a role-specific detach arms that role's re-attach window); pending answer after `ACTIVE` splits ring-scoped vs lease-scoped teardown at the `ACTIVE` boundary and pre-dispatch `PROVIDER_UNREACHABLE` leaves `call_token` unconsumed; no `line.*` command queues to a `ws_disconnected` binding — `TERMINATING` preserves intent and `provider.reregister` re-mints `line.hangup` on the new channel, and the ban reaches the saga path (`compensate_dial` still ends the lease `network_error`; `compensate_answer`'s undrained ring carries the reject intent a `provider.reregister` re-mints); `ProviderRegisterResult.auto_created_assignment` exposes the register-minted record for `restore_line(line_id, None)` compensation; `drop_session`/`max_call_duration` teardown rides `TERMINATING` with pending end-reason preserved; `provider_lost` unifies every dead-binding end incl. `dongle_lost`, `network_error` stays compensation/deadline-only; `MissedCallWakeEvent` — tokenless masked `missed_call` wake projection; stale/equal/older-generation provider facts are record-only (watermark may rise, `liveness`/`last_seen_at`/deadlines untouched); pool+preferred tickets survive orphan grace until the last window lapses; preferred-line acquire (`RINGING_LOCKED` → `LINE_BUSY_INCOMING` or enqueue; `unbound`/dead → `PROVIDER_UNREACHABLE`) + preempted-grant reissue re-validation; tokenless `active`/`disconnected` facts on `RINGING_LOCKED` resolve the open ring or mint `external_call`; forward-fallback terminal failure is ordinary answered-lease teardown, never `missed_call`; exclusive-owner inbound delivery requires an owner `receive_inbound` session; idempotent replay revalidates recorded outcome liveness; `has_more` is the adapter's locked two-call probe; `admin.issue_key` gains required-on-admin `subject_id?`; DTMF pause-budget exhaustion unified as provider-role detach (resumed pauses never accumulate) | contract.py, tests/test_domain_contract.py, docs/api-contract.md, docs/specs/line-manager.md, docs/hci-agent.md, §5.2-§5.4, §6.4, §7, §10 |
-| round 36 (iteration-4 architecture audit — docs/diagram fixes, issue #91) | Block diagram corrected: bidirectional `/dev/vhci`, RF edge terminates at the remote DONGLE, all post-mutation dispatch routed through the ordered writer (write-through then publish/dispatch), container init/stack supervisor added (bluetoothd/oFono/PipeWire/WirePlumber/dbus-daemons/FallbackWorker + full kernel reconciliation on stack restart), oFono `HandsfreeAudioAgent` owns the HFP SCO socket (OF↔PW SCO-fd edge), bidirectional INT↔FB and MR↔FB, LP→MR `0x05`/`0x06` DTMF control edge, KERNEL→MR relabeled with token-revoke/lease-teardown/epoch-invalidate, authoritative `line_id`↔`hciN` map (feeder → bundle supervisor → kernel) scoping pair windows + force-clear with `PairableTimeout`/`DiscoverableTimeout` backstop, tunnel edge gains `SCO_SETUP`/`SCO_TEARDOWN` + DTLS-media/`SOCK_SEQPACKET`-loopback transport labels. Docs pinned: explicit feeder→agent `SCO_SETUP{air_mode, esco_handle, service_interval_ms}`/`SCO_TEARDOWN` altsetting actuation (agent needs no HCI-event parsing), loopback media = `SOCK_SEQPACKET`, `direct_mtls` media = mutual DTLS bound to the mTLS control session (TLS cannot run over UDP), HELLO only inside the authenticated tunnel + `session_nonce` media binding, agent outbound playout buffer paced by the isoc callback clock with whole-packet drop/dup (no ASRC), feeder PLC = codec-correct frames (H2 seq continuation + `Packet_Status_Flag=0b10` mSBC / CVSD silence, never zeros), hardware gate order enumerate→detach→claim→`HCI_Reset`→`HCI_Read_BD_ADDR`→MAC verify + startup wedge recovery, in-memory-authoritative/SQLite-write-through invariant with `restore_line` compensation, kernel-timer-driven fallback activation with bounded ack-retry (`event.fallback_triggered` informational), hydrated `provider_bindings` quarantine revalidation, per-uid container separation (`0660` group admin.sock + pid→role `internal.sock`), API keys hashed / webhook+escalation secrets encrypted-or-`0600`, `0x06` DTMF-END/resume opcode, `SendTones`/`AT+VTS` as per-session probe | docs/architecture-block-diagram.mmd, docs/hci-agent.md, docs/adr/0004-hci-agent-runtime.md, docs/api-contract.md, docs/specs/line-manager.md, §2.1, §4.5, §5.3, §9, §10 |
+| round 36 (iteration-4 architecture audit — docs/diagram fixes, issue #91) | Block diagram corrected: bidirectional `/dev/vhci`, RF edge terminates at the remote DONGLE, all post-mutation dispatch routed through the ordered writer (write-through then publish/dispatch), container init/stack supervisor added (bluetoothd/oFono/PipeWire/WirePlumber/dbus-daemons/FallbackWorker + full kernel reconciliation on stack restart), oFono `HandsfreeAudioAgent` owns the HFP SCO socket (OF↔PW SCO-fd edge), bidirectional INT↔FB and MR↔FB, LP→MR `0x05`/`0x06` DTMF control edge, media commands dispatched WRITER→MR (token-revoke/lease-teardown/epoch-invalidate), authoritative `line_id`↔`hciN` map (feeder → bundle supervisor → kernel) scoping pair windows + force-clear with `PairableTimeout`/`DiscoverableTimeout` backstop, tunnel edge gains `SCO_SETUP`/`SCO_TEARDOWN` + DTLS-media/`SOCK_SEQPACKET`-loopback transport labels. Docs pinned: explicit feeder→agent `SCO_SETUP{air_mode, esco_handle, service_interval_ms}`/`SCO_TEARDOWN` altsetting actuation (agent needs no HCI-event parsing), loopback media = `SOCK_SEQPACKET`, `direct_mtls` media = mutual DTLS bound to the mTLS control session (TLS cannot run over UDP), HELLO only inside the authenticated tunnel + `session_nonce` media binding, agent outbound playout buffer paced by the isoc callback clock with whole-packet drop/dup (no ASRC), feeder PLC = codec-correct frames (H2 seq continuation + `Packet_Status_Flag=0b10` mSBC / CVSD silence, never zeros), hardware gate order enumerate→detach→claim→`HCI_Reset`→`HCI_Read_BD_ADDR`→MAC verify + startup wedge recovery, in-memory-authoritative/SQLite-write-through invariant with `restore_line` compensation, kernel-timer-driven fallback activation with bounded ack-retry (`event.fallback_triggered` informational), hydrated `provider_bindings` quarantine revalidation, per-uid container separation (`0660` group admin.sock + pid→role `internal.sock`), API keys hashed / webhook+escalation secrets encrypted-or-`0600`, `0x06` DTMF-END/resume opcode, `SendTones`/`AT+VTS` as per-session probe | docs/architecture-block-diagram.mmd, docs/hci-agent.md, docs/adr/0004-hci-agent-runtime.md, docs/api-contract.md, docs/specs/line-manager.md, §2.1, §4.5, §5.3, §9, §10 |
 
 ## §1. Service boundary
 
@@ -414,8 +414,8 @@ implicit; round 31 pins the full inventory):
 |---|---|---|---|
 | **Manager** | `wss://gw:7001/provider` | Line providers (LocalLine, RemoteLine) | `provider.*` (up), `line.*` (down) |
 | **APICallService** | `wss://gw:7002/agent` | AI agents | `agent.*`, `call.*` (up), `event.*` (down) |
-| **AdminService** | `unix:///run/phonebridge-private/admin.sock` (mode 0600) or `wss://gw:7004/admin` | Admin clients (`phonebridgectl`, admin MCP) | `admin.*` |
-| **InternalService** | `unix:///run/phonebridge-private/internal.sock` (mode 0600, never bind-mounted or network-exposed) | In-container service identities (`system:*`, e.g. the FallbackWorker) | `agent.*`, `call.*` (up), `event.*` (down) |
+| **AdminService** | `unix:///run/phonebridge-private/admin.sock` (mode `0660`, `root:phonebridge-admin` — group reachability admits the gateway + admin tooling) or `wss://gw:7004/admin` | Admin clients (`phonebridgectl`, admin MCP) | `admin.*` |
+| **InternalService** | `unix:///run/phonebridge-private/internal.sock` (mode `0600` owned by the gateway uid + `SO_PEERCRED` pid→role map; never bind-mounted or network-exposed) | In-container service identities (`system:*`, e.g. the FallbackWorker) | `agent.*`, `call.*` (up), `event.*` (down) |
 
 **Split runtime mounts (round 34, iteration-2 audit item 16):**
 `/run/phonebridge/` is the SHARED runtime tree — it carries the
@@ -423,8 +423,16 @@ host-visible `vhci.lock`, the provider restart state files
 `<line_id>.json` and the `media/<line_id>.sock` loopback
 endpoints other pods legitimately mount — while the private
 control sockets live on a SEPARATE daemon-private mount
-`/run/phonebridge-private/` (mode `0700`, never bind-mounted or
-network-exposed) holding `admin.sock` and `internal.sock`. The
+`/run/phonebridge-private/` (mode `0750`, `root:phonebridge-admin`
+— group reachability on the mount is what admits the gateway and
+the admin tooling to `admin.sock`; media/provider children, exec
+hooks and the FallbackWorker are never members — never
+bind-mounted or
+network-exposed) holding `admin.sock` (`0660
+root:phonebridge-admin`) and `internal.sock` (`0600`, owned by
+the gateway uid; the FallbackWorker's dedicated uid reaches it
+through the spawn-time named-UID ACL on the mount and socket —
+see the uid-separation paragraph in §9). The
 split is load-bearing, not cosmetic: mounting the whole
 `/run/phonebridge` tree into a provider/utility pod would smuggle
 the admin and internal listeners into an untrusted mount
@@ -1133,8 +1141,12 @@ cold start, where it replays the last durably committed truth.
   THE WRITER after its write-through, in submission order: typed
   envelopes to the EventBus, provider commands to the Manager
   down-channel, bundle lifecycle commands (spawn/restart/retire)
-  to the line-bundle supervisor, and validated pair windows to
-  the BlueZ `Agent1` — ingress stays direct (admin
+  and pair-window open/close notifications to the line-bundle
+  supervisor, validated pair windows to the BlueZ `Agent1`,
+  media commands to the MediaRouter (`MediaAllocator`
+  allocation/revocation, media-token revoke, lease teardown,
+  epoch invalidate), and `system:*` commands to the
+  FallbackWorker over `internal.sock` — ingress stays direct (admin
   `pair_window` requests and MediaRouter/D-Bus facts still enter
   the kernel unmediated), only the mutation OUT-path is
   writer-serialized
@@ -1444,7 +1456,8 @@ removed. **The event is INFORMATIONAL, not the activation path
 (round 36, iteration-4 audit item 18):** fallback activation is
 kernel-timer-driven — the kernel owns the
 `fallback_accept_ttl_sec` deadline itself and dispatches the
-fallback activation to the FallbackWorker directly (a `system:*`
+fallback activation to the FallbackWorker through the same
+ordered writer every other post-mutation dispatch rides (a `system:*`
 command over `internal.sock`) with a BOUNDED ack-retry, so a
 lost `event.fallback_triggered` envelope on the best-effort bus
 can never orphan a ringing call — the kernel-side timer and
@@ -1864,7 +1877,7 @@ Design consequences:
 Between the hci-agent and the container, SCO rides the **media-UDP**
 channel of the line's tunnel profile (isochronous semantics: stale
 frames are dropped, never retransmitted; the `loopback` profile
-substitutes a CONNECTED `SOCK_STREAM` Unix socket at
+substitutes a CONNECTED `SOCK_SEQPACKET` Unix socket at
 `/run/phonebridge/media/<line_id>.sock` with the peer verified at
 `accept()` — `docs/hci-agent.md` §2); control flows on
 control-TCP. A QUIC/multiplexed-streams unification is a V2 track.
@@ -2127,22 +2140,38 @@ sharing one `XDG_RUNTIME_DIR` and one session D-Bus — with an
 explicit system-bus policy granting UID `phonebridge` access to
 `org.bluez` (and nothing else privileged). **In-container uid
 separation (round 36, iteration-4 audit item 17 — the "one uid
-impersonates everything" gap closed):** file mode `0600` plus
-`SO_PEERCRED` is NOT sufficient when every child shares the
-`phonebridge` uid — a compromised media or provider child could
-open `internal.sock` and impersonate a `system:*` identity or an
-`admin.*` client. The deployment therefore runs the line-bundle
-children (`vhci-feeder`, `LineProvider`) and every exec wake hook
-under DEDICATED unprivileged uids distinct from the gateway's —
-the supervisor spawns them `setuid`-separated (or maps them
-through the container user namespace). Socket reachability then
+impersonates everything" gap closed; rescoped to need-based
+uids):** the separation is scoped to what each child NEEDS, not
+uid-per-child — the session D-Bus/PipeWire domain is uid-scoped
+(`XDG_RUNTIME_DIR` is a per-uid `0700` dir and the
+`org.bluez`/`org.ofono` system-bus policy keys on UID
+`phonebridge`), so the N `LineProvider` workers KEEP the
+`phonebridge` uid they share with the gateway, `pipewire` and
+`wireplumber`; DEDICATED unprivileged uids apply only to
+children WITHOUT session-bus needs — each `vhci-feeder`, every
+exec wake hook — plus the FallbackWorker, whose own uid is what
+the `system:*` pid→role map records. The supervisor spawns them
+`setuid`-separated (or maps them through the container user
+namespace). Socket reachability plus the role map is what
 enforces the boundary: `admin.sock` lives in
-`/run/phonebridge-private/` group-scoped `0660`
-`root:phonebridge-admin` (only admin tooling and the gateway join
-the group — media/provider children never do), and
-`internal.sock` additionally maps `SO_PEERCRED` pid/uid through a
-pid→role map so only the supervised FallbackWorker's uid may
-authenticate as `system:fallback_worker`; a compromised child
+`/run/phonebridge-private/` mounted `0750
+root:phonebridge-admin` with the socket file itself `0660
+root:phonebridge-admin` — the mount's group reachability is what
+admits the gateway and the admin tooling, and media/provider
+children and exec hooks are never in that group — while
+`internal.sock` stays `0600` owned by the gateway uid and maps
+`SO_PEERCRED` pid/uid through the supervisor-recorded pid→role
+map, so only the supervised FallbackWorker's pid/uid pair may
+authenticate as `system:fallback_worker`. The two
+`internal.sock` layers are complementary, not redundant: `0600`
+refuses every foreign uid at `connect()` (the FallbackWorker's
+dedicated uid is admitted by a named-UID ACL the supervisor
+installs on the private mount and socket at spawn — never a
+group membership that would leak `admin.sock` reach), and the
+role map is what bars a compromised child that SHARES the
+gateway uid — a `phonebridge`-uid LineProvider passes the mode
+bit but its pid/uid pair is not the recorded `system:*` peer,
+so it cannot mint a worker identity. A compromised child
 outside both allowlists reaches NEITHER socket — it owns no
 admin surface and no `system:*` session to spoof. Restart
 reconciliation protocol: on ANY bus
@@ -2255,11 +2284,14 @@ status (mirrors the busctl commands used in Phase-0).
   - **headless pairing** (round 19; hciN scoping + crash backstop
     round 36, iteration-4 audit item 10): an in-container BlueZ
     `org.bluez.Agent1` rejects all pairing by default;
-    `admin.pair_window {line_id, duration_sec}` opens `Pairable` on
+    `admin.pair_window {line_id, duration_sec}` opens `Pairable`
+    and `Discoverable` on
     one adapter (by `adapter_mac`) and auto-confirms SSP within the
     window — no `docker exec bluetoothctl` per line. The kernel
     NOTIFIES the affected line-bundle supervisor of every window
-    open/close; the supervisor's force-clear of
+    open/close through the ordered writer's drained pair-window
+    commands (§4.5 — the writer owns all post-mutation dispatch);
+    the supervisor's force-clear of
     `Pairable`/`Discoverable` targets ONLY that line's own adapter,
     resolved through the kernel's authoritative `line_id ↔ hciN`
     map (the vhci-feeder reports the minted index over bundle IPC —

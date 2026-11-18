@@ -69,14 +69,16 @@ Four listener surfaces, one gateway daemon, shared in-process `LineManager` kern
 |---|---|---|---|
 | **Manager** | `wss://gw:7001/provider` | Line providers (LocalLine, RemoteLine) | `provider.*` (up), `line.*` (down) |
 | **APICallService** | `wss://gw:7002/agent` | AI agents | `agent.*`, `call.*` (up), `event.*` (down) |
-| **AdminService** | `unix:///run/phonebridge-private/admin.sock` (mode 0600) or `wss://gw:7004/admin` | Admin clients (phonebridgectl, admin MCP) | `admin.*` |
-| **InternalService** | `unix:///run/phonebridge-private/internal.sock` (mode 0600, never bind-mounted or network-exposed) | In-container service identities (`system:*`) | `agent.*`, `call.*` (up), `event.*` (down) |
+| **AdminService** | `unix:///run/phonebridge-private/admin.sock` (mode `0660`, group `phonebridge-admin`) or `wss://gw:7004/admin` | Admin clients (phonebridgectl, admin MCP) | `admin.*` |
+| **InternalService** | `unix:///run/phonebridge-private/internal.sock` (mode `0600` owned by the gateway uid + `SO_PEERCRED` pid→role map, never bind-mounted or network-exposed) | In-container service identities (`system:*`) | `agent.*`, `call.*` (up), `event.*` (down) |
 
 The internal listener is the ONLY socket family where a `system:*`
 `agent_id` may register (round 30, review-19 B1): it is bound
 inside the container filesystem, never bind-mounted out, and the
-adapter additionally verifies the peer's uid via `SO_PEERCRED`
-(root or the dedicated `phonebridge` service uid — anything else
+adapter additionally verifies the peer's pid/uid via `SO_PEERCRED`
+against the supervisor-recorded pid→role map
+(only the supervised worker entry — e.g. the FallbackWorker's
+dedicated uid — may register its `system:*` role; anything else
 is `UNAUTHORIZED` + close). A `system:*` identity presented on
 the agent, provider, admin, or any bind-mounted socket is
 `UNAUTHORIZED` — the reserved namespace exists to authenticate
@@ -1061,8 +1063,8 @@ identical framing code path (`websockets.unix_serve` —
 
 The agent-facing surface has no privileged mutations. Admin calls
 arrive on the **dedicated admin listener** —
-`unix:///run/phonebridge-private/admin.sock` (mode `0600`, group
-`phonebridge`) or the `wss://<host>:7004/admin` path for remote
+`unix:///run/phonebridge-private/admin.sock` (mode `0660`, group
+`phonebridge-admin`) or the `wss://<host>:7004/admin` path for remote
 tooling — never multiplexed onto the agent or provider sockets.
 **Admin auth (round 30):** the connection's first call MUST be
 `admin.auth {api_key}` → `{ok, server_time}`; the key's `admin`
@@ -1466,7 +1468,7 @@ state only, not key provisioning or bus plumbing):
    exclusive assignment = CLAIM -> moderator approval; private MCP
    server interface so the developer's trusted AI agent can admin.
    **Wire shape DECIDED (round 30):** admin scope rides a dedicated
-   listener (`admin.sock` UDS 0600 or `wss://…/admin`) with an
+   listener (`admin.sock` UDS `0660` group `phonebridge-admin` or `wss://…/admin`) with an
    `admin.auth {api_key}` handshake — see the `admin.*` namespace
    above for the full method table; `system:*` service identities
    are confined to the private `internal.sock` listener with
