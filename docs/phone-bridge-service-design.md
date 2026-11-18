@@ -2152,7 +2152,11 @@ children WITHOUT session-bus needs — each `vhci-feeder`, every
 exec wake hook — plus the FallbackWorker, whose own uid is what
 the `system:*` pid→role map records. The supervisor spawns them
 `setuid`-separated (or maps them through the container user
-namespace). Socket reachability plus the role map is what
+namespace) and ALWAYS calls `setgroups(0, NULL)` (or the
+equivalent supplementary-group reset) before `setuid` — default
+`initgroups()` behaviour for a same-uid child would silently
+re-inherit `phonebridge-admin` and defeat the exclusion below.
+Socket reachability plus the role map is what
 enforces the boundary: `admin.sock` lives in
 `/run/phonebridge-private/` mounted `0750
 root:phonebridge-admin` with the socket file itself `0660
