@@ -66,6 +66,7 @@ referenced sections.
 | round 30 (`SA_carbon_review_19` slice B2a — design-doc hardening) | Webhook HTTP client never follows `3xx` (redirect = delivery failure under the retry budget); `/var/lib/phonebridge-media` third volume + media quotas (`max_recording_sec`, per-line cap, delete-after-send, retention TTL, ENOSPC isolation from SQLite WAL); `restore_line` kernel compensation + single-transaction `lines`+`line_assignments` writes + hydration as last-resort reconciler; single mutation lock covers kernel call→drain→`bus.publish` on every adapter path (per-mutation FIFO); `forward_via_line` second-leg FSM (`enqueue` on busy, terminal on unreachable/`DIAL_REJECTED`, ~20 s budget, either-leg teardown); `answer_and_announce` decision-time eligibility (EXCLUSIVE or live `receive_inbound`, degrade `no_pickup`), WAV-only ref validated at `configure_line`, hangup only after MediaRouter drain + jitter budget; `record_and_telegram` bot token in SQLite secrets injected by supervisor, mandatory beep before record, dead-letter spool + restart resume; `/run/phonebridge/<line_id>.json` bound to call-instance id + deleted on teardown + stale-age rejection; sibling-liveness check precedes D-Bus-loss `call_state` reports (`dongle_lost` ordering, supervisor flush window); phone numbers PII-masked incl. exec-hook stdio, `DIAL_REJECTED.detail`, `phonebridgectl` (default masked, `--reveal`); `remove_line` → `INVALID_STATE` while referenced by another line's `forward_via_line`; exec-hook coalescing keyed per `(hook, line_id)` keeps latest payload (cross-line payloads never merge); `vhci.lock` on a host-shared path (bind-mount or host-side lock service) | §2.1, §4.5, §5.3-§5.4, §7, §10 |
 | round 31 (`SA_swe2_review_1` — 40/40 accepted, design batch 3) | `provider_bindings` becomes a persisted table (`channel_seq`, `last_seen_at`, heartbeat stamps) — `hydrate_lines` loads bindings DEAD (`ws_disconnected` + expired `orphan_deadline_at`) and the first `tick` runs the full orphan cascade unless a fresh `provider.register` supersedes; orphan cascade spelled atomically (UNREACHABLE → lease `network_error` teardowns → ticket/claim `provider_lost` cancels → ring/`external_call` reset → binding tombstone; heartbeat-down suspended while `ws_disconnected`); uplink overflow single policy — socket ALWAYS read, `0x02`/`0x03` processed normally, drop-NEWEST PCM only, `0x04` + `event.media_overflow` once per contiguous episode; mutation lock NARROWED to kernel mutation + drains (in-memory) — SQLite write-through and `bus.publish` ride a single ordered writer task preserving per-mutation FIFO, `restore_line` compensation re-enters the lock deadlock-free; `compensate_dial(line_id, assignment_id, lease_id)` binding-scoped saga entry (hangup-first `network_error`, no fabricated provider facts); `CallPhase.ANSWERING` internal accept phase; provider-stamp watermark — ping facts below the watermark are applied CLAMPED, state facts are deduped; `provider_call_id` exact ring identity + `RING_DEDUP_MIN_GAP_SEC` best-effort fallback; `record_and_telegram` gains mandatory `announcement_ref` + `max_recording_sec` policy fields; stale-surface refresh (four listeners, `LineSummary.assignment_id`, full method/event inventories, `remove_line` quiescent-only) | §2.2-§3.6, §4.2, §4.5, §5.2-§5.4, §6.3-§6.4, §6.6, §7, §9-§10 |
 | round 32 (`SA_swe2_review_2` — design batch 3) | `hangup_hold_sec` (default 10 s, bound 1–120) + `CallPhase.TERMINATING` — `call.hangup` parks an in-flight lease until provider `disconnected` or a kernel-side `network_error` lapse, only `ACQUIRED` grants end directly; pending-write marker + bounded admin wait + guarded `restore_line` (re-mutated record degrades to `config_stale` + admin alert, never a blind old-snapshot overwrite); `provider_bindings` = best-effort cache (failed write = `config_stale`, NO kernel compensation; `restore_line` is `LineAssignment`-only; `last_seen_at` debounced `>= 30 s`; stamp watermarks persisted; `channel_seq` reseeds `max(stored)+1`; hydrated-dead cascade suppresses external escalation hooks); orphan-cascade reason unified `provider_lost` + NO commands to dead/tombstoned bindings; DTMF `0x05` = egress-pacer PAUSE (frames buffer, flush keeps post-DTMF speech; `pre_dtmf_consumed`/`none` semantics); SCO MTU — fixed `hci_vhci.sco_mtu`, feeder answers the kernel's first `HCI_Read_Buffer_Size` locally (60 mSBC/48 CVSD), real `0x1005` proxied for learning only; `compensate_answer` ring-scoped reject vs `compensate_dial` lease-scoped hangup-first; `ingest_media_overflow` sole `event.media_overflow` source + `audio_lost` never arms pair TTL; external-call attribution = evidence-agreement rule; queue — terminal `grant_ttl_expired`, `seq` ordering, `DIAL_OUT`-only tickets, full re-check trigger set; idempotency TTL 3600 s + LRU 256 + `IDEMPOTENCY_CONFLICT`; `register_intent` identity-triple matching; `grant_expires_at` ACQUIRED-only; four hardware-identity fields on `lines` (`adapter_mac`, `paired_phone_mac`, `transport_profile` `loopback\|direct_mtls\|wireguard`, `line_home_country` display-region only) | §3.3-§3.5, §4.2, §4.5, §5.1-§5.4, §6.3-§6.4, §6.6, §9-§10 |
+| round 33 (iteration-1 architecture audit — contract re-freeze) | The `{accepted}` provider reply is distilled into a first-class kernel fact `ProviderCommandAck` ingested via `LineManager.ingest_command_ack` — `CommandAckKind` `dial\|answer`, `call_token` echo answer-only, `accepted:true` clears the armed handshake and records `provider_call_id` on the dial path, `accepted:false` applies the identical effects of `compensate_dial`/`compensate_answer` in one mutation; `CallLease.pending_command` + `provider_command_ack_deadline_at` arm atomically per down-channel dispatch (phase-coherent, DIALING/ANSWERING only), `provider_command_ack_sec` (default 2 s, ≤ 60 s) joins `TimeoutConfig`/`LineTimeouts`, `tick` is the ack-deadline backstop — the agent's `call.dial`/`call.accept` wire reply is withheld until the bounded handshake resolves (`PROVIDER_UNREACHABLE` on refusal/timeout/unreachable, no new error code); answer-pending ring sub-state — a consumed `call_token` never re-enters the fallback decision; unqualified sole-live-lease attribution requires positive evidence (`provider_call_id` and/or normalized `caller_id` present on both sides AND agreeing, else `external_call` mint); `ProviderBinding` carries durable `liveness_stamp_watermark`/`call_stamp_watermark` (monotone-max, persisted, inherited on reregister, `channel_seq` reseeds, `orphan_deadline_at` channel-local never durable); `WakeAudience` zero-live-subscriber fan-out (hooks-only, no envelope without hooks); adapter-owned listing `cursor` (XOR `offset`, fail-closed `INVALID_ARGUMENT`, kernel keeps `offset`/`limit`); `CallLease.media_epoch` (0 on `ACQUIRED`, ≥ 1 on call-bearing phases); provisioning validation hardens (unique `adapter_mac`, ISO 3166-1 `default_region`, pairing windows require `paired_phone_mac`, E.164 ASCII digit guard, `RedactedString` value-equality/hash) | contract.py, docs/api-contract.md, docs/specs/line-manager.md, §3.3-§3.5, §4.5, §5.2-§5.3 |
 
 ## §1. Service boundary
 
@@ -477,8 +478,8 @@ normal result, not an exception.
 | `agent.register_intent` | `{agent_id, token, intents[], profile?}` -> `{session_id}`; declarative wish resolved by the intent-resolver into a LineAssignment (§4) |
 | `call.acquire` | `{session_id, intent, line_id?, profile?, enqueue?, idempotency_key?}` -> `{granted:true, line_id, lease_id, expires_at}` or `{granted:false, queued:true, ticket_id, position}` or `{granted:false, free_lines[]}`; `free_lines:[]` = nothing available - routine result, the client retries itself. `expires_at` is the grant TTL deadline (round 20). Optional `enqueue` joins the FIFO queue (§3.4); a non-empty `(method, session_id, idempotency_key)` triple scopes retry dedup — the keyspace is partitioned by METHOD (round 31), so the same key under `call.acquire`/`call.dial`/`call.accept`/`call.claim_exclusive` names independent operations; `idempotency_key` bounded 1-128 chars, round 23) |
 | `call.release` | `{session_id, lease_id?, assignment_id?}` - exactly ONE target (round 22): `lease_id` ends the ephemeral lease (undialed grant frees the line; in-flight call is hung up first); `assignment_id` is the durable-binding path - the exclusive owner voluntarily releases its LineAssignment. `OWNER_MISMATCH` on a foreign target; zero or BOTH targets = `INVALID_ARGUMENT` (round 24) |
-| `call.dial` | `{session_id, lease_id, number, country, idempotency_key?}` -> `{lease_id, media_endpoint, media_token}`; strict E.164 + ISO alpha-2 cross-check BEFORE the line (round 12) - `DIAL_REJECTED` with a typed `data.reason`, otherwise the validated E.164 passes to `line.dial` unchanged. A same-key retry returns the STORED result — including media credentials whose one-shot `media_token` may already be consumed; fresh credentials come only from `call.reattach_media` (round 31) |
-| `call.accept` | `{session_id, call_token, idempotency_key?}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired or the token was already consumed, `OWNER_MISMATCH` as applicable (round 21). The minted lease starts in the internal `answering` phase (round 31 — `line.answer` in flight, no wire spelling) and reconciles to `active`/`disconnected` from provider facts; the same stored-result/consumed-token idempotency rule as `call.dial` applies |
+| `call.dial` | `{session_id, lease_id, number, country, idempotency_key?}` -> `{lease_id, provider_call_id?, media_endpoint, media_token}`; strict E.164 + ISO alpha-2 cross-check BEFORE the line (round 12) - `DIAL_REJECTED` with a typed `data.reason`, otherwise the validated E.164 passes to `line.dial` unchanged. The wire reply is withheld until the provider's bounded command handshake resolves (round 33 — `provider_command_ack_sec` window; it waits ONLY for the ack, never for cellular alerting): refusal, timeout or provider-unreachable answers `PROVIDER_UNREACHABLE`, an accepted ack records `provider_call_id` on the lease and mirrors it to the agent. A same-key retry returns the STORED result — including media credentials whose one-shot `media_token` may already be consumed; fresh credentials come only from `call.reattach_media` (round 31) |
+| `call.accept` | `{session_id, call_token, idempotency_key?}` - atomic: issues the lease, answers the ring, attaches media -> `{lease_id, line_id, media_endpoint, media_token}`; `STALE_TOKEN` if the accept window expired or the token was already consumed, `OWNER_MISMATCH` as applicable (round 21). The minted lease starts in the internal `answering` phase (round 31 — `line.answer` in flight, no wire spelling) and reconciles to `active`/`disconnected` from provider facts; the wire reply likewise waits for the bounded `line.answer` handshake (round 33 — `PROVIDER_UNREACHABLE` on a refused/timed-out/unreachable ack, the burned token never re-enters the fallback decision), and the same stored-result/consumed-token idempotency rule as `call.dial` applies |
 | `call.claim_exclusive` | `{session_id, line_id, idempotency_key?}` -> `{claim_id, status:"pending_approval"}` — durable exclusivity by CLAIM + moderator approval in admin (never self-granted, §4.2); resolution arrives asynchronously as `event.claim_resolved` (+`event.assignment_granted` on approval) |
 | `call.cancel_acquire` | `{session_id, ticket_id}` -> `{ok}` — withdraw a queued ticket; idempotent no-op for an id that is not a LIVE ticket of the calling session (never-queued, granted, cancelled or expired ids all resolve `{ok}`), `OWNER_MISMATCH` only for a LIVE foreign ticket (round 31) |
 | `call.reattach_media` | `{session_id, lease_id}` -> `{lease_id, media_endpoint, media_token}` — fresh AGENT media credentials for a live lease after its media socket dropped while the control channel lived (round 25); the new pair supersedes and invalidates the prior agent token |
@@ -597,14 +598,35 @@ alternatively carries
 echoed back to the agent's `call.dial` result so both sides' call
 logs name the same leg). `line.revoke` exists but is **admin-only**
 (round 10f). The `{accepted}` reply on `line.dial`/`line.answer`
-is awaited by the adapter with a ~2 s deadline (round 23, Saga
-compensation; mechanism pinned round 31, SA_swe2_review_1 item 5):
-`{accepted:false}` / timeout / transport error MUST drive the
+is awaited by the adapter with a bounded deadline (round 23, Saga
+compensation; mechanism pinned round 31, SA_swe2_review_1 item 5;
+window made configurable round 33 — the line's effective
+`provider_command_ack_sec`, default 2 s, `>0` and ≤ 60 s, patched
+through `admin.configure_line{timeouts}` like every other knob).
+From dispatch until the handshake resolves the lease carries
+`pending_command` (`"dial"`/`"answer"`, phase-coherent) together
+with the kernel-clock `provider_command_ack_deadline_at` — armed
+and cleared atomically (round 33); while armed the lease is
+excluded from `state_snapshot` omission reconciliation and from
+unqualified sole-live-lease attribution. A received reply is
+distilled into `ProviderCommandAck` — the FIRST-CLASS kernel fact
+of the handshake (round 33, `command` is the closed
+`CommandAckKind` vocabulary and `call_token` echoes the ring token
+on answer only) — and reported through
+`LineManager.ingest_command_ack{line_id, assignment_id}`:
+`{accepted:true}` clears the armed pair and, on the dial path,
+records `provider_call_id` on the lease; `{accepted:false}` or a
+deadline lapse applies the identical effects the matching
+compensation entry carries. `{accepted:false}` / timeout /
+transport error on the ADAPTER side MUST drive the
 kernel's binding-scoped `compensate_dial(line_id, assignment_id,
 lease_id)` entry — an adapter/kernel-internal call, never a wire
 method and never a fabricated `provider.call_state` fact (the
 provider reported nothing; a synthesized `disconnected` would lie
-about an observation that never happened). `compensate_dial`
+about an observation that never happened) — and `tick` enforces
+the stamped ack deadline as the kernel backstop applying the same
+terminal effects when no report ever arrives (round 33).
+`compensate_dial`
 enqueues a best-effort `line.hangup{lease_id}` FIRST — air-side
 teardown of the call leg that may have physically reached the
 phone — then ends the lease with `network_error` in the same
@@ -627,8 +649,11 @@ provider's `disconnected` or the `ring_drain_ttl_sec` lapse
 resolves the drain, because the physical inbound ring can outlive
 the failed answer; `compensate_dial` is lease-scoped
 hangup-first by contrast — it frees the line in the same step.
-The kernel answers the agent's `call.dial`/`call.accept` without
-waiting for this reply.
+The kernel answers the agent's `call.dial`/`call.accept` only
+once the bounded handshake resolves (round 33 — it waits ONLY
+for the command ack, never for cellular alerting or answer; a
+refused, timed-out or unreachable handshake answers
+`PROVIDER_UNREACHABLE` with no new error code minted).
 
 ### §3.6 Events (`event.*` down to agents)
 
@@ -755,8 +780,12 @@ LineAssignment is removed): the provider attachment record
 (`assignment_id` in the *binding* space, `caps`, `profile`,
 `liveness`, `connected_at`, `last_seen_at`,
 `heartbeat_interval_ms`, `heartbeat_degraded_after`,
-`heartbeat_down_after`, `channel_seq`, `orphan_deadline_at` — the
-heartbeat stamps and `channel_seq` are frozen at register time, and
+`heartbeat_down_after`, `channel_seq`, `orphan_deadline_at`,
+`liveness_stamp_watermark`, `call_stamp_watermark` — the
+heartbeat stamps and `channel_seq` are frozen at register time,
+the two stamp watermarks are durable monotone-max values restored
+by `hydrate_lines` and inherited line-scoped across
+reregistration (round 33, §4.5), and
 the record persists on the `provider_bindings` table since round 31,
 §4.5 — `liveness`/`orphan_deadline_at` still re-derive on load
 because the sockets they describe died with the process).
@@ -772,7 +801,12 @@ teardown.
 - **Exclusive binding = claim + approval** (round 10d): the agent
   files a CLAIM REQUEST; a moderator approves it in the admin
   surface - it is NOT self-granted. Admin may also assign directly
-  (override path).
+  (override path). The claimable-line predicate is SHARED (round
+  33): `call.get_lines(intent:"exclusive_line")` and
+  `call.claim_exclusive` evaluate the same eligibility —
+  `claimable:true`, `mode:shared_pool`, and a live provider
+  binding — so the discoverability listing can never offer a line
+  a claim would reject.
 - Inbound on an owned line: owner is woken via hooks ->
   `RINGING_LOCKED` scoped to the owner -> `call.accept(call_token)`;
   non-owner accept = `OWNER_MISMATCH`; non-owner dial =
@@ -851,10 +885,14 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   `assignment_id`, `line_id`, `caps_json`, `profile`, `meta_json`,
   `connected_at`, `last_seen_at`, `channel_seq`,
   `heartbeat_interval_ms`, `heartbeat_degraded_after`,
-  `heartbeat_down_after`: the persisted identity card lets a
+  `heartbeat_down_after`, `liveness_stamp_watermark`,
+  `call_stamp_watermark` (round 33 — the two durable
+  monotone-max stamp domains named as real columns: liveness/
+  refresh stamps vs call-state/ring stamps, see the watermark
+  rule below): the persisted identity card lets a
   restarted kernel distinguish "provider that re-registers" from
   "provider that never came back" and keeps the line-scoped stamp
-  watermark across restarts; `liveness`/`orphan_deadline_at` are
+  watermarks across restarts; `liveness`/`orphan_deadline_at` are
   NOT durable columns — they re-derive on load, see the
   hydrated-dead rule below) and `escalation_hooks`.
 - **Memory-only (never persisted):** `CallLease`, `QueueTicket`,
@@ -967,8 +1005,15 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
   coalesce window, never one row write per `provider.ping`; the
   kernel's in-memory copy still updates per fact (liveness math
   reads memory, never the row). The persisted row ALSO carries
-  the provider-stamp watermark (the highest applied
-  `observed_at`/`checked_at` per binding) so a restart cannot
+  the provider-stamp watermarks (round 33 — two independent
+  durable monotone-max domains: `liveness_stamp_watermark` for
+  ping/heartbeat refresh facts, applied CLAMPED below the
+  watermark so a late stamp never rewinds the recorded
+  high-water mark, and `call_stamp_watermark` for call-state/ring
+  facts, where a below-watermark stamp is dropped as a replayed
+  duplicate; both are restored by `hydrate_lines` and inherited
+  line-scoped by a reregistered binding — never reset by
+  supersession) so a restart cannot
   re-apply replayed facts below the watermark, and `channel_seq`
   reseeds as `max(stored) + 1` across restarts — a hydrated
   generation is never re-issued, so a stale socket's facts can
@@ -1115,7 +1160,17 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
 2. Gateway consults LineAssignment: owner exists -> wake owner via
    configured hooks; no owner -> event to the live
    `receive_inbound`-intent sessions (round 22 - a shared pool
-   never broadcasts rings to dial_out-only agents).
+   never broadcasts rings to dial_out-only agents). **Zero
+   live-subscriber routing (round 33):** when the fan-out resolves
+   to ZERO live sessions the ring emits a `wake`-audience envelope
+   ONLY if at least one escalation hook is configured — socket
+   fan-out is empty by construction and only the hooks' delivery
+   leg consumes it — and with no hooks configured NO
+   `incoming_call` envelope is emitted at all (the ring still waits
+   out `accept_window_sec` so a sleeping agent can wake and
+   answer); `wake` is legal on `incoming_call`/`missed_call` only,
+   never widened to `broadcast`, and the wake payload carries the
+   masked caller, never the live one-shot `call_token`.
 3. `event.incoming_call{line_id, call_token, caller_id?,
    expires_at}` is emitted (RFC 3339 absolute deadline since
    round 22 - a relative `expires_in_ms` would skew by outbox
@@ -1137,6 +1192,18 @@ I/O inside a kernel mutation (CODING_HAZARDS rule 4).
    an `event.call_state_changed.state`), reconciles to `active` or
    `disconnected` from the provider's reports, and is covered by
    `max_call_duration_sec` like any other post-acquire phase.
+   **Answer-pending ring (round 33):** consuming the `call_token`
+   parks the ring in a kernel-internal `answer_pending` sub-state
+   for the duration of the `line.answer` handshake — the burned
+   token stays burned, `tick` MUST NOT run the fallback decision
+   while the handshake is armed inside its
+   `provider_command_ack_sec` window, a direct `decide_fallback`
+   on an answer-pending ring is `INVALID_STATE`, and no later path
+   can re-enter the decision for the same physical ring: a failed
+   handshake ends the `ANSWERING` lease `network_error` and keeps
+   the line `RINGING_LOCKED` under the drain rule, an accepted
+   handshake commits the ring (the ack itself never advances the
+   lease phase — only provider call-state facts do).
 5. **Accept window: default 30 s; ALL timeouts and windows are
    admin-configurable** (round 10a).
 6. Timeout -> the line's `fallback_policy` (§5.3). **Ring-drain rule
@@ -1917,21 +1984,32 @@ handset itself): the line goes `BUSY` with reason `external_call`,
 no agent lease is minted and no PipeWire bridge is attached (audio
 stays on the phone), and the gateway sends NO `Hangup` — the line
 returns to `FREE` when the provider reports the call gone.
-**Attribution evidence rule (round 32, SA_swe2_review_2 item 10):**
+**Attribution evidence rule (round 32, SA_swe2_review_2 item 10;
+positive-evidence floor pinned round 33):**
 an update carrying NEITHER `call_token` nor `lease_id` on a line
 NOT in `RINGING_LOCKED` is correlated against the line's live
 leases BEFORE the external mint — with EXACTLY ONE live
 candidate (e.g. a `DIALING` lease whose provider omitted the
-`lease_id` echo) every attributable field the update carries must
+`lease_id` echo) the bind requires POSITIVE evidence (round 33):
+at least one of `provider_call_id` (vs the lease's recorded
+handle) or normalized `caller_id` (vs the dialed number or the
+ring's recorded caller) must be present on BOTH sides AND agree —
+`caller_id` is legal on a post-ring update precisely as this
+bounded correlation evidence, never to re-mint caller identity.
+Every attributable field the update carries must
 AGREE with the lease's evidence: `provider_call_id` vs the
 lease's recorded handle, `caller_id` vs the dialed number, and
 the direction implied by the lease's phase. A field ABSENT on
-either side is unverifiable and never blocks correlation, but a
+either side is unverifiable and never blocks correlation — but
+an update carrying NO corroborating evidence on either side can
+never bind an external call to an agent lease — and a
 field PRESENT on both sides that DISAGREES is conflicting
 evidence: the kernel correlates NOTHING, mints the
 `external_call` hold for the call the update truly describes, and
 leaves the unmatched lease on its normal deadline/orphan-grace
-expiry — never ended early by evidence it cannot answer for. Two
+expiry — never ended early by evidence it cannot answer for. A
+lease with an armed `pending_command` is additionally excluded
+from attribution while its handshake is open (round 33). Two
 or more live candidates with no token make the update
 unattributable and it is likewise minted `external_call` rather
 than guessed. The
@@ -1983,7 +2061,13 @@ status (mirrors the busctl commands used in Phase-0).
     `list_provider_bindings`, plus the store-facing
     `hydrate_lines`/`restore_line` pair (§4.5) — every listing is
     paginated at `MAX_LIST_PAGE` 64 rows per page (round 30/31,
-    same 64-row/64 KiB list-page bound as the agent listings) —
+    same 64-row/64 KiB list-page bound as the agent listings) and
+    the wire MAY carry the adapter-owned `cursor` param INSTEAD of
+    `offset` (round 33 — mutually exclusive on one request,
+    malformed/expired/foreign cursor is a fail-closed
+    `INVALID_ARGUMENT`, never a silent rewind to offset 0; the
+    kernel surface keeps `offset`/`limit` only and the opaque
+    token never crosses the kernel boundary) —
     the agent-facing
     `LineManager` deliberately exposes no privileged mutations.
     `admin.provision_line` (round 28) is the "create" half of the
@@ -2010,7 +2094,7 @@ status (mirrors the busctl commands used in Phase-0).
   heartbeat_degraded_after?, heartbeat_down_after?,
   fallback_accept_ttl_sec?, ring_drain_ttl_sec?,
   max_call_duration_sec?, clear_max_call_duration?,
-  hangup_hold_sec?}` (round 22;
+  hangup_hold_sec?, provider_command_ack_sec?}` (round 22;
   `fallback_accept_ttl_sec`
   added round 23, ~10 s default, bounds the FallbackWorker accept
   deadline; `ring_drain_ttl_sec` ~60 s default bounds the
@@ -2019,7 +2103,9 @@ status (mirrors the busctl commands used in Phase-0).
   86400 s when set, and bounds `record_and_telegram` recording
   length; `hangup_hold_sec` — round 32, SA_swe2_review_2 item 1 —
   bounds the `terminating` hold of §5.2, default 10 s, tight
-  `1..120` bound). All timeout values are finite numbers (`NaN`/`Infinity`
+  `1..120` bound; `provider_command_ack_sec` — round 33 — bounds
+  the `line.dial`/`line.answer` command-acknowledgement handshake,
+  default 2 s, tight `>0..60` bound). All timeout values are finite numbers (`NaN`/`Infinity`
   rejected at the boundary) with sane upper bounds per field (round
   25). `heartbeat_interval_sec` is floored at 0.001 s
   (millisecond granularity — the wire unit is ms) and stamped as

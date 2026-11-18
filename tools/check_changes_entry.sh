@@ -145,6 +145,24 @@ if fragment:
             )
             print('{"status":"fail","reason":"changes_fragment_no_frontmatter"}')
             sys.exit(1)
+        # round 33 (iteration-1 audit item 32): a fragment that opens
+        # '---' but never closes it used to pass whenever a
+        # '## Spec impact' heading sat inside the would-be
+        # frontmatter - the malformed shape fails explicitly.
+        fm_lines = body.lstrip().splitlines()
+        fm_end = next(
+            (i for i, l in enumerate(fm_lines[1:], 1)
+             if l.strip() == "---"),
+            None,
+        )
+        if fm_end is None:
+            print(
+                f"FAIL: {frag} has an unterminated '---' frontmatter "
+                "block - see .changes/_template.md",
+                file=sys.stderr,
+            )
+            print('{"status":"fail","reason":"changes_fragment_unterminated_frontmatter"}')
+            sys.exit(1)
         if not re.search(r"(?m)^##\s+Spec impact\s*$", body):
             print(
                 f"FAIL: {frag} has no '## Spec impact' section - "

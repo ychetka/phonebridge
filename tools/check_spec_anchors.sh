@@ -68,12 +68,18 @@ if [ -n "$BASE" ]; then
   if git merge-base "$BASE" HEAD >/dev/null 2>&1; then
     CHANGED_PATHS=$(git diff --name-only "$BASE...HEAD") \
       || { echo "cannot diff $BASE...HEAD" >&2; exit 1; }
+    # The three-dot diff compares merge-base...HEAD, so deleted-anchor
+    # detection (round 33) must read the spec files at the SAME
+    # merge-base commit - comparing against BASE itself would count
+    # anchors deleted on the base side as this PR's deletions.
+    SPEC_MERGE_BASE=$(git merge-base "$BASE" HEAD)
   else
     CHANGED_PATHS=$(git diff --name-only "$BASE" HEAD) \
       || { echo "cannot diff $BASE HEAD" >&2; exit 1; }
+    SPEC_MERGE_BASE="$BASE"
   fi
 fi
-export CHANGED_PATHS SPEC_BASE_SET
+export CHANGED_PATHS SPEC_BASE_SET SPEC_MERGE_BASE
 
 CHANGES_DIR="$CHANGES" TOP_DIR="$TOP" python3 - <<'PYEOF'
 import os, re, sys
@@ -115,36 +121,54 @@ def slugify(title):
     s = re.sub(r"[^\w\- ]", "", title.lower())
     return s.replace(" ", "-")
 
+def anchors_in_lines(lines):
+    """Requirement anchors produced by a line iterable - shared by
+    the working-tree reader and the merge-base reader (round 33,
+    deleted-anchor detection) so both sides slug identically."""
+    anchors = set()
+    for line in lines:
+        m = re.match(r"^###\s+(Requirement:\s*.+?)\s*$", line)
+        if not m:
+            continue
+        # GitHub slugs the whole heading text - the
+        # "Requirement:" prefix is part of the anchor.
+        base = slugify(m.group(1))
+        anchor, n = base, 0
+        while anchor in anchors:
+            n += 1
+            anchor = f"{base}-{n}"
+        anchors.add(anchor)
+    return anchors
+
 def requirement_anchors(path):
     """All requirement anchors present in a spec file, including
     GitHub's -1/-2 dedup suffixes for repeated heading names."""
-    anchors = set()
     try:
         with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                m = re.match(r"^###\s+(Requirement:\s*.+?)\s*$", line)
-                if not m:
-                    continue
-                # GitHub slugs the whole heading text - the
-                # "Requirement:" prefix is part of the anchor.
-                base = slugify(m.group(1))
-                anchor, n = base, 0
-                while anchor in anchors:
-                    n += 1
-                    anchor = f"{base}-{n}"
-                anchors.add(anchor)
-    except FileNotFoundError:
+            return anchors_in_lines(fh)
+    except OSError:
         return None
-    return anchors
 
 def parse_impact(path):
     """Extract Spec impact entries from a fragment, or None."""
-    lines = open(path, encoding="utf-8").read().splitlines()
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError as exc:
+        # An unreadable entry (permissions, a .md directory) used to
+        # crash the checker with a traceback - fail closed instead
+        # (round 33, iteration-1 audit item 32).
+        return [("malformed", f"unreadable fragment: {exc}")]
     # frontmatter occupies [0 .. second '---']; the section lives after
     end = next(
         (i for i, l in enumerate(lines[1:], 1) if l.strip() == "---"),
         None,
     ) if lines and lines[0].strip() == "---" else None
+    if lines and lines[0].strip() == "---" and end is None:
+        # A fragment that opens frontmatter but never closes it used
+        # to pass when a '## Spec impact' heading happened to sit in
+        # the would-be frontmatter body - the malformed shape is now
+        # reported explicitly (round 33, iteration-1 audit item 32).
+        return [("malformed", "unterminated '---' frontmatter")]
     body = lines[end + 1:] if end is not None else lines
     start = next(
         (i for i, l in enumerate(body) if re.match(r"^##\s+Spec impact\s*$", l)),
@@ -159,7 +183,20 @@ def parse_impact(path):
                 entries.append(("malformed", "duplicate '## Spec impact' section"))
             break
         s = line.strip()
-        if not s or s.startswith("#"):
+        # Hidden markdown cleanup (round 33, iteration-1 audit item
+        # 32): BOM/zero-width marks and HTML comments used to fall
+        # into the 'malformed' bucket or, worse, hide content from a
+        # reader - strip the invisible prefix and skip comment lines
+        # deterministically.
+        s = s.lstrip("\ufeff\u200b\u200e\u200f")
+        if not s or s.startswith("#") or s.startswith("<!--"):
+            continue
+        # An inline trailing comment after an entry is allowed:
+        # '- adds: docs/specs/x.md#anchor  # note' parses as the
+        # entry. The strip needs a preceding space so an anchor's own
+        # '#' separator is never eaten.
+        s = re.sub(r"\s+#.*$", "", s).strip()
+        if not s:
             continue
         m = re.match(r"^-\s*(\w+):\s*(\S+)\s*$", s)
         if m:
@@ -173,6 +210,7 @@ def parse_impact(path):
 files = sorted(
     f for f in os.listdir(changes_dir)
     if f.endswith(".md") and not f.startswith("_") and f != "README.md"
+    and os.path.isfile(os.path.join(changes_dir, f))
 )
 if not files:
     print("no pending .changes entries - nothing to check")
@@ -183,6 +221,9 @@ anchor_cache = {}
 # --base per-file coverage (round 32, swe-2 item 27): spec files
 # anchored by fragments that are themselves inside the diff.
 anchored_specs_by_diff = set()
+# removes anchors declared by in-diff fragments - used by the
+# deleted-anchor detection below (round 33).
+declared_removes = set()
 for name in files:
     # repo-relative fragment path, matched against the --base diff set
     frag_rel = os.path.relpath(os.path.join(changes_dir, name), top)
@@ -232,6 +273,8 @@ for name in files:
             continue
         if changed_fragments is not None and frag_rel in changed_fragments:
             anchored_specs_by_diff.add(spec_rel)
+            if op == "removes":
+                declared_removes.add((spec_rel, anchor))
         spec_abs = os.path.join(top, spec_rel)
         if spec_rel not in anchor_cache:
             anchor_cache[spec_rel] = requirement_anchors(spec_abs)
@@ -280,6 +323,37 @@ if changed_specs is not None:
             ".changes fragment anchors it - add an adds/modifies/"
             "removes entry"
         )
+
+# Deleted-anchor detection (round 33, iteration-1 audit item 32):
+# a requirement heading REMOVED from a spec file in this diff must be
+# declared by a 'removes:' entry in an in-diff fragment - otherwise a
+# silent spec deletion passes all existence checks (no adds/modifies
+# entry points at a gone anchor, and the per-file coverage rule only
+# needs SOME anchor). The comparison reads the spec at the SAME
+# merge-base the three-dot diff used, so deletions that already
+# happened on the base side are not attributed to this PR.
+if changed_specs is not None and os.environ.get("SPEC_MERGE_BASE"):
+    import subprocess
+    mb = os.environ["SPEC_MERGE_BASE"]
+    for spec_rel in sorted(changed_specs):
+        old = subprocess.run(
+            ["git", "show", f"{mb}:{spec_rel}"],
+            capture_output=True, text=True, cwd=top,
+        )
+        if old.returncode != 0:
+            continue  # spec file added by this PR - nothing deleted
+        gone = anchors_in_lines(old.stdout.splitlines())
+        cur = anchor_cache.get(spec_rel)
+        if cur is None:
+            cur = requirement_anchors(os.path.join(top, spec_rel))
+        gone -= cur or set()
+        declared = {a for s, a in declared_removes if s == spec_rel}
+        for anchor in sorted(gone - declared):
+            problems.append(
+                f"{spec_rel}: requirement anchor '#{anchor}' deleted "
+                "in this diff but no in-diff .changes fragment "
+                "declares a 'removes:' entry for it"
+            )
 
 for p in problems:
     print(f"FAIL: {p}", file=sys.stderr)

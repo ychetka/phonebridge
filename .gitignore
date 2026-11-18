@@ -17,3 +17,12 @@ queue/
 .devin/hooks.v1.json
 .devin/archive/
 .devin/migration_ok
+
+# Iteration audit exchange artifacts are reviewer-local working
+# files - never committed (round 33).
+.audit_exchange/
+
+# Top-level generated review artifacts (SA_* dumps, monitor.log)
+# are machine-local reviewer output - never committed (round 33).
+/SA_*
+/monitor.log

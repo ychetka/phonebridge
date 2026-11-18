@@ -168,14 +168,30 @@ agent `0x16 SCO_STATE`:
   agent chops outgoing HCI SCO packets into the REAL
   `wMaxPacketSize`-sized isoc frames of the selected
   altsetting. **`SCO_ALT_UNSUPPORTED` is a deliverable signal
-  (round 30):** when the descriptor exposes no usable
-  altsetting — or the feeder-side geometry readback mismatches —
-  the failure MUST reach a stateful owner: the feeder reports it
-  through the bundle IPC to the LineProvider (surfaced as a
-  `provider.*` teardown/dial-refusal fact, never a silent reject),
-  the agent reports it as `STATUS{LINK_DEGRADED,
-  detail:"sco_alt_unsupported"}` when it is the side that cannot
-  select an altsetting, and it joins the media-health event
+  (round 30; ownership pinned round 33):** the FEEDER is the
+  stateful owner of every sync-setup failure — it is the only
+  component holding both the negotiated air profile and the
+  descriptor geometry, so `SCO_ALT_UNSUPPORTED` resolves on ITS
+  side as a sync-setup refusal (pre-`Synchronous Connection
+  Complete` or failed geometry readback): the state transition is
+  sync-setup → refused → Interface 1 back to `altsetting 0` with
+  isoc transfers cancelled, and the fact reaches the LineProvider
+  through the bundle IPC as a `provider.*` teardown/dial-refusal
+  fact, never a silent reject. When the AGENT is the side that
+  cannot select an altsetting its obligation is bounded: it
+  reports `STATUS{LINK_DEGRADED,
+  detail:"sco_alt_unsupported"}` within one heartbeat interval of
+  giving up selection (never waits for the next periodic
+  heartbeat), leaves Interface 1 at `altsetting 0`, and the
+  feeder owns the teardown from there — a dead control session
+  suppresses the STATUS delivery but the altsetting-0 default
+  below still applies. **Timeout (round 33):** altsetting
+  selection is not open-ended — a descriptor scan completing
+  without a usable altsetting reports immediately, and a
+  successful `open:true` followed by no valid SCO traffic is
+  already bounded by the `SCO_RX_STARVATION` gate (~500 ms
+  during an active call); no third "selecting forever" state
+  exists. The signal joins the media-health event
   vocabulary below — an undeliverable signal would strand the
   sync connection half-open.
   `rx_pkt_len`/`tx_pkt_len`
@@ -305,7 +321,24 @@ boundaries, so on `loopback` each record is prefixed with
 (`kind·nonce·seq·ts·payload`), and the parser bounds
 `rec_len` before reading — a desynchronized stream must fail
 fast exactly like the control channel's `MAX_CTRL_FRAME_LEN`
-rule.
+rule. **Hard bound and fail-closed recovery (round 33):** the
+cap is `MAX_MEDIA_FRAME_LEN = 4096` — the same 4 KiB ceiling as
+`MAX_CTRL_FRAME_LEN`, generous against a real record (≤ ~300 B:
+11 B header + one HCI SCO packet ≤ 258 B) — and `rec_len`
+outside `[11, MAX_MEDIA_FRAME_LEN]` declares the stream
+DESYNCHRONIZED: there is no resync scan on a stream socket (a
+misaligned byte offset can fake a valid header at any offset),
+so the receiver counts the framing error, closes the media
+socket, and lets the agent's reconnect path re-authenticate a
+fresh stream — the malformed connection is NEVER kept alive on
+the hope the next record parses. On reconnect BOTH sides reset
+the media-channel state wholesale: `media_seq` freshness,
+the jitter-buffer occupancy/watermark edges, and the isoc
+plumbing restart from the new session's `HELLO_ACK` — no
+buffered frames, sequence expectations, or watermark state may
+cross a socket boundary. An EOF (orderly FIN) on the stream is
+the same teardown path — a half-closed media socket is not a
+recoverable record state.
 
 `uint8 kind · uint32 BE session_nonce · uint16 BE media_seq ·
 uint32 BE ts_ms · payload` — one record per media frame (round
@@ -644,7 +677,7 @@ passively from the event stream it forwards:
 | `SCO_FRAMING_ERROR` | media record shorter than the HCI SCO header, `payload_len` mismatch, or handle 0 / out of range |
 | `SCO_PEER_MISMATCH` | frame from a source address failing the tunnel peer check (WireGuard `/32` or mTLS-bound identity; on `loopback` the accept()-time `SO_PEERCRED` uid is the identity) — distinct from `SCO_SESSION_MISMATCH` (round 21) |
 | `SCO_SESSION_MISMATCH` | frame with a `session_nonce` other than the current HELLO_ACK-issued value — stale pre-reset session traffic (round 20) |
-| `SCO_ALT_UNSUPPORTED` | selected air profile cannot be carried: the descriptor offers no usable altsetting, or the dongle's declared `sco_data_packet_len` mismatches the negotiated profile — the sync path is refused/torn down and the fact is reported to the LineProvider (round 30 — the deliverable form of the old "call rejected" note) |
+| `SCO_ALT_UNSUPPORTED` | selected air profile cannot be carried: the descriptor offers no usable altsetting, or the dongle's declared `sco_data_packet_len` mismatches the negotiated profile — the feeder owns the refusal/teardown and the fact is reported to the LineProvider (round 30 — the deliverable form of the old "call rejected" note; owner/state/timeout pinned round 33) |
 
 These are loud degradation signals feeding the line state machine —
 the kernel-side symptom (`hci0: SCO packet for unknown connection
