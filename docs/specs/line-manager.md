@@ -1935,3 +1935,37 @@ the kernel's runtime bookkeeping.
    gating replayed facts through the quarantine, so a stale
    binding that outlived the process cannot re-enter service or
    replay pre-crash stamps.
+
+### Requirement: Iteration-5 audit dispatch and reinit (round 37)
+
+The fifth external architecture audit (iteration-5, issue #93)
+pinned two dispatch/supervision invariants; each is normative
+for the kernel's out-path and its stack-restart handling.
+
+1. **Every `system:*` dispatch rides the ordered writer.**
+   The kernel NEVER emits a `system:*` command on a direct
+   kernel→socket path: fallback activation and every other
+   `system:*` item is drained
+   `KERNEL→WRITER→internal.sock→FB` through the same ordered
+   writer (and the same write-through-then-dispatch ordering)
+   as drained provider commands — the kernel owns the
+   `fallback_accept_ttl_sec` deadline and the bounded
+   ack-retry, the writer owns the dispatch itself, and
+   `event.fallback_triggered` stays the informational mirror.
+2. **Stack-restart reconciliation is a cascading re-init.**
+   On ANY stack-supervisor restart of a shared member
+   (`bluetoothd`, `oFono`, `PipeWire`, `WirePlumber`, either
+   `dbus-daemon`) the supervisor restarts the member AND
+   reports the restart to the kernel; the kernel's
+   reconciliation then emits re-init items THROUGH THE ORDERED
+   WRITER covering the full dependent set, not only the
+   kernel's own books: the managed `Agent1` re-registers on
+   the fresh `org.bluez`, every line-bundle supervisor
+   re-attaches its `LineProvider`/`vhci-feeder` D-Bus watches
+   to the new bus, the per-line
+   `phonebridge_uplink`/`phonebridge_downlink` virtual
+   PipeWire nodes are re-created, and the kernel re-verifies
+   its `line_id`-to-`hciN` map entries against the
+   post-restart adapter set — a restarted stack member can
+   never leave dead bus watches, missing virtual nodes or an
+   un-registered pairing agent behind.

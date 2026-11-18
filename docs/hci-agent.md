@@ -66,14 +66,21 @@ The agent is deliberately *dumb* — it owns hardware and moves frames:
   verify the returned MAC against the configured `adapter_mac` —
   the MAC check is POST-CLAIM because `BD_ADDR` is not present
   in USB descriptors and only the live controller answers
-  `0x1009`. **Wedge recovery (round 36):** an agent that died
+  `0x1009`. **Wedge recovery (round 36; restore scoped
+  remote-only round 37, iteration-5 audit item 4):** an agent that died
   mid-claim can leave the dongle detached from `btusb` or with
   Interface 1 still on a non-zero altsetting; on STARTUP the
   agent MUST detect that wedged state (device present on
   `usb_path` but unclaimed-by-anyone / `btusb` not bound, or a
-  stale non-zero altsetting) and restore `btusb` BEFORE
+  stale non-zero altsetting) and, on a remote/dedicated agent
+  host, restore `btusb` BEFORE
   re-attempting the claim sequence — a clean re-enumeration
-  baseline, never a claim built on a half-owned device.
+  baseline, never a claim built on a half-owned device. On the
+  co-located `loopback` profile the same detection applies but
+  the recovery target is "unbound": the agent resets the
+  wedged device WITHOUT re-binding `btusb` (§3 — a re-bound
+  `btusb` would register a physical `hciN` in the shared
+  `init_net` that the container's `bluetoothd` could adopt).
 - **HCI relay** — forwards HCI frames between the dongle and the
   container: commands/ACL/events on the **control channel** (TCP), SCO
   audio on the **media channel** (UDP on tunnel profiles /
@@ -123,13 +130,19 @@ wire contract above assumes:
   the transfer pool;
 - malformed isoc input fails closed (counted + dropped, never
   forwarded), and shutdown cancels/drains in-flight transfers in a
-  bounded window before releasing the claim and restoring `btusb`;
+  bounded window before releasing the claim and restoring
+  `btusb` — the restore is REMOTE-ONLY (round 37, iteration-5
+  audit item 4): on the co-located `loopback` profile the agent
+  MUST NOT re-bind `btusb` on shutdown or wedge recovery, and
+  the device stays userspace-claimed or unbound by policy (§3);
 - acceptance is gated on real hardware (x86_64 AND ARM):
   `usb_path` enumeration + VID/PID/serial/MAC verification,
   dongle-scoped `btusb` detach, interfaces 0/1 claim, `HCI Reset` →
   Command Complete, SCO altsetting selection, continuous isoc RX,
   paced outbound SCO, complete-record preservation, safe
-  cancel/drain, `btusb` restore, and measured CPU/jitter/lost
+  cancel/drain, `btusb` restore verified on the remote profile
+  with `btusb` verified UNBOUND on `loopback`, and measured
+  CPU/jitter/lost
   frames — the full gate is enumerated in ADR-0004.
 
 ## §2. Wire protocol (V1)
@@ -955,6 +968,20 @@ like the control peer, and the `session_nonce` still binds
 frames to the live control session (§2). No wireguard/tls
 stack is involved — loopback
 is the one-host trust domain made explicit.
+**`btusb` is never re-bound on `loopback` (round 37,
+iteration-5 audit item 4):** the dongle on a co-located host
+is administratively assigned to the container, and the
+container shares the host's `init_net` — a `btusb` re-bind on
+agent exit or wedge recovery would register a PHYSICAL `hciN`
+in `init_net` carrying the same `BD_ADDR` as the line's
+`/dev/vhci` adapter, and the container's own `bluetoothd`
+could then adopt the physical dongle (same-kernel adoption is
+the defect this rule closes). The agent therefore keeps the
+device unbound — or bound to a stub driver — so the
+shared-kernel `bluetoothd` can never claim it, and the
+deployment installs a rule keeping the physical MAC unmanaged
+by the container's `bluetoothd`; `btusb` restore semantics
+apply only on remote/dedicated agent hosts (§1, ADR-0004).
 
 **`direct_mtls` and NAT rebind (round 30):** classic DTLS 1.2
 binds its security context to the 4-tuple, so a NAT mapping
@@ -1017,7 +1044,17 @@ dongle:
                                      # `ATTR{authorized}="0"` or a
                                      # driver `unbind` rule keyed on
                                      # usb_path, else the host hciX
-                                     # reappears mid-reset)
+                                     # reappears mid-reset). There is
+                                     # NO btusb-restore on the
+                                     # co-located `loopback` profile
+                                     # (round 37, iteration-5 audit
+                                     # item 4): unbound/stub-bound is
+                                     # the steady state — a re-bound
+                                     # btusb would mint a physical
+                                     # hciN in the shared init_net
+                                     # the container bluetoothd could
+                                     # adopt; restore applies only on
+                                     # remote/dedicated hosts (§3)
   reset:
     on_start: false
     on_watchdog: true                # power-cycle on DONGLE_DEAD —
