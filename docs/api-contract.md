@@ -731,6 +731,11 @@ lives one layer below, in the agent's `transport_profile` tunnel
 contract above is unchanged — it now binds worker processes that are
 always container-local; a smart-remote LineProvider remains a
 documented alternative for links too hostile for HCI-over-IP.
+Confirmed binding (round 36, iteration-4 audit item 16): on the
+agent wire every media frame carries the `session_nonce` minted by
+`HELLO_ACK`, binding it to the live control session — a media
+frame that does not echo the current nonce is rejected on every
+transport profile (`docs/hci-agent.md` §2).
 
 ## Binary media protocol (ADR-02, round 11)
 
@@ -789,7 +794,7 @@ identical framing code path (`websockets.unix_serve` —
    `timestamp_ms` (stream-relative), then the payload. **Sequence
    and clock bases (round 30):** `seq` is ONE shared `uint24`
    counter per direction covering ALL frame kinds (`0x01` audio and
-   the `0x02`/`0x03`/`0x04`/`0x05` control frames alike) — a control frame
+   the `0x02`/`0x03`/`0x04`/`0x05`/`0x06` control frames alike) — a control frame
    consumes a sequence value like any other frame so gap detection
    cannot be fooled by an interleaved control burst; it wraps
    modulo 2^24. `timestamp_ms` is `uint32` milliseconds counted
@@ -856,26 +861,48 @@ identical framing code path (`websockets.unix_serve` —
      watermark and budget — it never stacks a second pause or
      orphans the first watermark. `0x05` is
      consumed at the router and never forwarded onward;
+   - `0x06` DTMF-END/resume — exactly **8 B**, provider→router only
+     (round 36, iteration-4 audit item 13): the explicit resume
+     half of the `0x05` pause pair — on receipt the router resumes
+     uplink-ring egress pacing the same way the trailing
+     timestamped `0x02` flush does (the `0x02` still owns the
+     `pre_dtmf_consumed` watermark discard; `0x06` is the
+     deterministic "tones done" signal so a pause ends by
+     declaration, not only by flush arrival or budget lapse). A
+     `0x06` received with NO active pause is a no-op, and like
+     `0x05` it is consumed at the router and never forwarded
+     onward;
    - any other length is a framing violation — the receiving side
      closes the socket with `1002 Protocol Error`.
-   **Direction scoping (round 32, SA_swe2_review_2 item 9):**
-   `0x04` OVERFLOW is legal ONLY router→producer and `0x05`
-   DTMF-START ONLY provider→router — the same frame carried on the
-   WRONG direction of a socket (an agent-originated `0x05`, a
-   producer-originated `0x04`, a `0x05`/`0x04` relayed onward) is a
+   **Direction scoping (round 32, SA_swe2_review_2 item 9; `0x06`
+   added round 36):** `0x04` OVERFLOW is legal ONLY router→producer
+   and the DTMF control pair `0x05`/`0x06` ONLY provider→router —
+   the same frame carried on the
+   WRONG direction of a socket (an agent-originated `0x05`/`0x06`, a
+   producer-originated `0x04`, a `0x05`/`0x06`/`0x04` relayed onward) is a
    protocol violation: the receiving side closes the socket with
    `1002 Protocol Error`. `0x01`/`0x02`/`0x03` are legal in both
    directions of their own socket — direction-scoped control
    frames are the only flags with a mandated direction.
    **DTMF implementation ownership (round 35, issue #89 — no wire
-   change):** the DTMF implementation is owned by the provider:
+   change; probe semantics + `0x06` edge round 36, iteration-4
+   audit item 13):** the DTMF implementation is owned by the
+   provider:
    the control plane stays `call.send_dtmf -> line.send_dtmf`, and
    the provider MAY choose a verified out-of-band path (oFono
-   `SendTones` / `AT+VTS`) when the stack proves support, falling
-   back to provider-side in-band synthesis otherwise — the
-   `0x05`/`0x02` frames above remain the in-band COORDINATION
-   contract in every case (pause the pacer, drain the watermark);
-   the MediaRouter never synthesizes tones.
+   `SendTones` / `AT+VTS`) when the stack proves support — where
+   "mechanism-verified" is a PER-SESSION PROBE, not a guarantee:
+   a successful `SendTones`/`AT+VTS` return only proves the modem
+   channel accepted the command on this session/stack attachment,
+   it does NOT prove the tones reached the cellular network —
+   falling
+   back to provider-side in-band synthesis otherwise is unchanged,
+   and the provider may re-probe per session; the
+   `0x05`/`0x06`/`0x02` frames above remain the in-band COORDINATION
+   contract in every case (pause the pacer, resume on `0x06`,
+   drain the watermark) — the `0x05`-pause/`0x06`-resume pair is
+   the LineProvider→MediaRouter control edge of the media
+   protocol; the MediaRouter never synthesizes tones.
    Flush is in-band — `clear_uplink_buffer`/`flush_audio_out` map to flag `0x02`, no control/media race. A `0x02` frame carries NO audio payload; it has PRIORITY over queued audio frames on the same lease — on receipt the bridge discards every still-queued uplink audio frame for that lease whose `timestamp_ms` is ≤ the flush's `timestamp_ms` (round 25 watermark semantics; round 28 clock-domain fix — the `0x02` `timestamp_ms` is a watermark IN THE AGENT'S UPLINK STREAM CLOCK: the `timestamp_ms` value of the last agent `0x01` frame the LineProvider consumed before it started DTMF synthesis (the `0x05` pause) — never a router-local wall-clock stamp). `timestamp_ms = 0` on a `0x02` is a REAL watermark (round 31, SA_swe2_review_1 item 34 — the first stream frame, stamped `0`, is a legitimate "consumed" stamp and MUST be dropped like any other ≤ watermark frame); the "no frame was consumed yet" case is NOT expressible in the watermark slot — it is declared on the dedicated `pre_dtmf_consumed` field of the `0x05` DTMF-START frame above, whose `none` value makes the trailing flush discard every frame that was queued BEFORE the `0x05` arrived (all unheard by construction — post-`0x05` arrivals survive). A provider that emits a post-DTMF `0x02` without a preceding `0x05` applies its own `timestamp_ms` watermark — a lone drain, never a pause watermark. **Discard scope (round 29, review-1 B7):** "still-queued" means frames buffered inside the MediaRouter's uplink ring that have NOT yet been written to the LineProvider socket by the egress pacer — a frame already delivered to the provider is out of the router's reach and cannot be recalled, while a frame still in the ring with `timestamp_ms` > the watermark SURVIVES the flush untouched. The watermark is a provider-consumed stamp in the agent-stream clock domain, so it may lag behind the freshest frame sitting in the ring — that gap is exactly the audio the provider never heard and the flush is meant to drop. Agent speech submitted during or after the synthesis pause — post-`0x05` arrivals, including frames stamped above the watermark — SURVIVES the post-DTMF flush (round 32, SA_swe2_review_2 item 8): the flush's discard set is only the unheard pre-DTMF prefix, and the paused pacer resumes draining the surviving tail when synthesis ends; the earlier "mute consumes the buffered audio" reading would erase brand-new speech the provider never asked to drop — an agent that wants its queued audio abandoned emits its own `0x02` barge-in. **Agent-originated `0x02` — barge-in (round 30):** the AGENT's own `0x02` (barge-in — the user/agent wants its queued TTS abandoned NOW, e.g. the callee started speaking) uses the RESERVED marker `timestamp_ms = 0xFFFFFFFF` and means DISCARD ALL still-queued uplink frames for the lease regardless of timestamp — the whole preloaded ring is flushed, not just the pre-watermark prefix. The marker value is deliberately outside the legal stream-clock range the serial-comparison rule could ever match (a real `0x01` stamp never reaches 2^32−1 inside a call), so a barge-in can never be misread as a provider DTMF watermark and vice versa: the provider's `0x02` always carries a real watermark in the agent's stream clock, the agent's `0x02` always carries the discard-all marker. Both directions are still consumed at the router and never forwarded onward.
 
 3. **Resource bounds (round 14, CODING_HAZARDS rule 7; revised round 25):**

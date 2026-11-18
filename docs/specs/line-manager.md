@@ -1898,3 +1898,39 @@ pinned the following edges; each is normative and mirrored on
     answered-lease path — never `missed_call`/`no_pickup`
     semantics — and owes no terminal announcement on the
     forwarding hop.
+
+### Requirement: Iteration-4 audit domain-state pins (round 36)
+
+The fourth external architecture audit (iteration-4, issue #91)
+pinned the following domain-state edges; each is normative for
+the kernel's runtime bookkeeping.
+
+1. **The kernel holds the authoritative `line_id`-to-`hciN`
+   runtime map.** The dynamically allocated kernel `hciN` index
+   (and the virtual adapter address `bluetoothd` exposes off it)
+   is recorded per line in kernel domain state: the vhci-feeder
+   reports the index it minted through `write-then-read`
+   discovery over the bundle IPC to the line-bundle supervisor,
+   which forwards the hciN-map + liveness facts to the kernel.
+   The map is the authoritative binding used to scope
+   `admin.pair_window` to the line's OWN adapter, to target the
+   bundle supervisor's `Pairable`/`Discoverable` force-clear at
+   that adapter only (hciN-scoped — a per-line clear can never
+   race a sibling line's open window), and to bind the oFono
+   modem for the line. The kernel MUST notify the bundle
+   supervisor of every pair-window open/close so the force-clear
+   is notified and adapter-scoped, and BlueZ's native
+   `PairableTimeout`/`DiscoverableTimeout` are armed as the crash
+   backstop.
+2. **Persisted `provider_bindings` rows are revalidated at
+   hydration, never auto-active.** A stored binding is
+   QUARANTINED on load — the existing hydrated-dead rule
+   (`ws_disconnected`, already-expired orphan deadline,
+   tombstone cascade on the first `tick`) IS the quarantine —
+   and it never becomes live on the row alone: re-activation
+   requires a fresh `provider.register`/`reregister` hello on a
+   NEW live socket minting a fresh `channel_seq`. The durable
+   `liveness_stamp_watermark`/`call_stamp_watermark` columns keep
+   gating replayed facts through the quarantine, so a stale
+   binding that outlived the process cannot re-enter service or
+   replay pre-crash stamps.
