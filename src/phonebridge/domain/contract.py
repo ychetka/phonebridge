@@ -3731,13 +3731,17 @@ class CallLease(ContractModel):
             raise ValueError("an ACQUIRED lease carries no provider_call_id")
         if self.phase is CallPhase.ACQUIRED and self.media_epoch != 0:
             raise ValueError("an ACQUIRED lease has media_epoch 0")
-        if self.phase in (
-            CallPhase.DIALING,
-            CallPhase.ANSWERING,
-            CallPhase.ALERTING,
-            CallPhase.ACTIVE,
-            CallPhase.TERMINATING,
-        ) and self.media_epoch < 1:
+        if (
+            self.phase
+            in (
+                CallPhase.DIALING,
+                CallPhase.ANSWERING,
+                CallPhase.ALERTING,
+                CallPhase.ACTIVE,
+                CallPhase.TERMINATING,
+            )
+            and self.media_epoch < 1
+        ):
             raise ValueError("a call-bearing phase requires media_epoch >= 1")
         return self
 

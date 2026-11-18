@@ -6512,8 +6512,12 @@ def test_round33_call_lease_evidence_and_media_epoch() -> None:
     CallLease(**_lease_base(), phase=CallPhase.ENDED, media_epoch=3)
     # A recorded provider handle rides a call-bearing lease as
     # durable correlation evidence.
-    lease = CallLease(**_lease_base(), phase=CallPhase.ACTIVE, media_epoch=1,
-                      provider_call_id="/ofono/voicecall01")
+    lease = CallLease(
+        **_lease_base(),
+        phase=CallPhase.ACTIVE,
+        media_epoch=1,
+        provider_call_id="/ofono/voicecall01",
+    )
     assert lease.provider_call_id == "/ofono/voicecall01"
     # Negative epochs are impossible.
     with pytest.raises(ValidationError):
