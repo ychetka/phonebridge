@@ -451,8 +451,9 @@ root:phonebridge-admin`), and `/run/phonebridge-internal/`
 `phonebridge-internal` is a dedicated empty-population group
 containing ONLY the FallbackWorker's dedicated uid) holding
 `internal.sock` (`0660 gateway-uid:phonebridge-internal`; the
-mount's group reachability admits the gateway and the
-FallbackWorker, nothing else — see the uid-separation paragraph
+gateway enters by OWNERSHIP on the `gateway-uid` mount/dir,
+group membership is the FallbackWorker's reach path only —
+nothing else gets in — see the uid-separation paragraph
 in §9). The
 split is load-bearing, not cosmetic: mounting the whole
 `/run/phonebridge` tree into a provider/utility pod would smuggle
