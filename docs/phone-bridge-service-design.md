@@ -256,7 +256,14 @@ Canonical deployment profile — **dedicated telephony host/VPS**
 - a `phonebridge doctor` pre-flight check (entrypoint) verifies
   `/dev/vhci` presence, `hci_vhci` module state, and the ABSENCE of
   a live host `bluetoothd`, and fails fast with remediation text —
-  never a cryptic `EAFNOSUPPORT` mid-startup.
+  never a cryptic `EAFNOSUPPORT` mid-startup. It ALSO verifies the
+  session-stack prerequisites (round 35, issue #89): a valid
+  `XDG_RUNTIME_DIR`, session D-Bus reachability, and the
+  PipeWire/WirePlumber lifecycle (the user-session services that
+  own `org.pipewire.Telephony` are startable and reachable) — a
+  headless container without a session bus fails the PipeWire
+  surface silently otherwise, so the check is part of the same
+  fail-fast pre-flight, not a runtime surprise.
 
 Optional hardened profile — **shared workstation / multi-tenant**
 (round 25, deferred past MVP): the same OCI image inside a
@@ -1720,9 +1727,19 @@ Design consequences:
   calls on ONE line (call waiting) share the audio path — the node
   proves "line has media", the binding to a call is via
   `line_id`+`lease_id`, never via the node.
-- In-band DTMF (SendTones is broken on the bus, §5.5) is owned
-  ENTIRELY by the **LineProvider** (round 22, review-10 MEDIUM-1 -
-  it owns the uplink endpoint): it synthesizes the PCM tones and
+- DTMF is owned ENTIRELY by the **LineProvider** (round 22,
+  review-10 MEDIUM-1 - it owns the uplink endpoint; control-plane
+  ownership pinned round 35, issue #89): the control plane stays
+  `call.send_dtmf -> line.send_dtmf`, and the provider is the
+  implementation owner that CHOOSES the mechanism — a **verified
+  out-of-band path** (oFono `SendTones` / `AT+VTS` over the modem
+  channel) whenever the stack proves support, otherwise
+  **provider-side in-band synthesis** with uplink muting and the
+  `0x05`/`0x02` coordination semantics below (the baseline today,
+  since `SendTones` is broken on this bus, §5.5). The
+  `MediaRouter` NEVER synthesizes DTMF — its role is limited to
+  pausing the egress pacer on `0x05` and draining the watermarked
+  frames on `0x02`. For the in-band path the provider synthesizes the PCM tones and
   mixes them into `phonebridge_uplink_<line_id>`, substituting them
   for the agent's uplink PCM for the tone duration (round 20) so a
   tone never races the agent's audio stream; tone ~70 ms, pause
@@ -1797,6 +1814,17 @@ control-TCP. A QUIC/multiplexed-streams unification is a V2 track.
 
 ### §6.6 MediaRouter pacing and buffer policy (round 23 ADR-A; pacing direction corrected round 24)
 
+- **Placement (round 35, issue #89):** the MediaRouter runs INSIDE
+  the gateway process for V1 — a separate media process is a
+  possible later hardening ADR, not the V1 baseline — but it lives
+  on a **dedicated media worker/event-loop layer**, decoupled from
+  the control plane: it never takes the kernel mutation lock
+  (pairing/configuration arrives through the `MediaAllocator`,
+  `ingest_media_state` and `ingest_media_overflow` ingresses, and
+  facts return via the outbox path) and it NEVER performs SQLite
+  I/O — durable writes stay on the kernel's ordered writer task.
+  A stalled control mutation can therefore never starve the 20 ms
+  pacer, and a media-side fault can never wedge a line mutation.
 - **Uplink (agent → phone):** the MediaRouter reads the agent's
   media socket CONTINUOUSLY at socket speed (non-blocking drain —
   the reader loop NEVER sleeps on a timer, and it NEVER stops
@@ -1963,6 +1991,21 @@ Three primitives only - no broker in v1:
    TTL sweep (default 5 min) so stale wake files never pile up
    (tmpfs keeps wake payloads — which can carry caller PII — off
    durable storage entirely, round 28).
+
+**Wake delivery is bounded best effort, not a broker (round 35,
+issue #89).** None of the three primitives is a durable
+at-least-once channel: socket fan-out delivers only to sessions
+live at publish time inside the bounded outbox — a full or dead
+socket queue drops the event rather than spooling it; webhook
+delivery retries inside the bounded budget that ends at the
+event's own deadline (`expires_at - 1 s` for ring-class events);
+exec/file-drop hooks run under their concurrency cap, coalescing
+and TTL rules. A missed wake NEVER wedges the call and never
+cancels the fallback path: the ring continues to be bounded by
+`accept_window_sec`, and on expiry the configured `fallback_policy`
+fires with its own `fallback_accept_ttl_sec` bound — the wake
+channel accelerates a sleeper, it is not load-bearing for the
+ring's lifecycle.
 
 Audience routing (round 23): `event.idle_alert` is `admin`-audience
 only — socket fan-out delivers it to sessions holding the `admin`
@@ -2331,6 +2374,18 @@ status (mirrors the busctl commands used in Phase-0).
    zero kernel unknown-handle errors after feeder gating. The four
    protocol invariants it exposed are locked in
    `docs/hci-agent.md` §2.
+4. **Cellular health telemetry (POST-MVP / backlog, round 35 —
+   issue #89):** HFP exposes modem indicators (oFono/`CIND`-derived
+   signal strength, phone battery, network registration,
+   roaming/service availability) that a pure `LineState`/liveness
+   view cannot see — a Bluetooth link can stay up while the phone
+   loses cellular service. This is an OBSERVABILITY and
+   admin-health surface first (surfaced for
+   monitoring/diagnostics), **not** an M1 line-eligibility gate:
+   grants/dials are still decided by occupancy and liveness, and no
+   new wire contract is added for it unless one is already
+   specified — the field belongs to a later observability pass,
+   not the M1 contract freeze.
 
 ### Questions resolved by developer ruling 2026-11-12
 
