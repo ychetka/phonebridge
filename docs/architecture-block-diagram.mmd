@@ -21,7 +21,7 @@ flowchart LR
             API["APICallService<br/>UDS / WSS<br/>agent.* call.* event.*"]
             MGR["Manager<br/>UDS / WSS<br/>provider.* up · line.* down"]
             ADM["AdminService<br/>admin.sock 0660 group / WSS<br/>admin.*"]
-            INT["InternalService<br/>internal.sock 0600<br/>system:* via SO_PEERCRED"]
+            INT["InternalService<br/>internal.sock 0660 group<br/>system:* via SO_PEERCRED + pid→role"]
         end
 
         KERNEL["LineManager + LineAdminKernel<br/>single-writer domain kernel<br/>(assignments · bindings · leases · queues)"]
@@ -82,6 +82,7 @@ flowchart LR
     WRITER -->|"validated pair window"| AG1
     WRITER -->|"drained provider commands"| MGR
     WRITER -->|"drained lifecycle +<br/>pair-window commands"| SUP
+    WRITER -->|"drained system:* commands"| INT
     SUP ==>|"supervises"| LP
     SUP ==>|"supervises"| VF
     LP <-->|"bundle IPC: liveness · SCO facts"| VF
@@ -91,7 +92,8 @@ flowchart LR
     STACKSUP ==>|"supervises"| OF
     STACKSUP ==>|"supervises"| PW
     STACKSUP ==>|"supervises"| FB
-    STACKSUP -->|"shared-fate restart →<br/>full reconciliation trigger"| KERNEL
+    STACKSUP -->|"cascade re-init<br/>after stack restart"| SUP
+    STACKSUP -->|"shared-fate restart → reconciliation trigger<br/>kernel re-init via ordered writer:<br/>Agent1 re-register · LP/VF re-attach<br/>· PipeWire nodes re-created"| KERNEL
 
     %% ===== typed events / wake =====
     WRITER -->|"drained typed envelopes"| BUS
@@ -149,13 +151,13 @@ flowchart LR
     class DB,WRITER,BTLIB,PBLIB,MEDLIB storage
     class LEGEND legend
 
-    %% blue = JSON-RPC control (edges 0-23)
-    linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 stroke:#1d4ed8,stroke-width:2px
-    %% green = typed events / wake (edges 24-29)
-    linkStyle 24,25,26,27,28,29 stroke:#047857,stroke-width:2px
-    %% purple = packetized media (edges 30-37)
-    linkStyle 30,31,32,33,34,35,36,37 stroke:#6d28d9,stroke-width:2px
-    %% orange = HCI/SCO tunnel (edges 38-41)
-    linkStyle 38,39,40,41 stroke:#c2410c,stroke-width:2px
-    %% gray = D-Bus / storage (edges 42-51)
-    linkStyle 42,43,44,45,46,47,48,49,50,51 stroke:#475569,stroke-width:2px,stroke-dasharray:6 4
+    %% blue = JSON-RPC control (edges 0-25)
+    linkStyle 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25 stroke:#1d4ed8,stroke-width:2px
+    %% green = typed events / wake (edges 26-31)
+    linkStyle 26,27,28,29,30,31 stroke:#047857,stroke-width:2px
+    %% purple = packetized media (edges 32-39)
+    linkStyle 32,33,34,35,36,37,38,39 stroke:#6d28d9,stroke-width:2px
+    %% orange = HCI/SCO tunnel (edges 40-43)
+    linkStyle 40,41,42,43 stroke:#c2410c,stroke-width:2px
+    %% gray = D-Bus / storage (edges 44-53)
+    linkStyle 44,45,46,47,48,49,50,51,52,53 stroke:#475569,stroke-width:2px,stroke-dasharray:6 4

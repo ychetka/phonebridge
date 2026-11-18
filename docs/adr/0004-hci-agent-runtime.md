@@ -79,11 +79,25 @@ one process, one audited unsafe surface.
   HCI SCO reassembly is counted and dropped, never forwarded
   (consistent with the wire contract's framing rules).
 - Shutdown cancels and drains in-flight transfers inside a bounded
-  window, releases the claim, and restores `btusb`. Startup runs
+  window, releases the claim, and — on remote/dedicated agent
+  hosts only — restores `btusb` (issue #93, iteration-5 audit
+  item 4: `btusb` re-attach is REMOTE-ONLY. On the co-located
+  `loopback` profile the dongle is administratively assigned to
+  the container, which shares `init_net` — re-binding `btusb`
+  would register a PHYSICAL `hciN` in `init_net` carrying the same
+  `BD_ADDR` as the line's `/dev/vhci` adapter, and the container's
+  own `bluetoothd` could then claim the physical dongle. A
+  loopback agent therefore MUST NOT re-bind `btusb` on shutdown
+  or wedge recovery: the device stays userspace-claimed or
+  unbound by policy, and the deployment keeps the physical MAC
+  unmanaged by the container's `bluetoothd`). Startup runs
   the symmetric **wedge recovery** (issue #91, iteration-4 audit
   item 15): the agent detects a dongle left detached from `btusb`
-  or on a stale non-zero altsetting by a previous unclean exit and
-  restores `btusb` BEFORE re-attempting the claim sequence, so a
+  or on a stale non-zero altsetting by a previous unclean exit —
+  on a remote host it restores `btusb` BEFORE re-attempting the
+  claim sequence, on the `loopback` profile it detects the same
+  wedge but resets the device WITHOUT re-binding `btusb`
+  (unbound is the loopback steady state) — so a
   crashed predecessor never leaves the device half-owned.
 
 ### Hardware acceptance gate
@@ -111,7 +125,10 @@ must demonstrate, on both x86_64 and an ARM target:
    outbound SCO to the eSCO service interval;
 6. preserve complete HCI SCO records end to end and expose
    per-packet `status`/`actual_length`;
-7. cancel/drain callbacks safely on stop and restore `btusb`;
+7. cancel/drain callbacks safely on stop and — verified on the
+   remote profile — restore `btusb`; the `loopback` profile is
+   verified to leave `btusb` UNBOUND on stop and wedge recovery
+   (issue #93, iteration-5 audit item 4);
 8. report CPU/jitter/lost-frame measurements within the documented
    media budget.
 
