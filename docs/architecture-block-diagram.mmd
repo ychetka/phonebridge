@@ -1,8 +1,10 @@
 %% phonebridge - deployment architecture (canonical Mermaid source, issue #89).
 %% Rendered copies: docs/architecture-block-diagram.svg / .png.
 %% Regenerate (mermaid-cli):
-%%   mmdc -i docs/architecture-block-diagram.mmd -o docs/architecture-block-diagram.svg -b white -p puppeteer-config.json
-%%   mmdc -i docs/architecture-block-diagram.mmd -o docs/architecture-block-diagram.png -b white --size 2600 -s 2 -p puppeteer-config.json
+%%   mmdc -i docs/architecture-block-diagram.mmd -o docs/architecture-block-diagram.svg -b white
+%%   mmdc -i docs/architecture-block-diagram.mmd -o docs/architecture-block-diagram.png -b white --size 2600 -s 2
+%% If your Chromium sandbox setup needs it, pass your own puppeteer
+%% config via -p <file> (not committed to this repository).
 flowchart LR
     subgraph EXT["EXTERNAL CLIENTS AND SUBSCRIBERS"]
         direction LR
@@ -99,7 +101,7 @@ flowchart LR
     BTD <-->|"Bluetooth HFP + SCO"| PHONE
 
     %% ===== HCI/SCO tunnel =====
-    HA <-->|"control + media channels per transport_profile<br/>wireguard / direct_mtls: control TCP + media UDP<br/>loopback: connected SOCK_STREAM UDS<br/>HELLO{line_id, token, usb_path, adapter_mac}<br/>→ HELLO_ACK{session_nonce}"| VF
+    HA <-->|"control + media channels per transport_profile<br/>wireguard / direct_mtls: control TCP + media UDP<br/>loopback: connected SOCK_STREAM UDS<br/>HELLO{line_id, token, agent_version,<br/>dongle:{usb_path, adapter_mac}, caps}<br/>→ HELLO_ACK{accepted, heartbeat_interval_ms,<br/>server_time, session_nonce}"| VF
     VF -->|"HCI write"| VHCI
     VHCI -->|"kernel hciN"| BTD
     HA <-->|"USB claim · isoc SCO"| DONGLE

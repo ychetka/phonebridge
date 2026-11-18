@@ -21,6 +21,10 @@ the rule that requires one).
   Rust + libusb (Bumble/pyusb demoted to protocol reference and dev
   tooling; narrow audited `IsoPump` FFI boundary). Issue #89.
 
-Earlier architectural decisions ADR-01/02/03 predate this directory
-and live as the recorded decision history inside
-`docs/phone-bridge-service-design.md`; they are not renumbered.
+Earlier architectural decisions ADR-01/02/03 predate this directory:
+they are formal-ish legacy design decisions recorded inside
+`docs/phone-bridge-service-design.md` and are not renumbered. The
+`ADR-A` / `ADR-B` / `ADR-24.x` identifiers that appear elsewhere in
+the docs (e.g. `docs/api-contract.md`, `docs/hci-agent.md`) are
+informal design notes from specific review rounds, not ADRs in this
+sequence; they stay inline where they were written.
