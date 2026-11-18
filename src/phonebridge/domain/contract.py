@@ -188,6 +188,7 @@ __all__ = [
     "MediaToken",
     "MediaTransport",
     "MissedCallEvent",
+    "MissedCallWakeEvent",
     "NoPickupFallback",
     "PairWindowRequest",
     "PairWindowResponse",
@@ -1862,7 +1863,17 @@ received. Every OTHER issue instant keeps mint-time arming:
 and the ``provider.reregister`` re-pair count a FRESH window from
 the reissue instant - those pairs are minted onto an already-live
 call with no command handshake to wait on, and a role that never
-re-attaches counts exactly like one that detached. ``tick()``
+re-attaches counts exactly like one that detached.
+Ack-arming is PER-ROLE and disarm-only (round 35,
+iteration-3 audit item 18): the ``{accepted: true}``
+handshake arms the window ONLY for roles not yet attached -
+a role whose ``media.auth`` already landed before the ack
+resolved (a fast connect inside the
+``provider_command_ack_sec`` window) is already live, so
+arming is a no-op for it and the ack can never start a
+countdown against an attached socket. The pair therefore
+dies only when a role is still unattached
+``MEDIA_PAIR_TTL_SEC`` after its own arming point. ``tick()``
 ends the lease with ``CallEndReason.NETWORK_ERROR`` on lapse
 (see :meth:`LineManager.ingest_media_state`)."""
 
@@ -1880,12 +1891,25 @@ kernel-second spelling of the media-frame ``DTMF_PAUSE_BUDGET_MS``
 media framing; design §6.4): the value is sized so the LARGEST
 legal ``call.send_dtmf`` workload - :data:`MAX_DTMF_DIGITS` = 32
 digits including ``,``/``w``/``W`` pause chars - fits inside the
-budget, the pacer resumes autonomously when no trailing ``0x02``
-flush arrives within it, and a second ``0x05`` re-arms the budget
-rather than stacking pauses. A pause observed LONGER than this
-window is a media-fault signal: the MediaRouter treats it exactly
-like a detached role (``ingest_media_state`` ``attached:false``
-path), never reads it as ordinary in-call silence."""
+budget, and a second ``0x05`` re-arms the budget
+rather than stacking pauses. Exhaustion semantic (round
+35, iteration-3 audit item 22 - ONE behavior everywhere,
+superseding the stale "pacer resumes autonomously"
+wording the media docs once carried): a pause observed
+LONGER than this window is a media-fault signal - the
+MediaRouter reports the provider role detached
+(``ingest_media_state`` ``attached:false`` path), the
+``MEDIA_PAIR_TTL_SEC`` re-attach window arms, and the
+lease ends ``network_error`` if no fresh provider-role
+``media.auth`` rebinds inside it. A pause whose ``0x02``
+flush lands BEFORE the budget lapses resumes forwarding
+and contributes NOTHING to detach accounting - only a
+still-armed pause lapse reports the detach, so repeated
+legal tone sequences (each ``0x05`` re-arms a fresh
+budget per agent ``send_dtmf`` segment, bounded by
+:data:`MAX_DTMF_DIGITS`) never accumulate into a
+phantom fault; the router never reads a pause as
+ordinary in-call silence either."""
 
 UNMATCHED_CALL_SAFETY_SEC: float = 3600.0
 """Safety-net deadline for a kernel record a provider fact left
@@ -1903,9 +1927,16 @@ keep tracking. ``tick`` releases the line
 ``network_error`` (a kernel-side lapse fact, never a fabricated
 provider ``disconnected``) so a missed teardown fact can never
 wedge the line ``BUSY`` forever. A hold minted WITH a
-correlation handle needs no fallback: its
-``provider_call_id``/burned ``call_token`` binds the later
-``disconnected`` that ends it."""
+correlation handle (round 35, iteration-3 audit item 9) is
+covered too - its ``provider_call_id``/burned ``call_token``
+binds the later ``disconnected`` that ends it, AND it arms the
+same deadline REFRESHED on every provider fact that binds to
+the handle (a live reported call keeps itself alive; a
+terminal fact lost in flight is swept within one window of
+the last report), plus ``state_snapshot`` reconciliation: a
+handle absent from an authoritative snapshot releases the
+hold. Only the UNMATCHED hold - no handle to refresh against -
+rides the flat mint-time deadline alone."""
 
 MAX_WAKE_HOOKS_PER_LINE: int = 16
 """Bound on :attr:`LineAssignment.wake_hooks` (round 34,
@@ -1923,7 +1954,10 @@ the kernel keeps for a line's :meth:`ingest_call_state` dedup
 entry per call identity (``lease_id`` on a qualified update,
 ``call_token`` on ring-correlated facts, ``provider_call_id``
 otherwise, plus a shared ``_unqualified`` bucket for facts
-carrying none). A line's live call set is small - a lease plus a
+carrying none - whose dedupe unit is the ``(stamp, state)``
+PAIR so same-stamp distinct states are a transition, not a
+repeat (round 35, iteration-3 audit item 8)). A line's live call
+set is small - a lease plus a
 ring plus an external hold - so 64 entries is generous headroom
 for rapid handsets churning call identities; the table is
 FIFO-evicted at the cap (evicting only forfeits dedup of facts
@@ -2102,9 +2136,24 @@ the FIRST DROPPED row and answers ``true`` whenever rows remain
 past it - there is no second page-length rule. The kernel
 surface keeps returning ``list[T]`` - the slice contract
 (stable order, bounded window) already carries everything the
-adapter needs to stamp the two fields, and a mid-page byte-cap
-truncation publishes the TRUE resume point through ``cursor``
-rather than the arithmetic ``offset+limit``.
+adapter needs - and the ``has_more``/``cursor`` pair is
+resolved by the LOCKED TWO-CALL PROBE (round 35, iteration-3
+audit item 19 - replaces the undocumented "count the total"
+reading, which the bare-list kernel surface cannot support
+race-free): the adapter evaluates ``has_more`` by issuing a
+SECOND kernel list call ``(offset + len(rows), limit=1)``
+UNDER THE SAME hold of the kernel's serialized mutation gate
+the first call ran in - kernel mutations are serialized
+through the single ordered writer, so two back-to-back list
+reads inside one lock hold observe ONE consistent snapshot
+and no insert/delete can slide the tail between page and
+probe; ``has_more := len(probe_rows) > 0``, and ``cursor``
+encodes ``offset + len(rows)`` (or the first-dropped-row
+index on byte-cap truncation) verbatim. A probe issued
+without the gate - two independent reads - can race a
+concurrent insert/delete and lie about the tail, which is
+exactly why the kernel exposes the deterministic pair rather
+than a count.
 
 Cursor-as-request-input (round 33; scope binding pinned round
 34, iteration-2 audit item 21): the reply-side ``cursor``
@@ -2766,10 +2815,20 @@ class ForwardViaLineFallback(ContractModel):
     immediately. A queue refusal or a leg still unresolved at
     budget lapse is a FORWARD FAILURE the same way: the
     worker ends the source-side lease through
-    ``call.release``/``call.hangup`` and the source ring resolves
-    ``no_pickup``/``missed_call`` (the fallback decision already
-    committed this ring's fate - a refused second leg can never
-    resurrect a different policy). Announcement source: this
+    ``call.release``/``call.hangup`` and the ANSWERED source
+    call emits its ordinary lease teardown -
+    ``event.call_state_changed{state:"disconnected",
+    reason:"agent_hangup"}`` for the worker's source lease -
+    NEVER ``no_pickup``/``missed_call`` (round 35, iteration-3
+    audit item 14: those reasons describe an UNANSWERED ring,
+    and the worker already answered this one - the caller hears
+    the disconnect like a failed call transfer). No terminal
+    announcement is owed on the forwarding hop either - the
+    ``answer_and_announce`` machinery terminates a RING, and
+    this hop carries no announcement asset by design; the
+    fallback decision already committed this ring's fate, so a
+    refused second leg can never resurrect a different policy.
+    Announcement source: this
     model deliberately carries NO ``announcement_ref`` - while
     the second leg is in ``DIALING``/``ALERTING`` the caller
     hears the TARGET line's early media (network ringback or
@@ -4011,19 +4070,28 @@ class CallLease(ContractModel):
     mis-enforce).
 
     Expired-grant error pin (round 34, iteration-2 audit item
+    20; verb scope narrowed round 35, iteration-3 audit item
     20 - the wire vocabulary already reserves the pairing):
-    once ``tick`` has ended the lease ``grant_ttl_expired`` a
-    ``call.dial``/``call.hangup``/``call.release{lease_id}``/
-    ``call.send_dtmf`` naming its ``lease_id`` answers uniformly
+    once ``tick`` has ended the lease ``grant_ttl_expired`` an
+    ACTION verb naming its ``lease_id`` - ``call.dial``,
+    ``call.send_dtmf``, ``call.reattach_media`` - answers
     ``PhonebridgeError(ErrorCode.RESOURCE_EXHAUSTED,
-    ErrorData(reason=ErrorReason.GRANT_TTL_EXPIRED))`` - the
+    ErrorData(reason=ErrorReason.GRANT_TTL_EXPIRED))``: the
     grant's deadline ran out is an expiry fact, NOT a token
     staleness fact, so ``STALE_TOKEN`` is inadmissible here (the
     same split the wire error table pins: grant-TTL expiry is
-    never token-class). A ``release`` that ALREADY ran before
-    the expiry stays an idempotent no-op per the release
-    contract - the no-op precedes the deadline, only facts
-    arriving after it see the typed expiry error."""
+    never token-class). CLEANUP verbs stay idempotent through
+    the ``_closed_leases`` tombstone ring instead: a
+    ``call.hangup``/``call.release{lease_id}`` naming ANY
+    already-ended lease - grant-expired included - is an
+    idempotent no-op (``{ok}``), same as a release that ran
+    before the expiry. Ordering (round 35): ownership resolves
+    BEFORE the expiry verdict - a LIVE foreign lease is
+    ``OWNER_MISMATCH`` as always, and only once the lease is
+    known ended does the tombstone path apply, so a foreign
+    caller can never distinguish a dead foreign lease from a
+    never-issued id (the same no-oracle pin
+    :data:`MAX_CLOSED_TICKETS` documents for tickets)."""
     profile: _CheckedProfile | None = Field(default=None, max_length=MAX_PROFILE_LEN)
     """The ``acquire(profile=...)`` label the agent asked for, saved
     on the lease (round 28, review-18 item 13): the acquire contract
@@ -4099,20 +4167,35 @@ class CallLease(ContractModel):
     qualified provider fact moving ``DIALING -> ALERTING``/
     ``ACTIVE`` or ``ANSWERING -> ACTIVE`` leaves the pair armed so
     the still-in-flight reply keeps its resolution path."""
-    media_epoch: int = Field(default=0, ge=0)
-    """Durable per-pair media stream epoch (round 33): the epoch of
-    the CURRENT media credential pair on this lease. ``0`` means no
-    pair was ever allocated (a still-``ACQUIRED`` grant); the first
-    ``MediaAllocator.allocate`` stamps ``1`` and every subsequent
-    pair issue - ``dial``/``accept`` allocation,
-    :meth:`reattach_media`, :meth:`reattach_provider_media`, the
-    reregister reissue - increments it by one. The pacer's PCM
-    watermark and the ``pre_dtmf_consumed`` DTMF cursor are scoped
-    by ``(lease_id, media_epoch)``: frames or stamps minted under an
-    older epoch are dropped as stale, so a reattach, a provider
-    media reconnect or a timestamp-domain reset can never splice
-    old-epoch audio or resurrect a consumed DTMF watermark onto the
-    new pair."""
+    agent_media_epoch: int = Field(default=0, ge=0)
+    """Durable AGENT-role media stream epoch (round 33; per-role
+    split round 35, iteration-3 audit item 1): the epoch of the
+    CURRENT agent-role half of this lease's media credential pair.
+    ``0`` means no pair was ever allocated (a still-``ACQUIRED``
+    grant); the first ``MediaAllocator.allocate`` stamps ``1`` and
+    every subsequent AGENT-role reissue - ``call.reattach_media``
+    only - increments it by one. The epoch is PER-ROLE on purpose:
+    a provider-side reissue (``provider.reattach_media`` or the
+    reregister re-pair) bumps ONLY
+    :attr:`provider_media_epoch`, so a live agent media socket
+    authenticated under the current agent epoch survives a
+    provider-role re-pair untouched - the single lease-wide epoch
+    of round 34 could never express that (reissuing one role
+    would have burned the other role's socket)."""
+    provider_media_epoch: int = Field(default=0, ge=0)
+    """Durable PROVIDER-role media stream epoch - the mirror of
+    :attr:`agent_media_epoch` (round 35, iteration-3 audit item
+    1): stamped ``1`` by the first ``MediaAllocator.allocate``
+    and incremented by every provider-role reissue
+    (``provider.reattach_media``, the ``provider.reregister``
+    re-pair). The pair-epoch pair ``(agent_media_epoch,
+    provider_media_epoch)`` scopes the media-frame watermarks:
+    the pacer's PCM watermark and the ``pre_dtmf_consumed`` DTMF
+    cursor ride the PROVIDER epoch (they are provider-side
+    stream artifacts), while the agent uplink ``0x02`` flush
+    watermark rides the AGENT epoch - a role's reissue drops
+    only stamps minted under THAT role's outgoing epoch, never
+    the sibling's."""
 
     @model_validator(mode="after")
     def _lease_invariants(self) -> CallLease:
@@ -4133,11 +4216,14 @@ class CallLease(ContractModel):
         ``"answer"`` on ``ANSWERING``/``ACTIVE``, ``None`` everywhere
         else (a settled lease simply carries ``None``, and a
         ``TERMINATING``/``ENDED`` lease can never carry a marker
-        because teardown clears it atomically); and
-        ``media_epoch`` is ``0`` exactly while the lease sits
-        ``ACQUIRED`` (no credential pair allocated yet) and
-        ``>= 1`` once any call-bearing phase is reached - an
-        ``ENDED`` lease keeps whatever epoch it died with."""
+        because teardown clears it atomically); and BOTH media
+        epochs are ``0`` exactly while the lease sits ``ACQUIRED``
+        (no credential pair allocated yet) and ``>= 1`` once any
+        call-bearing phase is reached (round 35: the pair is
+        allocated as a unit, so both role epochs start at ``1``
+        together and then advance independently per role reissue)
+        - an ``ENDED`` lease keeps whatever epoch pair it died
+        with."""
         if self.intent is Intent.EXCLUSIVE_LINE:
             raise ValueError("a CallLease can never hold exclusive_line intent")
         if self.answered_at is not None and self.answered_at < self.created_at:
@@ -4199,20 +4285,18 @@ class CallLease(ContractModel):
         # a media epoch; any call-bearing phase owns a pair.
         if self.phase is CallPhase.ACQUIRED and self.provider_call_id is not None:
             raise ValueError("an ACQUIRED lease carries no provider_call_id")
-        if self.phase is CallPhase.ACQUIRED and self.media_epoch != 0:
-            raise ValueError("an ACQUIRED lease has media_epoch 0")
-        if (
-            self.phase
-            in (
-                CallPhase.DIALING,
-                CallPhase.ANSWERING,
-                CallPhase.ALERTING,
-                CallPhase.ACTIVE,
-                CallPhase.TERMINATING,
-            )
-            and self.media_epoch < 1
+        if self.phase is CallPhase.ACQUIRED and (
+            self.agent_media_epoch != 0 or self.provider_media_epoch != 0
         ):
-            raise ValueError("a call-bearing phase requires media_epoch >= 1")
+            raise ValueError("an ACQUIRED lease has media epochs 0")
+        if self.phase in (
+            CallPhase.DIALING,
+            CallPhase.ANSWERING,
+            CallPhase.ALERTING,
+            CallPhase.ACTIVE,
+            CallPhase.TERMINATING,
+        ) and (self.agent_media_epoch < 1 or self.provider_media_epoch < 1):
+            raise ValueError("a call-bearing phase requires media epochs >= 1")
         return self
 
 
@@ -4599,6 +4683,22 @@ class ProviderRegisterResult(ContractModel):
 
     binding: ProviderBinding
     pending_rings: tuple[PendingRing, ...] = ()
+    auto_created_assignment: LineAssignment | None = None
+    """The ``LineAssignment`` record this register mutation
+    AUTO-CREATED for a previously unconfigured ``line_id``
+    (round 35, iteration-3 audit item 4), ``None`` when the
+    register landed on an already-configured line. The field
+    exists for the register-scoped rollback path: when the
+    adapter's write-through of the new provider binding fails
+    AFTER :meth:`LineManager.register_provider` committed, it
+    compensates with :meth:`LineManager.restore_line`
+    ``(line_id, None)`` - which removes the auto-created record
+    AND tombstones the binding minted in the same mutation in
+    one atomic rollback (the normal live-binding quiescence
+    guard would otherwise block the compensation forever -
+    see ``restore_line``). When ``None``, no register-scoped
+    rollback privilege exists and the ordinary removal rules
+    apply."""
 
 
 # ---------------------------------------------------------------------------
@@ -4917,13 +5017,18 @@ class MediaCredentials(ContractModel):
     pair inside :class:`ProviderReattachMediaCommand` /
     :class:`MediaReattachResult`, item 9). On the wire both travel
     as ``media_endpoint``/``media_token``; the MediaRouter binds
-    each token to ``(lease_id, expected_role, media_epoch)``
-    (round 34, iteration-2 audit item 17 - the epoch joins the
-    binding tuple so :attr:`CallLease.media_epoch`'s
-    ``(lease_id, media_epoch)`` watermark scoping is actually
+    each token to ``(lease_id, expected_role, role_epoch)``
+    (round 34, iteration-2 audit item 17; PER-ROLE epoch round
+    35, iteration-3 audit item 1 - the epoch joins the binding
+    tuple so the ``(lease_id, role, epoch)`` watermark scoping of
+    :attr:`CallLease.agent_media_epoch`/
+    :attr:`CallLease.provider_media_epoch` is actually
     implementable: a socket authenticated under a superseded
-    epoch pair is rejected at ``media.auth`` and any frame or
-    pacer/DTMF stamp minted under it is dropped as stale). The
+    epoch OF ITS OWN ROLE is rejected at ``media.auth`` and any
+    frame or pacer/DTMF stamp minted under it is dropped as
+    stale, while the sibling role's socket - bound to the
+    sibling epoch that a single-role ``reissue`` never moved -
+    stays valid). The
     binary PCM/DTMF frames themselves need NO epoch field - the
     token binding already fixes the socket's epoch for its whole
     lifetime, so frame scoping follows the socket, never a
@@ -4977,21 +5082,35 @@ class MediaCredentials(ContractModel):
     provider_media_endpoint: _CheckedMediaEndpoint = Field(max_length=MAX_ENDPOINT_LEN)
     agent_media_token: _CheckedMediaToken
     provider_media_token: _CheckedMediaToken
-    media_epoch: int = Field(ge=1)
-    """Epoch of :attr:`CallLease.media_epoch` this pair was minted
-    under (round 34, iteration-2 audit item 17): stamped by the
-    allocator at issue - ``1`` for the first pair, incremented
-    with every reissue/reattach exactly like the lease field.
-    The MediaRouter records it in the token binding so the
-    ``(lease_id, media_epoch)`` scoping of pacer watermarks and
-    the ``pre_dtmf_consumed`` DTMF cursor can be enforced on the
-    wire-facing side too: a credential pair minted under an older
-    epoch can never authenticate after the lease's epoch moved
-    on. The field travels inside the credential object only -
-    the wire ``media.auth`` frame stays ``{token, role}``
-    because the router already knows the epoch from the token
-    binding, and a client-asserted epoch would add nothing but a
-    spoofable field."""
+    agent_media_epoch: int = Field(ge=1)
+    """AGENT-role epoch this pair view was minted under (round 35,
+    iteration-3 audit item 1 - replaces the single lease-wide
+    ``media_epoch`` of round 34): ``1`` for the first pair,
+    incremented ONLY by agent-role reissues
+    (``call.reattach_media``). The MediaRouter records it in the
+    agent token's binding so the ``(lease_id, "agent",
+    agent_media_epoch)`` scoping of the uplink ``0x02`` flush
+    watermark can be enforced on the wire-facing side too: a
+    credential minted under an older agent epoch can never
+    authenticate after the lease's agent epoch moved on - while
+    it stays valid across any provider-role reissue, whose epoch
+    advance it does not share."""
+    provider_media_epoch: int = Field(ge=1)
+    """PROVIDER-role epoch this pair view was minted under - the
+    mirror of :attr:`agent_media_epoch` (round 35): ``1`` for the
+    first pair, incremented ONLY by provider-role reissues
+    (``provider.reattach_media``, the ``provider.reregister``
+    re-pair). It scopes the provider-side stream artifacts - the
+    pacer's PCM watermark and the ``pre_dtmf_consumed`` DTMF
+    cursor - to ``(lease_id, "provider", provider_media_epoch)``,
+    so a provider re-pair can never splice old-epoch audio or
+    resurrect a consumed DTMF watermark while the agent's socket
+    keeps streaming under its untouched epoch. Both epoch fields
+    travel inside the credential object only - the wire
+    ``media.auth`` frame stays ``{token, role}`` because the
+    router already knows the epoch from the token binding, and a
+    client-asserted epoch would add nothing but a spoofable
+    field."""
 
     @model_validator(mode="after")
     def _roles_get_distinct_tokens(self) -> MediaCredentials:
@@ -5122,7 +5241,12 @@ class WakeAudience(ContractModel):
     :class:`IncomingCallWakeEvent` projection (round 33, PR #82
     review), so a wake delivery STRUCTURALLY cannot carry the raw
     ``call_token``, which is meaningless to a non-session
-    recipient and is a one-shot credential. The kernel stamps it
+    recipient and is a one-shot credential; on ``missed_call`` it
+    carries :class:`MissedCallWakeEvent` (round 35, iteration-3
+    audit item 7) - tokenless AND masked-caller, because the
+    authenticated :class:`MissedCallEvent` would JSON-serialize
+    the RAW caller number onto the unauthenticated hook spool.
+    The kernel stamps it
     exactly when
     a ring arrives on a line with zero live receive-intent sessions
     AND at least one configured wake hook: a pool line with no
@@ -5186,7 +5310,9 @@ be stamped with, enforced by :class:`EventEnvelope` at construction:
   hooks still fire while socket fan-out is empty by construction;
   on ``incoming_call`` the wake envelope carries ONLY the
   tokenless :class:`IncomingCallWakeEvent` projection - PR #82
-  review - while every non-wake audience keeps the token-bearing
+  review - and on ``missed_call`` only
+  :class:`MissedCallWakeEvent` - round 35, iteration-3 audit
+  item 7 - while every non-wake audience keeps the token-bearing
   :class:`IncomingCallEvent`) -
   NEVER ``broadcast``;
 - ``fallback_triggered`` carries the worker's
@@ -5282,6 +5408,15 @@ class EventEnvelope(ContractModel, Generic[PayloadT]):
             # token-bearing :class:`IncomingCallEvent`; the
             # non-wake audiences keep the table's pin.
             expected = IncomingCallWakeEvent
+        if self.name is EventName.MISSED_CALL and self.audience.scope == "wake":
+            # Round 35 (iteration-3 audit item 7): ``missed_call``
+            # gets the same wake projection treatment - a
+            # ``wake``-scoped envelope carries ONLY
+            # :class:`MissedCallWakeEvent` (masked caller, no
+            # ``RedactedString`` surface), while the
+            # authenticated-audience spelling keeps the table's
+            # pin.
+            expected = MissedCallWakeEvent
         if expected is not None and not isinstance(self.payload, expected):
             raise ValueError(
                 f"payload {type(self.payload).__name__} does not match event {self.name.value!r}"
@@ -5335,8 +5470,13 @@ class IncomingCallWakeEvent(ContractModel):
     STRUCTURALLY cannot leak the one-shot ``call_token``: the field
     simply does not exist on this model, so no serialization path
     can ever emit a live ring token to an unauthenticated hook.
-    :class:`MissedCallEvent` needs no sibling projection - it
-    already carries no token.
+    :class:`MissedCallEvent` carries no token either, but its
+    ``caller_id`` is typed ``_CheckedCallerNumber`` - a
+    ``RedactedString`` that JSON-serializes the RAW number onto
+    an unauthenticated hook spool. It therefore gets its own
+    sibling projection :class:`MissedCallWakeEvent` (round 35,
+    iteration-3 audit item 7) under the same masked-plain-``str``
+    rule.
 
     Masked caller projection (round 34, iteration-2 audit item 16 -
     the model is deliberately NOT an :class:`_IncomingCallEventBase`
@@ -5890,6 +6030,38 @@ class MissedCallEvent(ContractModel):
         return self
 
 
+class MissedCallWakeEvent(ContractModel):
+    """Tokenless ``missed_call`` wake projection (round 35,
+    iteration-3 audit item 7): the ONLY payload spelling legal on
+    a :class:`WakeAudience` ``missed_call`` envelope, mirroring
+    :class:`IncomingCallWakeEvent`. A wake-hook delivery to the
+    ``missed_call`` event is legal (the wake vocabulary covers
+    ``incoming_call`` AND ``missed_call``), but the authenticated
+    :class:`MissedCallEvent` payload types ``caller_id`` as a
+    ``RedactedString`` - which ``model_dump(mode="json")``
+    renders RAW, a PII leak onto an unauthenticated
+    webhook/exec spool. This projection carries only the fields a
+    wake needs: ``line_id``, the MASKED ``caller_id`` (plain
+    ``str`` via :func:`_check_masked_caller`, same rule as
+    :attr:`IncomingCallWakeEvent.caller_id` - the mask marker is
+    required so a raw E.164 can never validate in), and the
+    ``reason`` the ring ended with. ``max_call_duration`` stays
+    inadmissible for the same lease-vs-ring fact reason as the
+    authenticated spelling."""
+
+    line_id: _CheckedLineId
+    caller_id: _CheckedMaskedCaller | None = None
+    reason: CallEndReason
+
+    @model_validator(mode="after")
+    def _reason_is_a_missed_call_reason(self) -> MissedCallWakeEvent:
+        """Same ring-vs-lease exclusion as
+        :class:`MissedCallEvent`."""
+        if self.reason is CallEndReason.MAX_CALL_DURATION:
+            raise ValueError("max_call_duration is not a missed_call reason")
+        return self
+
+
 class IdleAlertEvent(ContractModel):
     """idle_alert payload (round 23, review-12 H6/M6): an EXCLUSIVE
     ``LineAssignment`` has been idle past ``idle_revoke_after``.
@@ -6206,14 +6378,21 @@ class ProviderLiveness(ContractModel):
     channel_seq: int = Field(ge=1)
     """Generation of the control socket this fact arrived on (round
     30, SA_carbon_review_19 slice-A item 10; strict-newer rule
-    round 34, iteration-2 audit item 8): adapter-stamped like
+    round 34, iteration-2 audit item 8; record-only rule round
+    35, iteration-3 audit items 8/17): adapter-stamped like
     :attr:`ProviderRegistration.channel_seq`. On a ``ws_disconnected``
     binding a REACHABLE fact clears ``orphan_deadline_at`` ONLY when
     this is STRICTLY GREATER than :attr:`ProviderBinding.channel_seq`
     - which only a ``provider.reregister`` generation satisfies; a
     delayed fact carried on the dead generation itself (EQUAL seq)
     or a still-lingering OLDER socket is recorded but never
-    disarms the orphan deadline."""
+    disarms the orphan deadline. Generally: any fact arriving with
+    an equal-or-older generation than the binding's live channel
+    is RECORD-ONLY - it feeds the ``checked_at`` dedup watermark
+    but mutates NO liveness state, disarms NO deadline and
+    refreshes NO ``last_seen_at`` (see the "Record-only stale
+    facts" paragraph of
+    :meth:`LineManager.note_provider_liveness`)."""
     checked_at: AwareDatetime
     """Provider-side observation stamp - ADVISORY ONLY (round 28,
     review-18 items 8/11; skew asymmetry clarified in the round-28
@@ -6334,7 +6513,16 @@ class ProviderCallStateUpdate(ContractModel):
     round 32, SA_swe2_review_2 item 10): an update carrying
     NEITHER ``call_token`` nor ``lease_id`` on a line NOT in
     ``RINGING_LOCKED`` is correlated against the line's live
-    leases BEFORE the external mint. With ZERO live candidates the
+    leases BEFORE the external mint. On a line IN
+    ``RINGING_LOCKED`` the unqualified case resolves differently
+    (round 35, iteration-3 audit item 12 - see
+    :meth:`LineManager.ingest_call_state`): a call-ESTABLISHING
+    unqualified state is the handset-answer case below minting
+    ``external_call`` bound to the open ring (or consuming a
+    parked ``pending_ring`` as correlation evidence), and an
+    unqualified ``disconnected`` resolves by the deterministic
+    priority open ring -> parked ``pending_ring`` ->
+    ``external_call`` hold -> unmatched drop. With ZERO live candidates the
     kernel mints ``external_call`` unconditionally - it reports a
     human-initiated call on the physical phone (dialed or
     answered on the handset itself); the line is marked BUSY with
@@ -6396,9 +6584,15 @@ class ProviderCallStateUpdate(ContractModel):
     ``tick`` releases the line ``FREE`` past it with
     ``reason:"network_error"`` so a missed teardown fact can
     never wedge the line BUSY forever. A hold carrying a
-    correlation handle needs no fallback - the later
+    correlation handle reconciles through TWO channels instead
+    (round 35, iteration-3 audit item 9): the later
     ``disconnected`` binds to it and ends the hold like a normal
-    external call. The same bounded-deadline family covers a
+    external call, and the same :data:`UNMATCHED_CALL_SAFETY_SEC`
+    deadline arms REFRESHED by every provider fact bound to the
+    handle - a lost terminal fact is then swept within one
+    window of the last report rather than living forever, and a
+    ``state_snapshot`` that no longer lists the handle releases
+    it. The same bounded-deadline family covers a
     parked ``pending_ring`` that was never promoted - see
     :meth:`LineManager.ingest_ring`.
 
@@ -6420,7 +6614,17 @@ class ProviderCallStateUpdate(ContractModel):
     ``active`` report still mints the ``BUSY``/``external_call``
     hold, and the later ``disconnected`` correlated by the burned
     token ends it and returns the line to ``FREE`` - never
-    ``STALE_TOKEN``. The best-effort ``line.hangup`` allowed
+    ``STALE_TOKEN``. The UNQUALIFIED variant carries no token at
+    all (round 35, iteration-3 audit item 12): a tokenless
+    ``dialing``/``alerting``/``active`` fact on the
+    ``RINGING_LOCKED`` line is still the same physical truth -
+    the ringing call was picked up on the handset - so the
+    kernel mints the ``BUSY``/``external_call`` hold and burns
+    the open ring's ``call_token`` INTO the hold's correlation
+    handle (the burned token keeps serving as the lifecycle
+    key for the hold the same way it did for the drain), or
+    consumes a parked ``pending_ring`` record when no open ring
+    exists. The best-effort ``line.hangup`` allowed
     inside ring-drain is reserved for the paths where the GATEWAY
     rejects the call (``reject`` fallback policy) - it is never
     queued on a ``no_pickup``/missed outcome or on this
@@ -6746,14 +6950,20 @@ class MediaAllocator(Protocol):
         endpoint. The ``provider_media_endpoint`` is always the
         provider-role address of the same pair.
 
-        Epoch stamping (round 34, iteration-2 audit item 17): the
-        returned :attr:`MediaCredentials.media_epoch` MUST equal
-        the lease's current :attr:`CallLease.media_epoch` - the
-        first ``allocate`` stamps ``1`` (the lease's own field
-        moves ``0 -> 1`` in the same mutation), every ``reissue``
-        stamps the NEXT value. The MediaRouter records the epoch
-        inside the token binding, so the credential object is the
-        channel that carries epoch knowledge to the media side."""
+        Epoch stamping (round 34, iteration-2 audit item 17;
+        PER-ROLE split round 35, iteration-3 audit item 1): the
+        returned :attr:`MediaCredentials.agent_media_epoch` and
+        :attr:`MediaCredentials.provider_media_epoch` MUST equal
+        the lease's current :attr:`CallLease.agent_media_epoch`/
+        :attr:`CallLease.provider_media_epoch` - the first
+        ``allocate`` stamps BOTH to ``1`` (the lease's own pair
+        moves ``0 -> 1`` in the same mutation, the pair is minted
+        as a unit); a single-role ``reissue`` stamps ONLY the
+        addressed role's next value and the returned pair view
+        carries the sibling role's UNCHANGED epoch. The
+        MediaRouter records each epoch inside the role-scoped
+        token binding, so the credential object is the channel
+        that carries epoch knowledge to the media side."""
         ...
 
     def reissue(self, lease_id: LeaseId, role: MediaRole) -> MediaCredentials:
@@ -6783,12 +6993,22 @@ class MediaAllocator(Protocol):
         would bypass ``revoke``'s no-socket-outlives-lease
         guarantee).
 
-        The reissued pair's :attr:`MediaCredentials.media_epoch`
-        is the INCREMENTED epoch - ``old + 1`` - and the lease's
-        :attr:`CallLease.media_epoch` moves with it in the same
-        mutation (round 34, iteration-2 audit item 17): a
-        reattach is a new media epoch by definition, so sockets
-        authenticated under the outgoing epoch die with it."""
+        The reissued pair's epoch for the ADDRESSED role is
+        INCREMENTED - ``old + 1`` - and the matching
+        :attr:`CallLease.agent_media_epoch`/
+        :attr:`CallLease.provider_media_epoch` field moves with
+        it in the same mutation, while the SIBLING role's epoch
+        is carried over unchanged (round 35, iteration-3 audit
+        item 1): a reissue is a new media epoch for the
+        reattached role by definition, so sockets authenticated
+        under that role's outgoing epoch die with it - but the
+        untouched role's socket, bound to its still-current
+        epoch, keeps streaming. This is the load-bearing
+        property: a provider-side re-pair (modem reconnect,
+        ``provider.reregister``) must NEVER kill a healthy agent
+        socket, and vice versa. The sibling side of the failed
+        handshake is unaffected and keeps its credential binding
+        until its own reissue or lease end."""
         ...
 
     def revoke(self, lease_id: LeaseId) -> None:
@@ -6950,7 +7170,12 @@ class LineManager(ABC):
         :class:`IncomingCallEvent` to the newly opened session as a
         fresh ``SessionAudience`` envelope carrying the SAME
         ``call_token`` and the original ``expires_at`` - for an
-        EXCLUSIVE line only when the registering agent OWNS it, for
+        EXCLUSIVE line only when the registering agent OWNS it AND
+        the session declares ``Intent.RECEIVE_INBOUND`` (round 35,
+        iteration-3 audit item 15 - same accept-eligibility gate
+        as the ring-time fan-out: an owner session on a
+        ``dial_out``-only registration gets no token it could
+        never consume), for
         a SHARED_POOL line to ANY new session holding
         ``Intent.RECEIVE_INBOUND`` (the token is still legally
         acceptable by that session, so hiding it would strand the
@@ -6991,6 +7216,32 @@ class LineManager(ABC):
         that never declared ``dial_out`` at ``register_intent`` gets
         INVALID_INTENT too - intent capability is per-session, not
         per-key.
+
+        Preferred-``line_id`` semantics (round 35, iteration-3
+        audit item 11): a ``call.acquire`` naming ``line_id`` is a
+        PREFERRED-LINE request - the ticket is bound to that
+        line and is served only when the line becomes FREE with
+        a servable binding. The outcome by block class is
+        deterministic: a ``RINGING_LOCKED`` line (or a BUSY
+        line) with ``enqueue: true`` ENQUEUES the preferred
+        ticket - occupancy is transient, the ring drains or the
+        accepted call ends and the ticket advances - while
+        ``enqueue: false`` answers ``LINE_BUSY_INCOMING`` (the
+        ring-specific code) or ``AcquireRefused`` (busy pool
+        alternative listing) as before. A preferred line whose
+        binding is ``ws_disconnected`` inside orphan grace
+        queues the same way - the binding may recover - but a
+        preferred line with NO live binding at all
+        (``unbound``: never registered; ``unreachable``: dead
+        past grace) is ``PROVIDER_UNREACHABLE`` under BOTH
+        enqueue modes: no socket exists that could ever serve
+        the ticket, so queueing one would park the agent's FIFO
+        slot forever (the fallback worker's
+        ``forward_via_line`` second leg relies on exactly this
+        verdict - see :class:`ForwardViaLineFallback`). A
+        ``line_id`` absent from the configured set is
+        ``LINE_NOT_FOUND`` and never queued.
+
         ``profile`` (round 27, review-17 items 27/80): optional
         per-call label carried onto the granted lease for
         observability - same ``1..MAX_PROFILE_LEN`` bound as
@@ -7006,7 +7257,9 @@ class LineManager(ABC):
         which carries the ORIGINAL ticket's profile forward.
         INVALID_INTENT when the intent is not in the line's caps;
         LINE_EXCLUSIVE_NOT_OWNER (+ ErrorData.free_lines) on exclusive
-        conflict; LINE_BUSY_INCOMING on a RINGING_LOCKED line. A busy
+        conflict; LINE_BUSY_INCOMING on a RINGING_LOCKED line taken
+        WITHOUT ``enqueue`` (round 35, iteration-3 audit item 11 -
+        see the preferred-``line_id`` semantics below). A busy
         pool returns AcquireRefused - routine result, never an error.
         ``free_lines`` inside a refusal carries only lines that could
         actually serve a retry (round 28, review-18 item 16;
@@ -7057,12 +7310,36 @@ class LineManager(ABC):
         ``ws_disconnected`` and ``unbound`` all fail it, round 34)
         becomes empty - the check runs on every liveness/caps/
         assignment mutation, so a queued ticket can never wait on a
-        pool that can never serve it. The dedup table records the OUTCOME of
+        pool that can never serve it. Orphan-grace deferral
+        (round 35, iteration-3 audit item 10): the cancellation
+        waits out the LAST eligible binding's orphan grace - a
+        servable set that is empty only because its members sit
+        ``ws_disconnected`` inside their ``orphan_deadline_at``
+        windows does NOT cancel the ticket yet; the ticket stays
+        queued until every eligible binding's deadline resolves
+        (a ``provider.reregister`` restores a servable line and
+        the ticket survives; the last lapse triggers the
+        ``provider_lost`` cascade which cancels it). A preferred
+        ``line_id`` ticket on a single line follows the same
+        rule for that one line. The dedup table records the OUTCOME of
         a keyed acquire (the granted ``lease_id`` or the queued
         ``ticket_id``): a same-key retry inside the entry's
         :data:`IDEMPOTENCY_TTL_SEC` window returns the recorded
-        outcome VERBATIM (replay-after-completion - the stored
-        result is served, never re-derived), the same key with
+        outcome VERBATIM - WITH a liveness re-check (round 35,
+        iteration-3 audit item 20): the recorded ``lease_id``/
+        ``ticket_id`` must still resolve LIVE at replay time.
+        A recorded ``AcquireGranted`` whose lease has since
+        ended (``grant_ttl_expired``, teardown, provider loss)
+        and a recorded ``AcquireQueued`` whose ticket resolved
+        (granted, cancelled, expired) are NOT replayed verbatim
+        - replaying a dead id would hand the agent a ``lease_id``
+        that resolves to nothing; the stored outcome is
+        superseded and the retry RE-EXECUTES fresh under the
+        same key, recording the new outcome over the dead one
+        (the liveness check is the kernel-side mirror of the
+        dedup entry - the outcome stays "stored, never
+        re-derived" only while the object it names is live);
+        the same key with
         DIFFERENT parameters inside the window is
         ``INVALID_ARGUMENT`` carrying
         ``ErrorReason.IDEMPOTENCY_CONFLICT`` (round 32,
@@ -7145,6 +7422,23 @@ class LineManager(ABC):
         preempted ticket keeps its priority; the reissue restores
         the preempted ticket's own lost position, it does not
         promote it past earlier arrivals.
+
+        Reissue eligibility re-check (round 35, iteration-3 audit
+        item 13): the re-materialization re-validates the
+        recorded ``preferred_line_id`` at insertion time - the
+        world may have moved while the grant was live. If the
+        preferred line can no longer serve the owner (it became
+        EXCLUSIVE to another agent, lost its ``DIAL_OUT`` cap,
+        or its binding died past grace), the ticket drops its
+        ``preferred_line_id`` and re-enters as a POOL ticket at
+        the same original ``seq``; if the owner then has NO
+        eligible line at all, the ticket is cancelled
+        ``queue_cancelled`` with the matching reason
+        (``line_exclusive``/``capability_removed``/
+        ``provider_lost`` per :class:`QueueCancelReason`)
+        instead of materializing a ticket that could never be
+        served. The reissue never mints a second grant - it
+        restores exactly one ticket.
 
         Ingress ``seq`` semantics (round 25, review-15 item 7): the
         global monotonic ``QueueTicket.seq`` counter is minted at
@@ -7240,7 +7534,15 @@ class LineManager(ABC):
         assignment, not to a lease). ``hangup``/provider
         ``disconnected`` already end the lease implicitly, so a
         trailing ``release`` after them is an idempotent no-op.
-        OWNER_MISMATCH on a foreign ``(session_id, lease_id)`` pair.
+        OWNER_MISMATCH on a foreign ``(session_id, lease_id)`` pair
+        - resolved BEFORE the expiry verdict, exactly like
+        :meth:`hangup` (round 35, iteration-3 audit item 20): a
+        lease already ENDED - ``grant_ttl_expired`` included -
+        resolves through the ``_closed_leases`` ring as an
+        idempotent no-op, never ``GRANT_TTL_EXPIRED`` (the typed
+        expiry error is reserved for action verbs - see
+        :attr:`CallLease.grant_expires_at`), and a foreign owner
+        on a live or dead lease alike is ``OWNER_MISMATCH``.
         Like every lease teardown (round 33, PR #82 review),
         releasing a lease still carrying an armed
         :attr:`CallLease.pending_command` clears the
@@ -7358,7 +7660,24 @@ class LineManager(ABC):
         reported it, and a fabricated fact would confuse dedup; late
         provider facts about the ended lease are deduplicated through
         the ``_closed_leases`` ring afterwards (never
-        ``STALE_TOKEN``)."""
+        ``STALE_TOKEN``).
+
+        Pre-dispatch vs post-dispatch grant survival (round 35,
+        iteration-3 audit item 10): a ``PROVIDER_UNREACHABLE``
+        verdict BEFORE ``line.dial`` is ever dispatched - the
+        binding already sits ``ws_disconnected``/``unreachable``
+        when ``dial()`` runs - leaves the ``ACQUIRED`` grant
+        UNSPENT: the lease stays live under its
+        ``grant_expires_at`` deadline so an agent holding a
+        just-granted line is not burned by a socket that died
+        between acquire and dial (the binding's orphan-grace
+        resolution or the grant TTL bounds the window). A
+        POST-dispatch handshake failure - refused, timed out or
+        lost after the command went out - consumes the grant
+        through the compensation path above: the lease ends
+        ``network_error``, terminal, and the agent re-acquires.
+        The grant never survives a dispatched-but-failed dial -
+        only the never-dispatched one."""
         ...
 
     @abstractmethod
@@ -7458,6 +7777,22 @@ class LineManager(ABC):
         handset-answer path of :class:`ProviderCallStateUpdate`
         and mints ``BUSY``/``external_call`` with no lease: the
         handset's pickup outlived the gateway's rejected answer.
+
+        Token survival on a failed accept (round 35, iteration-3
+        audit item 10): the burned ``call_token`` NEVER survives
+        a failed ``line.answer`` handshake - refused, timed out
+        or lost, the token stays burned and the ring drains
+        under its own rule (a retry with the same token is
+        ``STALE_TOKEN``; a fresh token is minted only by a
+        genuinely new ring report or the fallback re-issue).
+        The narrower pre-dispatch case mirrors ``call.dial``: a
+        ``PROVIDER_UNREACHABLE`` verdict BEFORE
+        ``line.answer`` is dispatched - the binding already
+        dead when ``accept()`` runs - means the accept never
+        committed: the token is NOT consumed and the ring
+        stays ``ringing`` under its normal accept window, so
+        an agent racing a socket drop is not burned by a
+        command that never left.
         Answer teardown stays RING-scoped until ACTIVE is
         confirmed: every failed-answer path - refused ack,
         timeout, transport error, or the ring's own
@@ -7499,7 +7834,32 @@ class LineManager(ABC):
         an agent forgot to release). A provider ``disconnected``
         report ends the lease the same way. Dead-man switch /
         orphan grace follow §5.4. OWNER_MISMATCH on a foreign
-        ``(session_id, lease_id)`` pair.
+        ``(session_id, lease_id)`` pair - resolved BEFORE the
+        expiry verdict (round 35, iteration-3 audit item 20): a
+        lease already ENDED - ``grant_ttl_expired`` included -
+        resolves through the ``_closed_leases`` ring as an
+        idempotent no-op, never ``GRANT_TTL_EXPIRED`` (the typed
+        expiry error is reserved for action verbs - see
+        :attr:`CallLease.grant_expires_at`).
+
+        Dead-channel teardown (round 35, iteration-3 audit item
+        3): a hangup (or the ``release``/``drop_session``/
+        ``tick`` teardowns that share this path) on a lease
+        whose binding sits ``ws_disconnected`` still parks the
+        lease ``TERMINATING`` under its ``hangup_hold_sec``
+        deadline, but mints NO ``ProviderHangupCommand`` while
+        the channel is dead - the outbox would drain it into a
+        socket that does not exist. The parked ``TERMINATING``
+        phase IS the durable teardown intent: a
+        ``provider.reregister`` inside the orphan grace re-mints
+        a fresh ``line.hangup{lease_id}`` on the NEW binding for
+        every preserved ``TERMINATING`` lease inside the
+        supersede mutation itself (the command intent survives
+        through the phase, not through a drained outbox); the
+        orphan-grace lapse takes the ``provider_lost`` cascade
+        instead, and a ``hangup_hold_sec`` lapse with the
+        channel still dead ends the lease ``network_error`` like
+        any other hold lapse.
 
         Pending-command teardown (round 33, PR #82 review;
         ring-scoped answer pin round 34, iteration-2 audit item
@@ -7550,8 +7910,19 @@ class LineManager(ABC):
         are accepted again. Tones ride
         :class:`ProviderSendDtmfCommand`
         (wire contract: docs/api-contract.md, round 26, review-16
-        item 6)."""
-        ...
+        item 6).
+
+        Dead-channel verdict (round 35, iteration-3 audit item 3):
+        a ``send_dtmf`` on a lease whose binding sits
+        ``ws_disconnected`` (or worse) answers
+        ``PROVIDER_UNREACHABLE`` and mints NO command - a tone is
+        a real-time effect that can neither ride a dead socket
+        nor be replayed after grace, so the deterministic
+        refusal replaces queueing it into an outbox the dead
+        channel can never drain. The same rule covers a tone
+        ``line.send_dtmf`` that was dispatched but lost when the
+        socket dropped: it is simply dropped - no tone replay
+        exists."""
 
     @abstractmethod
     async def reattach_media(self, session_id: SessionId, lease_id: LeaseId) -> MediaReattachResult:
@@ -7874,7 +8245,17 @@ class LineManager(ABC):
         ``restore_line(line_id, None)`` exactly like a failed
         provision (an auto-created record is durable config, not
         cache, so it can never ride the best-effort
-        ``provider_bindings`` write path).
+        ``provider_bindings`` write path). The created record is
+        also returned on
+        :attr:`ProviderRegisterResult.auto_created_assignment`
+        (round 35, iteration-3 audit item 4) so the adapter knows
+        the rollback scope verbatim - and that same
+        ``restore_line(line_id, None)`` call is privileged to
+        remove the record DESPITE the binding this mutation just
+        minted (the register-scoped compensation rolls the pair
+        back atomically - see ``restore_line``); without the
+        pairing the ordinary live-binding quiescence guard would
+        make a failed write-through unrecoverable.
 
         The returned result's ``binding`` stamps
         ``heartbeat_interval_ms`` from the line's EFFECTIVE
@@ -7932,6 +8313,21 @@ class LineManager(ABC):
         the ack gate - a handshake that can never complete is
         closed by the dead-binding purge, not left to lapse.
 
+        TERMINATING retarget (round 35, iteration-3 audit item 3):
+        a lease parked ``TERMINATING`` on the orphaned/superseded
+        binding - torn down while the channel was dead, so no
+        ``ProviderHangupCommand`` could be minted for it (see
+        :meth:`hangup`) - re-BINDS under the snapshot rules like
+        every other preserved lease, and the kernel mints a
+        FRESH ``ProviderHangupCommand{lease_id}`` on the new
+        ``assignment_id`` inside this same mutation: the parked
+        phase is the durable record of the teardown intent the
+        dead channel could not carry, so the retarget never
+        depends on outbox entries that drained away. A
+        ``TERMINATING`` lease absent from a present
+        ``state_snapshot`` reconciles out normally - the
+        provider's picture wins as for every reconciled phase.
+
         Reregister on a DEAD binding (round 27, review-17 item 21):
         once the orphan-grace window expired or the binding was
         declared UNREACHABLE, ``provider.reregister`` is classified
@@ -7944,25 +8340,35 @@ class LineManager(ABC):
         verdict distinct from either legal path.
 
         Plain ``provider.register`` on a second socket (round 34,
-        iteration-2 audit item 24 - resolves the
-        wording/replacement conflict): the ``INVALID_STATE`` guard
+        iteration-2 audit item 24; fail-closed lease rule round
+        35, iteration-3 audit item 5): the ``INVALID_STATE`` guard
         covers ONLY bindings with a live control channel
         (REACHABLE/DEGRADED). Against a WS_DISCONNECTED binding
         still inside orphan grace a plain ``register`` arriving on
         a NEW socket is a LEGAL fresh supersede, NOT a violation:
         the old socket is gone, so the kernel supersedes the
         orphaned row, mints a fresh ``assignment_id`` and
-        ``channel_seq``, and reconciles leases by the
-        ``state_snapshot`` rules of the dead-binding fresh-register
-        path - identical classification to the hydrated-dead row
-        below, since a grace-window orphan and an expired tombstone
-        differ only in whether ``tick`` has already run the
-        cascade. The grace-window DIFFERENCE is which leases the
-        snapshot can still re-bind (the orphan's leases may still
-        be alive) - never the verdict on the method itself. A
-        ``provider.reregister`` inside the same window stays the
-        preferred idempotent reattach; ``register`` is simply not
-        rejected on a dead-socket line.
+        ``channel_seq``. BUT ``provider.register`` carries NO
+        ``state_snapshot`` - a register that declares no call
+        view cannot preserve call state, so the orphan's live
+        leases end ``provider_lost`` INSIDE this mutation (the
+        same atomic teardown the dead-binding cascade performs,
+        routed through the supersede instead of ``tick``): a
+        preserved-but-unverified lease would be a zombie the new
+        binding can never serve because the provider side never
+        learned its ``lease_id``. The air-side calls the
+        restarted provider still holds re-surface as
+        ``external_call`` facts through the NEW binding's own
+        ``provider.call_state`` reports - the truth comes back
+        on provider evidence, never on a zombie lease. Open
+        ring/``pending_ring``/``external_call`` records of the
+        orphan reset with the same cascade (a physically
+        still-ringing call is re-reported ``ringing`` on the new
+        channel and mints a fresh token). ``provider.reregister``
+        inside the same window stays the lease-PRESERVING
+        reattach path - its ``state_snapshot`` is what makes
+        preservation verifiable, which is exactly why the two
+        methods diverge here.
 
         Hydrated-dead binding (round 31, SA_swe2_review_1 item 3):
         a ``ProviderBinding`` row loaded by
@@ -7989,6 +8395,13 @@ class LineManager(ABC):
         rediscovered ring keeps exactly one kernel-minted
         correlation token - deduplicated by ring identity, never
         re-minted on a repeat register.
+        :attr:`ProviderRegisterResult.auto_created_assignment`
+        (round 35, iteration-3 audit item 4) carries the
+        ``LineAssignment`` the register auto-created for a
+        previously unconfigured ``line_id`` (``None`` when the
+        line already existed) - the rollback-scope handle the
+        write-through compensation needs, see
+        :meth:`LineAdminKernel.restore_line`.
         """
         ...
 
@@ -8138,8 +8551,11 @@ class LineManager(ABC):
         still queued for the dying binding are dropped in the same
         transaction, and the in-flight
         ``line.dial``/``line.answer`` leases of dropped commands
-        end with the ``disconnected``/``network_error`` effect
-        inside the same transaction - their teardown events reach
+        end with the ``provider_lost`` effect
+        inside the same transaction (round 35, iteration-3 audit
+        item 16 - the unified dead-binding reason, never
+        ``network_error``: a binding death is provider loss, not a
+        call-fault guess) - their teardown events reach
         the SAME cycle's ``drain_events()`` rather than outliving
         the command drain (the adapters drain events first, so
         teardown events minted during a LATER command drain would
@@ -8149,7 +8565,7 @@ class LineManager(ABC):
         acknowledgement has no live socket left to answer on, so
         the pending handshake is cancelled inside the same
         transaction and the lease follows the dead-binding
-        ``network_error`` end - a reregistered binding never
+        ``provider_lost`` end - a reregistered binding never
         inherits a half-completed handshake.
 
         Fact recording vs escalation (round 25, review-15 item 32):
@@ -8168,6 +8584,24 @@ class LineManager(ABC):
         equal-or-smaller ``channel_seq``, is recorded as a fact but
         MUST NOT disarm the orphan deadline, otherwise a dead
         session's last gasp could keep a zombie binding alive).
+
+        Record-only stale facts (round 35, iteration-3 audit
+        items 8/17 - the generalization of the strict-newer rule):
+        a liveness fact whose ``channel_seq`` is SMALLER than the
+        binding's recorded generation, or EQUAL to a generation
+        whose channel already closed, is RECORD-ONLY - it feeds
+        the ``checked_at`` dedup watermark and nothing else. It
+        MUST NOT mutate ``binding.liveness`` (a stale-gas
+        ``reachable`` cannot un-degrade or un-orphan the binding,
+        and a stale ``ws_disconnected``/``unreachable`` cannot
+        re-arm or re-run a cascade), MUST NOT disarm
+        ``orphan_deadline_at``, and MUST NOT refresh
+        ``last_seen_at`` (a dead generation's echo is not
+        evidence the live channel is healthy). Only a fact on
+        the CURRENT live generation mutates liveness at all -
+        which is why recovery from ``ws_disconnected`` exists
+        only through ``provider.reregister`` minting a strictly
+        newer generation.
         The missed-ping DEGRADED->DOWN escalation is owned
         EXCLUSIVELY by ``tick(now)``, which compares the binding's
         missed-ping count against the thresholds STAMPED on the
@@ -8215,7 +8649,15 @@ class LineManager(ABC):
         accept-window decision, never as an ``incoming_call``
         subscriber; an EXCLUSIVE line's owner still receives the
         event even when the owner is not an ordinary pool
-        subscriber. Zero-member fan-out (round 33; exclusive-line
+        subscriber - but ONLY through sessions declaring
+        ``Intent.RECEIVE_INBOUND`` (round 35, iteration-3 audit
+        item 15): the token-bearing ``incoming_call`` is an
+        accept invitation, so an owner session that registered
+        only ``dial_out`` MUST NOT receive a ``call_token`` it
+        could never legally consume (``call.accept`` would
+        reject it ``INVALID_INTENT``) and does NOT count as a
+        live fan-out member for the wake decision either.
+        Zero-member fan-out (round 33; exclusive-line
         extension round 34, iteration-2 audit item 2): a ring whose
         live audience is EMPTY emits the ``incoming_call`` through
         the typed :class:`WakeAudience` audience when the line's
@@ -8461,16 +8903,35 @@ class LineManager(ABC):
         - the intermediate ``FREE`` is never published (see
         :class:`LineStateChangedEvent`).
 
-        Binding-level reasons (round 27, review-17 item 18):
+        Binding-level reasons (round 27, review-17 item 18; full
+        cascade pinned round 35, iteration-3 audit item 16):
         ``reason=dongle_lost`` on a ``disconnected`` update is NOT a
         per-call detail - it reports tunnel/USB death of the whole
         attachment, so the kernel MUST additionally mark the
         binding UNREACHABLE (``event.line_health_changed``), tear
         down the binding's REMAINING leases with
-        ``CallEndReason.PROVIDER_LOST`` and cancel its pending
-        tickets as ``queue_cancelled{reason: "provider_lost"}`` -
-        the same consequences an UNREACHABLE liveness fact carries,
-        triggered here by the provider's own report. ``stack_restart``
+        ``CallEndReason.PROVIDER_LOST``, cancel its pending
+        tickets as ``queue_cancelled{reason: "provider_lost"}``,
+        reject its pending claims as
+        ``claim_resolved{status:"rejected",
+        reason:"provider_lost"}``, burn a still-OPEN ring on the
+        line through the ring lifecycle
+        (``MissedCallEvent{reason:"provider_lost"}`` - the ring
+        died with the provider, so the missed-call event reports
+        the binding loss, not ``no_pickup``), release any
+        ``external_call`` hold the binding reported, and
+        tombstone the binding into ``_closed_assignments`` -
+        the SAME unified consequences an UNREACHABLE liveness
+        fact carries (``provider_lost`` is THE dead-binding
+        reason on every axis - lease ends, queue cancels, claim
+        rejects, ring misses - never a call-scoped
+        ``network_error``/``dongle_lost`` mix), triggered here
+        by the provider's own report. The dead-binding outbox
+        purge applies identically: every queued command for the
+        dead binding is dropped in the same mutation and NO
+        ``ProviderHangupCommand`` is minted for the torn-down
+        leases - a tombstoned binding can never be given more
+        work. ``stack_restart``
         stays call-scoped (the call vanished; the bus may be fine).
 
         Stale-binding drops (round 27, review-17 item 67): an
@@ -8500,7 +8961,16 @@ class LineManager(ABC):
         never dropped by call A's newer stamp; facts naming a
         superseded ``assignment_id`` are already rejected
         ``STALE_TOKEN`` through the ``_closed_assignments`` ring
-        before dedup is consulted. The identity table is BOUNDED
+        before dedup is consulted. The ``_unqualified`` bucket
+        dedupes on the ``(accepted_stamp, state)`` PAIR, not the
+        stamp alone (round 35, iteration-3 audit item 8): two
+        distinct call states sharing one coarse provider stamp are
+        a legal transition sequence, not a duplicate - a provider
+        clock ticking in whole seconds emits ``dialing`` then
+        ``alerting`` under the same ``observed_at``, and dropping
+        the second as a "repeat" would freeze the call's reported
+        progression. Only a verbatim ``(stamp, state)`` repeat in
+        the bucket is a duplicate. The identity table is BOUNDED
         (:data:`MAX_CALL_STAMP_WATERMARKS_PER_LINE` entries per
         line, FIFO-evicted at the cap) so a handset churning call
         identities can never grow kernel state unboundedly.
@@ -8518,7 +8988,69 @@ class LineManager(ABC):
         binding at the line's binding scope - survives only as the
         RESTART REPLAY FLOOR for facts naming NO live call
         identity; it never decides ordering between two live
-        identities."""
+        identities.
+
+        Floor restriction (round 35, iteration-3 audit item 8):
+        the durable ``call_stamp_watermark`` floor is restart-replay
+        evidence, never proof a call never existed - it drops an
+        unqualified fact ONLY when the fact is STRICTLY below the
+        floor AND can mint no new state: an unqualified
+        ``disconnected`` or a verbatim ``(stamp, state)`` repeat at
+        or below the floor is dropped (it produces nothing), while
+        a call-ESTABLISHING unqualified state
+        (``dialing``/``alerting``/``active``) is never suppressed
+        by the floor - a genuinely new handset call must not be
+        silenced by watermark evidence, so it mints the
+        ``external_call`` hold anyway and the
+        :data:`UNMATCHED_CALL_SAFETY_SEC` deadline bounds the
+        occasional false positive that a suppressed real call
+        would have wedged silently.
+
+        Occupancy is a UNION of holds (round 35, iteration-3 audit
+        item 9): a line's ``BUSY`` is the union of every live hold
+        on it - agent lease, ``external_call`` hold, ring record.
+        A ``disconnected`` ending one hold while another still
+        lives keeps the line ``BUSY`` - the held-reason column
+        (``lease`` vs ``external_call``) shifts without a FREE
+        blip, and ``line_state_changed{new_state:"FREE"}`` fires
+        ONLY when the LAST hold ends. Correlated ``external_call``
+        safety (same item): a hold minted WITH a correlation
+        handle (``provider_call_id`` or a burned ``call_token``)
+        still carries a reconciliation guarantee - it reconciles
+        against ``state_snapshot`` like a reconciled-phase lease
+        (a handle absent from an authoritative snapshot is
+        released), and it arms the SAME
+        :data:`UNMATCHED_CALL_SAFETY_SEC` deadline as an
+        unmatched hold, REFRESHED on each provider fact bound to
+        the hold's handle - a live reported call keeps itself
+        alive while a terminal fact lost in flight is swept
+        within one window of the last fact; an unmatched hold
+        carries no handle to refresh against, so its mint-time
+        deadline stands alone.
+
+        Tokenless facts on a ``RINGING_LOCKED`` line (round 35,
+        iteration-3 audit item 12): an unqualified
+        call-ESTABLISHING fact (``dialing``/``alerting``/
+        ``active``) arriving on a ``RINGING_LOCKED`` line is the
+        handset-answer case - it mints ``BUSY``/``external_call``
+        with no lease, burning the open ring's ``call_token`` as
+        its correlation handle exactly like the token-echoed
+        ``active`` above; when no open ring exists but a
+        ``pending_ring`` record is parked, the fact mints the
+        same hold consuming the parked record as correlation
+        evidence (its ``provider_call_id`` becomes the handle
+        when present, otherwise the hold is unmatched and the
+        safety deadline applies). A tokenless ``disconnected``
+        on ``RINGING_LOCKED`` resolves in deterministic priority:
+        (1) the open ring first - it ends the ring, burns
+        ``MissedCallEvent``, and drains like the by-line rule
+        above; (2) absent an open ring, the parked
+        ``pending_ring`` record is cleared (its provider-reported
+        ring died before promotion); (3) absent both, a live
+        ``external_call`` hold on the line is released; (4)
+        nothing matched - the fact is recorded as an unmatched
+        fact under the safety-net rule and dropped, never
+        ``STALE_TOKEN``."""
         ...
 
     @abstractmethod
@@ -8736,6 +9268,26 @@ class LineManager(ABC):
         not mint a second hangup command nor re-end the lease;
         its provider-fact or ``hangup_hold_sec`` lapse closes it).
 
+        Dead-channel compensation (round 35, iteration-3 audit
+        item 3): the saga path obeys the same dead-binding
+        command ban as :meth:`hangup` - when the lease's binding
+        already sits ``ws_disconnected``/dead, NO
+        ``ProviderHangupCommand`` is minted (a best-effort
+        command has no socket to ride and the outbox would
+        drain it into nothing). The lease outcome is unchanged:
+        it still ends ``network_error`` in the same atomic step -
+        the compensation's own verdict, not the command, is what
+        ends the lease - and because the lease ENDS rather than
+        parking ``TERMINATING``, there is no durable command
+        intent for a ``provider.reregister`` to re-mint; the
+        modem-side call is left to the provider's own
+        reconnect/caller-side cleanup exactly like the
+        dead-binding outbox purge defines (the orphan-grace
+        lapse would take the ``provider_lost`` cascade for any
+        lease still alive, so a refused-dial lease dying
+        ``network_error`` first is consistent, not a second
+        reason channel).
+
         Synthesizing a ``disconnected``
         :meth:`ingest_call_state` fact remains FORBIDDEN here
         too (the provider never reported one); the
@@ -8801,6 +9353,44 @@ class LineManager(ABC):
         mints NO second ring-scoped reject and never re-ends the
         lease - its provider fact or ``hangup_hold_sec`` lapse
         closes it.
+
+        Dead-channel compensation (round 35, iteration-3 audit
+        item 3): the same dead-binding command ban applies -
+        when the ring's binding already sits
+        ``ws_disconnected``/dead, NO ring-scoped
+        ``ProviderHangupCommand`` is minted. The lease still
+        ends in the same atomic step and the line still stays
+        ``RINGING_LOCKED`` under the ring-drain rule, but the
+        OPEN RING itself is the durable reject intent: a
+        successful ``provider.reregister`` inside the orphan
+        grace re-mints the ring-scoped reject
+        (``ProviderHangupCommand{call_token}``) while the ring
+        remains undrained, and a ring that drains on its
+        ``ring_drain_ttl_sec`` or the orphan-grace cascade with
+        no live channel simply never sends one - exactly the
+        ``TERMINATING`` re-mint model :meth:`hangup` defines,
+        carried by ring state instead of a parked lease.
+
+        Post-ACTIVE answer compensation (round 35, iteration-3
+        audit item 2): ``ANSWERING -> ACTIVE`` is legal WHILE the
+        ``line.answer`` handshake is still open - the provider's
+        ``active`` fact advances the phase without settling the
+        pending command (see :attr:`CallLease.pending_command`).
+        A refused/timed-out/lost handshake landing on that lease
+        is NO LONGER ring-scoped: the provider has already
+        attested the call is up, so the ring's fate was committed
+        and the compensation switches to the LEASE-scoped
+        teardown :meth:`compensate_dial` defines - a best-effort
+        ``ProviderHangupCommand{lease_id}`` (air-side teardown of
+        the live call the provider just confirmed), the lease
+        ending ``network_error``, the line returning
+        ``BUSY -> FREE`` in the same mutation, and
+        ``event.call_state_changed{state:"disconnected"}`` to the
+        owning session. It NEVER returns the line to
+        ``RINGING_LOCKED`` and NEVER emits ``missed_call`` -
+        ``missed_call`` describes an unanswered ring, and this
+        call was confirmed active; the withheld ``call.accept``
+        reply still answers ``PROVIDER_UNREACHABLE``.
         Synthesizing a ``disconnected``
         :meth:`ingest_call_state` fact stays FORBIDDEN here too -
         the queued reject command IS the teardown, and the drain
@@ -8910,7 +9500,21 @@ class LineManager(ABC):
         :meth:`compensate_dial`; for ``"answer"`` the ring-scoped
         reject (``call_token`` set, ``lease_id`` ``None``) then the
         ``ANSWERING`` lease end of :meth:`compensate_answer`, the
-        line staying ``RINGING_LOCKED`` under the drain rule.
+        line staying ``RINGING_LOCKED`` under the drain rule. The
+        dead-binding command ban applies identically (round 35,
+        iteration-3 audit item 3): no ``ProviderHangupCommand`` is
+        minted onto a binding that sits ``ws_disconnected``/dead;
+        the lease end is unchanged, and a still-open ring's
+        ring-scoped reject re-mints on a successful
+        ``provider.reregister`` while the ring remains undrained.
+        Phase-conditional (round 35, iteration-3 audit item 2):
+        an ``"answer"`` refusal landing on a lease the provider
+        already advanced to ``ACTIVE`` takes the LEASE-scoped
+        arm instead (``ProviderHangupCommand{lease_id}``,
+        ``network_error`` end, ``BUSY -> FREE``,
+        ``call_state_changed`` - never ``missed_call``, never
+        back to ``RINGING_LOCKED``) because the provider's own
+        ``active`` fact already committed the call.
         ``ack.reason`` is recorded as bounded diagnostic input only
         - it is never synthesized into a provider fact and never
         echoed raw into agent-facing ``detail`` text."""
@@ -8991,6 +9595,26 @@ class LineManager(ABC):
         no-op. This is the ONLY way sessions end; there is no
         per-ticket/per-lease sweep API.
 
+        Dead-man teardown through ``TERMINATING`` (round 35,
+        iteration-3 audit item 6): the dead-man switch on a lease
+        in an in-flight phase (``DIALING``/``ANSWERING``/
+        ``ALERTING``/``ACTIVE``) is hangup-intent like
+        :meth:`release` - the kernel queues
+        ``ProviderHangupCommand``, parks the lease
+        ``TERMINATING`` with ``agent_disconnected`` recorded as
+        the pending end-reason, and the provider's
+        ``disconnected`` fact or the ``hangup_hold_sec`` lapse
+        closes it (an in-flight call must never be treated as
+        instantly ended - the air-side teardown is real work
+        that can itself fail). An ``ACQUIRED`` grant ends
+        directly ``ENDED`` with ``agent_disconnected`` - no air
+        leg exists to confirm. The dead-binding variant applies
+        too: a session drop while the binding sits
+        ``ws_disconnected`` mints no command (see the
+        dead-channel teardown rule on :meth:`hangup`), and a
+        binding that died already ends the lease
+        ``provider_lost`` via the orphan cascade instead.
+
         Media teardown ordering (round 29, SA_quant_review_1
         slice-A item 9): the dead-man lease teardown calls
         ``MediaAllocator.revoke(lease_id)`` INSIDE this same
@@ -9052,7 +9676,8 @@ class LineManager(ABC):
         cycle's ``drain_events()``.
 
         ``max_call_duration_sec`` (round 28, review-18 item 7;
-        ``ANSWERING`` folded in round 31, SA_swe2_review_1 item 2):
+        ``ANSWERING`` folded in round 31, SA_swe2_review_1 item 2;
+        TERMINATING routing round 35, iteration-3 audit item 6):
         when the line's effective cap is set, a lease in
         ``DIALING``/``ANSWERING``/``ALERTING``/``ACTIVE``/
         ``TERMINATING`` crossing
@@ -9062,7 +9687,18 @@ class LineManager(ABC):
         wall-clock length, including a ``record_and_telegram``
         worker recording and a wedged answer/teardown leg.
         ``ACQUIRED`` is exempt (its ``grant_expires_at`` already
-        bounds the undialed grant).
+        bounds the undialed grant). A still-in-flight lease the cap
+        catches routes through ``TERMINATING`` like every other
+        kernel-initiated air-side teardown (round 35): the kernel
+        queues ``line.hangup``, records ``max_call_duration`` as
+        the pending end-reason on the TERMINATING entry, and the
+        provider's ``disconnected`` or the ``hangup_hold_sec``
+        lapse closes it - the recorded reason is a
+        kernel-attributed cause that a later provider report does
+        NOT override (the call ended BECAUSE of the cap). A lease
+        already ``TERMINATING`` when its cap lands ends on the
+        earlier of the two deadlines with the recorded reason
+        ``max_call_duration`` when the cap fired first.
         Ring-drain best-effort ``line.hangup`` restriction (item
         9): the drain MAY queue ``line.hangup`` only on paths where
         the GATEWAY rejected the call (``reject`` fallback
@@ -9070,12 +9706,12 @@ class LineManager(ABC):
         the phone's own carrier-side end clears the ring.
 
         ``TERMINATING`` hold lapse (round 32, SA_swe2_review_2 item
-        1): a lease parked in ``TERMINATING`` by
-        :meth:`hangup` - the ONLY parking path; the
-        :meth:`compensate_dial`/:meth:`compensate_answer` saga
-        entries end their lease ``network_error`` INSIDE the same
-        mutation that queues the command, so they never leave a
-        ``TERMINATING`` tenant behind - carries a private
+        1; parking set widened round 35, iteration-3 audit item
+        6): a lease parked in ``TERMINATING`` by any agent-or-
+        kernel-initiated air-side teardown - :meth:`hangup`,
+        :meth:`release` on an in-flight lease, :meth:`drop_session`'s
+        dead-man teardown, the ``max_call_duration`` cap above -
+        carries a private
         hold deadline stamped at transition time; at
         ``now >= hold_deadline`` ``tick`` ends it with
         ``CallEndReason.NETWORK_ERROR`` as a KERNEL-side timeout
@@ -9086,6 +9722,39 @@ class LineManager(ABC):
         1..120 s range), NOT ``max_call_duration_sec``: a lost or
         wedged ``line.hangup`` can never leave the lease (and the
         line's FIFO) wedged in ``TERMINATING`` past the hold.
+
+        ``TERMINATING -> ENDED`` reason precedence (round 35,
+        iteration-3 audit item 16): every ``TERMINATING`` entry
+        records a pending end-reason at parking time -
+        ``agent_hangup`` for ``call.hangup``/``call.release``,
+        ``agent_disconnected`` for :meth:`drop_session`,
+        ``max_call_duration`` for the cap, ``network_error`` for a
+        tick/media deadline teardown. The emitted reason on the
+        closing ``call_state_changed{state:"disconnected"}`` is
+        resolved as: (1) a provider ``disconnected`` fact arriving
+        inside the hold carries the air-side truth - its reported
+        ``reason`` wins when the teardown was AGENT-initiated
+        (hangup/release/drop_session - the provider may know the
+        remote already ended); (2) KERNEL-attributed trigger
+        reasons (``max_call_duration``, ``provider_lost``,
+        ``network_error``) are authoritative and are never
+        overridden - the recorded cause IS why the call died;
+        (3) a hold lapse emits ``network_error`` (kernel timeout
+        fact) as pinned above; (4) absent a provider reason an
+        agent-initiated teardown emits its recorded agent reason -
+        kernel teardown of an agent-requested hangup defaults to
+        ``agent_hangup``, not an undefined value.
+        ACQUIRED-end events (round 35, item 16): EVERY lease end
+        emits ``event.call_state_changed{state:"disconnected",
+        reason}`` to the owning session, including the
+        ``ACQUIRED`` ends that never held an air leg -
+        ``grant_ttl_expired`` on grant-TTL lapse,
+        ``preempted_by_incoming`` on ring preemption,
+        ``agent_hangup`` on ``call.hangup``/``call.release`` of an
+        undialed grant, ``agent_disconnected`` on
+        ``drop_session``, ``provider_lost`` on binding death -
+        a grant silently dying without any event would leave the
+        agent holding a lease id that resolves to nothing.
 
         Tick OWNS both ring timers (round 24, review-13 H2): at
         ``now >= ring.expires_at`` (``accept_window_sec`` elapsed) it
@@ -9377,8 +10046,10 @@ class LineManager(ABC):
         :meth:`tick` heartbeat-down) - never inside this drain.
         The in-flight ``line.dial``/``line.answer`` leases of
         dropped commands end with the
-        ``disconnected``/``network_error`` effect inside the same
-        transaction, so their lease-end events reach the SAME
+        ``provider_lost`` effect inside the same
+        transaction (round 35, iteration-3 audit item 16 - the
+        unified dead-binding reason everywhere a binding death
+        ends a lease), so their lease-end events reach the SAME
         cycle's ``drain_events()`` instead of outliving the
         command drain (the adapters drain events first - events
         minted inside a command-drain teardown would sit unsent
@@ -10455,6 +11126,30 @@ class LineAdminKernel(ABC):
         ``config_stale`` plus alert, never a silently restored
         dangling reference (the stored-graph validation rule of
         :meth:`hydrate_lines` applies to the rollback product too).
+
+        Register-scoped rollback exemption (round 35, iteration-3
+        audit item 4): the ONE case where a live binding does not
+        block ``snapshot=None`` removal is the register's own
+        compensation - the record was auto-created by
+        :meth:`LineManager.register_provider` for a previously
+        unconfigured ``line_id`` (visible to the adapter on
+        :attr:`ProviderRegisterResult.auto_created_assignment`)
+        and the provider-binding write-through then failed. The
+        kernel removes the record AND tombstones the
+        ``ProviderBinding`` minted in the same register mutation
+        atomically - the binding joins ``_closed_assignments`` so
+        its later facts resolve ``STALE_TOKEN``, a
+        :class:`ProviderRevokeCommand` is queued on its still-open
+        channel so the just-registered provider is told to detach,
+        and any rings/``pending_rings`` the register minted with
+        it die with the line. The exemption is bound to the
+        pairing: the binding must be the one minted by that
+        register mutation AND still pristine - no lease minted, no
+        provider fact processed, no further mutation committed on
+        it since. A binding that already accreted live facts makes
+        the pair non-atomic and the compensation degrades to
+        ``config_stale`` plus admin alert like every other guarded
+        removal.
 
         Tombstone exemption (round 31, SA_swe2_review_1 item 1 -
         the exemption the rollback needs to stay honest): a

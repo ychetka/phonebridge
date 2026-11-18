@@ -126,6 +126,7 @@ from phonebridge.domain.contract import (
     MediaToken,
     MediaTransport,
     MissedCallEvent,
+    MissedCallWakeEvent,
     NoPickupFallback,
     PairWindowRequest,
     PairWindowResponse,
@@ -2450,7 +2451,8 @@ def test_media_credentials_distinct_role_tokens() -> None:
         provider_media_endpoint="wss://media.internal/provider",
         agent_media_token=MediaToken(RedactedString("a-tok")),
         provider_media_token=MediaToken(RedactedString("p-tok")),
-        media_epoch=1,
+        agent_media_epoch=1,
+        provider_media_epoch=1,
     )
     assert creds.agent_media_token != creds.provider_media_token
     assert creds.agent_media_endpoint != creds.provider_media_endpoint
@@ -2460,7 +2462,8 @@ def test_media_credentials_distinct_role_tokens() -> None:
             provider_media_endpoint="wss://media.internal/provider",
             agent_media_token=MediaToken(RedactedString("same")),
             provider_media_token=MediaToken(RedactedString("same")),
-            media_epoch=1,
+            agent_media_epoch=1,
+            provider_media_epoch=1,
         )
     for missing_endpoint in (
         {"provider_media_endpoint": "wss://media.internal/provider"},
@@ -2470,7 +2473,8 @@ def test_media_credentials_distinct_role_tokens() -> None:
             MediaCredentials(
                 agent_media_token=MediaToken(RedactedString("a")),
                 provider_media_token=MediaToken(RedactedString("p")),
-                media_epoch=1,
+                agent_media_epoch=1,
+                provider_media_epoch=1,
                 **missing_endpoint,
             )
 
@@ -2605,7 +2609,8 @@ def test_media_allocator_port_lifecycle() -> None:
                 provider_media_endpoint="wss://media.internal/provider",
                 agent_media_token=MediaToken(RedactedString("a-tok")),
                 provider_media_token=MediaToken(RedactedString("p-tok")),
-                media_epoch=1,
+                agent_media_epoch=1,
+                provider_media_epoch=1,
             )
             self._live[str(lease_id)] = creds
             return creds
@@ -3841,9 +3846,11 @@ def test_cross_field_validators_batch3() -> None:
         answered_at=NOW_UTC,
         phase=CallPhase.ACTIVE,
         # Round 33: a call-bearing phase owns a media credential
-        # pair - the epoch the pair was minted under rides the
-        # lease, so ACTIVE requires media_epoch >= 1.
-        media_epoch=1,
+        # pair - the epochs the pair was minted under ride the
+        # lease, so ACTIVE requires both role epochs >= 1 (split
+        # into per-role counters in round 35).
+        agent_media_epoch=1,
+        provider_media_epoch=1,
     )
     assert ok_lease.answered_at == NOW_UTC
     with pytest.raises(ValidationError):
@@ -3887,7 +3894,8 @@ def test_clock_and_media_allocator_runtime_checkable() -> None:
                 provider_media_endpoint="wss://media.internal/provider",
                 agent_media_token=MediaToken(RedactedString("a")),
                 provider_media_token=MediaToken(RedactedString("p")),
-                media_epoch=1,
+                agent_media_epoch=1,
+                provider_media_epoch=1,
             )
 
         def reissue(self, lease_id: LeaseId, role: contract.MediaRole) -> MediaCredentials:
@@ -3896,7 +3904,8 @@ def test_clock_and_media_allocator_runtime_checkable() -> None:
                 provider_media_endpoint="wss://media.internal/provider",
                 agent_media_token=MediaToken(RedactedString("a2")),
                 provider_media_token=MediaToken(RedactedString("p2")),
-                media_epoch=2,
+                agent_media_epoch=2,
+                provider_media_epoch=2,
             )
 
         def revoke(self, lease_id: LeaseId) -> None:
@@ -5012,7 +5021,8 @@ def test_media_endpoint_bounds() -> None:
         "provider_media_endpoint": "wss://media.internal/provider",
         "agent_media_token": MediaToken(RedactedString("a")),
         "provider_media_token": MediaToken(RedactedString("p")),
-        "media_epoch": 1,
+        "agent_media_epoch": 1,
+        "provider_media_epoch": 1,
     }
     for bad in ("", overlong):
         with pytest.raises(ValidationError):
@@ -5606,15 +5616,16 @@ def test_call_lease_phase_cross_field_invariants() -> None:
             CallLease(**base, phase=post, grant_expires_at=NOW_UTC + timedelta(seconds=5))
     for late in (CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED):
         # ...and answer facts are legal once the call is established.
-        # Round 33: a call-bearing phase carries media_epoch >= 1
-        # (the media pair the call leg rides); an ENDED lease keeps
-        # the epoch it died with.
+        # Round 33: a call-bearing phase carries media epochs >= 1
+        # (the media pair the call leg rides; per-role since round
+        # 35); an ENDED lease keeps the epochs it died with.
         CallLease(
             **base,
             phase=late,
             answered_at=NOW_UTC,
             answer_confidence="confirmed",
-            media_epoch=1,
+            agent_media_epoch=1,
+            provider_media_epoch=1,
         )
     # Round 31 (SA_swe2_review_1 item 37): the ACQUIRED deadline is
     # REQUIRED (an undialed lease without one would park the line
@@ -6350,6 +6361,10 @@ def test_admin_wire_method_drift() -> None:
         "scopes": False,
         "line_id": True,
         "expires_at": True,
+        # Round 35 (iteration-3 audit item 21): the admin-axis
+        # subject parameter - REQUIRED on an admin-scope key so
+        # admin.list_keys can report a non-empty bound subject.
+        "subject_id": True,
     }
     assert table["admin.revoke_key"] == {"key_id": False}
 
@@ -6546,7 +6561,8 @@ def test_round33_call_lease_pending_command_coherence() -> None:
         phase=CallPhase.DIALING,
         pending_command="dial",
         provider_command_ack_deadline_at=deadline,
-        media_epoch=1,
+        agent_media_epoch=1,
+        provider_media_epoch=1,
     )
     assert dial_pending.pending_command == "dial"
     answer_pending = CallLease(
@@ -6554,7 +6570,8 @@ def test_round33_call_lease_pending_command_coherence() -> None:
         phase=CallPhase.ANSWERING,
         pending_command="answer",
         provider_command_ack_deadline_at=deadline,
-        media_epoch=1,
+        agent_media_epoch=1,
+        provider_media_epoch=1,
     )
     assert answer_pending.pending_command == "answer"
     # Phase coherence (round 34 widened window): a qualified
@@ -6568,7 +6585,8 @@ def test_round33_call_lease_pending_command_coherence() -> None:
             phase=phase,
             pending_command="dial",
             provider_command_ack_deadline_at=deadline,
-            media_epoch=1,
+            agent_media_epoch=1,
+            provider_media_epoch=1,
         )
         assert still_pending.pending_command == "dial"
     assert (
@@ -6577,7 +6595,8 @@ def test_round33_call_lease_pending_command_coherence() -> None:
             phase=CallPhase.ACTIVE,
             pending_command="answer",
             provider_command_ack_deadline_at=deadline,
-            media_epoch=1,
+            agent_media_epoch=1,
+            provider_media_epoch=1,
         ).pending_command
         == "answer"
     )
@@ -6596,7 +6615,8 @@ def test_round33_call_lease_pending_command_coherence() -> None:
                 phase=bad_phase,
                 pending_command=kind,
                 provider_command_ack_deadline_at=deadline,
-                media_epoch=1,
+                agent_media_epoch=1,
+                provider_media_epoch=1,
             )
     # ACQUIRED + pending marker: epoch 0 and the live grant deadline
     # are set so ONLY the pending_command phase rule can fire (an
@@ -6608,7 +6628,8 @@ def test_round33_call_lease_pending_command_coherence() -> None:
             pending_command="dial",
             provider_command_ack_deadline_at=deadline,
             grant_expires_at=NOW_UTC + timedelta(seconds=5),
-            media_epoch=0,
+            agent_media_epoch=0,
+            provider_media_epoch=0,
         )
     # The marker and its deadline are set/cleared TOGETHER - a
     # deadline with nothing pending is a phantom tick entry, a
@@ -6618,14 +6639,16 @@ def test_round33_call_lease_pending_command_coherence() -> None:
             **_lease_base(),
             phase=CallPhase.DIALING,
             pending_command="dial",
-            media_epoch=1,
+            agent_media_epoch=1,
+            provider_media_epoch=1,
         )
     with pytest.raises(ValidationError):
         CallLease(
             **_lease_base(),
             phase=CallPhase.DIALING,
             provider_command_ack_deadline_at=deadline,
-            media_epoch=1,
+            agent_media_epoch=1,
+            provider_media_epoch=1,
         )
     # ...and a deadline can never precede the lease it arms on.
     with pytest.raises(ValidationError):
@@ -6634,18 +6657,21 @@ def test_round33_call_lease_pending_command_coherence() -> None:
             phase=CallPhase.DIALING,
             pending_command="dial",
             provider_command_ack_deadline_at=NOW_UTC - timedelta(seconds=1),
-            media_epoch=1,
+            agent_media_epoch=1,
+            provider_media_epoch=1,
         )
 
 
 def test_round33_call_lease_evidence_and_media_epoch() -> None:
-    """GWT: ``provider_call_id``/``media_epoch`` evidence rules -
+    """GWT: ``provider_call_id``/media-epoch evidence rules -
     an ACQUIRED (pre-dial) lease carries neither, every call-bearing
-    phase owns a media pair (epoch >= 1), and ENDED keeps the epoch
+    phase owns a media pair (both role epochs >= 1 - per-role since
+    round 35, iteration-3 audit item 1), and ENDED keeps the epochs
     it died with."""
     # ACQUIRED: no provider handle, epoch 0.
     acquired = CallLease(**_lease_base(), grant_expires_at=NOW_UTC + timedelta(seconds=5))
-    assert acquired.media_epoch == 0 and acquired.provider_call_id is None
+    assert acquired.agent_media_epoch == 0 and acquired.provider_media_epoch == 0
+    assert acquired.provider_call_id is None
     with pytest.raises(ValidationError):
         CallLease(
             **_lease_base(),
@@ -6656,7 +6682,8 @@ def test_round33_call_lease_evidence_and_media_epoch() -> None:
         CallLease(
             **_lease_base(),
             grant_expires_at=NOW_UTC + timedelta(seconds=5),
-            media_epoch=1,
+            agent_media_epoch=1,
+            provider_media_epoch=1,
         )
     # Call-bearing phases require the pair epoch.
     for phase in (
@@ -6668,23 +6695,29 @@ def test_round33_call_lease_evidence_and_media_epoch() -> None:
     ):
         with pytest.raises(ValidationError):
             CallLease(**_lease_base(), phase=phase)
-        CallLease(**_lease_base(), phase=phase, media_epoch=1)
+        CallLease(**_lease_base(), phase=phase, agent_media_epoch=1, provider_media_epoch=1)
     # ENDED keeps whatever epoch it died with - both 0 (released
     # pre-dial) and a live epoch are legal.
     CallLease(**_lease_base(), phase=CallPhase.ENDED)
-    CallLease(**_lease_base(), phase=CallPhase.ENDED, media_epoch=3)
+    CallLease(**_lease_base(), phase=CallPhase.ENDED, agent_media_epoch=3, provider_media_epoch=3)
     # A recorded provider handle rides a call-bearing lease as
     # durable correlation evidence.
     lease = CallLease(
         **_lease_base(),
         phase=CallPhase.ACTIVE,
-        media_epoch=1,
+        agent_media_epoch=1,
+        provider_media_epoch=1,
         provider_call_id="/ofono/voicecall01",
     )
     assert lease.provider_call_id == "/ofono/voicecall01"
     # Negative epochs are impossible.
     with pytest.raises(ValidationError):
-        CallLease(**_lease_base(), phase=CallPhase.ACTIVE, media_epoch=-1)
+        CallLease(
+            **_lease_base(),
+            phase=CallPhase.ACTIVE,
+            agent_media_epoch=-1,
+            provider_media_epoch=-1,
+        )
 
 
 def test_round33_wake_audience_scope() -> None:
@@ -6713,12 +6746,27 @@ def test_round33_wake_audience_scope() -> None:
             expires_at=NOW_UTC,
         ),
     )
-    EventEnvelope[MissedCallEvent](
+    # On ``missed_call`` the wake envelope carries ONLY the
+    # tokenless ``MissedCallWakeEvent`` projection (round 35,
+    # iteration-3 audit item 7) - the session-scoped
+    # ``MissedCallEvent`` shape is rejected on a wake audience.
+    EventEnvelope[MissedCallWakeEvent](
         name=EventName.MISSED_CALL,
         audience=wake,
         emitted_at=NOW_UTC,
-        payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NO_ANSWER),
+        payload=MissedCallWakeEvent(
+            line_id=LineId("line-main"),
+            caller_id="+373****45",
+            reason=CallEndReason.NO_ANSWER,
+        ),
     )
+    with pytest.raises(ValidationError):
+        EventEnvelope[MissedCallEvent](
+            name=EventName.MISSED_CALL,
+            audience=wake,
+            emitted_at=NOW_UTC,
+            payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NO_ANSWER),
+        )
     # ...but a wake envelope can never carry a session lease fact or
     # a broadcast-shaped line event.
     with pytest.raises(ValidationError):
@@ -7156,8 +7204,9 @@ def test_round34_admin_line_view_orphan_coherence() -> None:
 
 
 def test_round34_media_credentials_epoch_bound() -> None:
-    """``MediaCredentials.media_epoch`` (item 17): a minted pair
-    always stamps the lease epoch it was issued under - ``>= 1``,
+    """``MediaCredentials`` media epochs (item 17; per-role split in
+    round 35, iteration-3 audit item 1): a minted pair always stamps
+    the per-role lease epochs it was issued under - each ``>= 1``,
     required, and a pair can never carry the pre-dial ``0``."""
     kwargs: dict[str, Any] = {
         "agent_media_endpoint": "unix:///run/phonebridge/media.sock",
@@ -7165,15 +7214,29 @@ def test_round34_media_credentials_epoch_bound() -> None:
         "agent_media_token": MediaToken(RedactedString("a-tok")),
         "provider_media_token": MediaToken(RedactedString("p-tok")),
     }
-    assert MediaCredentials(**kwargs, media_epoch=1).media_epoch == 1
-    assert MediaCredentials(**kwargs, media_epoch=9).media_epoch == 9
+    creds = MediaCredentials(**kwargs, agent_media_epoch=1, provider_media_epoch=1)
+    assert creds.agent_media_epoch == 1 and creds.provider_media_epoch == 1
+    creds9 = MediaCredentials(**kwargs, agent_media_epoch=9, provider_media_epoch=9)
+    assert creds9.agent_media_epoch == 9 and creds9.provider_media_epoch == 9
     for bad_epoch in (0, -1):
         with pytest.raises(ValidationError):
-            MediaCredentials(**kwargs, media_epoch=bad_epoch)
-    # The field is required - a pair minted without its epoch is a
-    # pre-round-34 shape and must not hydrate.
+            MediaCredentials(**kwargs, agent_media_epoch=bad_epoch)
+        with pytest.raises(ValidationError):
+            MediaCredentials(**kwargs, provider_media_epoch=bad_epoch)
+    # Per-role independence (round 35, iteration-3 audit item 1):
+    # the two epochs are separate counters - a pair whose provider
+    # half was reissued carries the split values and still
+    # validates, while the sibling epoch simply did not move.
+    split = MediaCredentials(**kwargs, agent_media_epoch=1, provider_media_epoch=4)
+    assert split.agent_media_epoch == 1 and split.provider_media_epoch == 4
+    # Both fields are required - a pair minted without its epochs
+    # is a pre-round-35 shape and must not hydrate.
     with pytest.raises(ValidationError):
         MediaCredentials(**kwargs)
+    with pytest.raises(ValidationError):
+        MediaCredentials(**kwargs, agent_media_epoch=1)
+    with pytest.raises(ValidationError):
+        MediaCredentials(**kwargs, provider_media_epoch=1)
 
 
 def test_round34_forward_via_line_error_tail() -> None:
@@ -7233,3 +7296,111 @@ def test_round34_liveness_watermark_safety_constants() -> None:
     # promoted pending-ring tokens back to the provider.ping reply.
     return_annotation = inspect.signature(LineManager.note_provider_liveness).return_annotation
     assert "PendingRing" in str(return_annotation)
+
+
+def test_round35_call_lease_per_role_media_epochs() -> None:
+    """GWT (round 35, iteration-3 audit item 1): the media epochs are
+    PER-ROLE counters, not one lease-wide scalar - a single-role
+    reissue advances only the addressed role so the sibling's live
+    socket survives under its own epoch. The coherence rule is
+    symmetric: ``ACQUIRED`` carries BOTH epochs at 0 and every
+    call-bearing phase requires BOTH at >= 1, but the two values
+    are independent - a provider-role re-pair leaves
+    ``agent_media_epoch`` untouched."""
+    # Asymmetric pair: the provider half was re-paired three times
+    # (reregister/reattach) while the agent socket stayed on epoch 1.
+    split = CallLease(
+        **_lease_base(),
+        phase=CallPhase.ACTIVE,
+        agent_media_epoch=1,
+        provider_media_epoch=4,
+    )
+    assert split.agent_media_epoch == 1 and split.provider_media_epoch == 4
+    # Each role's zero independently rejects on a call-bearing
+    # phase - a half-pair can never ride a live call.
+    for zero_role in (
+        {"agent_media_epoch": 0, "provider_media_epoch": 2},
+        {"agent_media_epoch": 2, "provider_media_epoch": 0},
+    ):
+        with pytest.raises(ValidationError):
+            CallLease(**_lease_base(), phase=CallPhase.ACTIVE, **zero_role)
+    # ACQUIRED is all-or-nothing at zero: a single stamped role
+    # already counts as an allocated pair and is rejected.
+    with pytest.raises(ValidationError):
+        CallLease(
+            **_lease_base(),
+            phase=CallPhase.ACQUIRED,
+            grant_expires_at=NOW_UTC + timedelta(seconds=5),
+            agent_media_epoch=1,
+            provider_media_epoch=0,
+        )
+    # ENDED keeps whatever pair it died with - a split pair included.
+    CallLease(
+        **_lease_base(),
+        phase=CallPhase.ENDED,
+        agent_media_epoch=2,
+        provider_media_epoch=7,
+    )
+
+
+def test_round35_missed_call_wake_payload_split() -> None:
+    """GWT (round 35, iteration-3 audit item 7): the ``missed_call``
+    payload splits by audience exactly like ``incoming_call`` did in
+    round 34 - ``MissedCallWakeEvent`` is the TOKENLESS
+    ``{line_id, caller_id?, reason}`` projection, the ONLY spelling
+    legal on a ``wake`` envelope, while the authenticated audiences
+    keep the ``RedactedString``-carrying ``MissedCallEvent``."""
+    assert "MissedCallWakeEvent" in contract.__all__
+    # Tokenless by construction: no lease token field can ever leak
+    # onto the unauthenticated hook leg.
+    assert "call_token" not in MissedCallWakeEvent.__pydantic_fields__
+    assert "lease_id" not in MissedCallWakeEvent.__pydantic_fields__
+    # The masked caller is a plain str pinned to the masked
+    # projection shape - a raw E.164 or a RedactedString-shaped dump
+    # can never validate in.
+    wake = MissedCallWakeEvent(
+        line_id=LineId("line-main"),
+        caller_id="+373****45",
+        reason=CallEndReason.NO_ANSWER,
+    )
+    assert wake.caller_id == "+373****45"
+    with pytest.raises(ValidationError):
+        MissedCallWakeEvent(
+            line_id=LineId("line-main"),
+            caller_id=_RAW_NUMBER,  # raw, unmasked
+            reason=CallEndReason.NO_ANSWER,
+        )
+    # caller_id is optional - an unknown-caller ring still reports.
+    MissedCallWakeEvent(line_id=LineId("line-main"), reason=CallEndReason.NO_ANSWER)
+    # The ring-vs-lease fact rule mirrors MissedCallEvent:
+    # max_call_duration is an established-lease end, never a missed
+    # call.
+    with pytest.raises(ValidationError):
+        MissedCallWakeEvent(
+            line_id=LineId("line-main"),
+            reason=CallEndReason.MAX_CALL_DURATION,
+        )
+    # Frozen like every contract DTO.
+    with pytest.raises(ValidationError):
+        wake.reason = CallEndReason.NORMAL  # type: ignore[misc]
+
+
+def test_round35_register_result_auto_created_assignment() -> None:
+    """GWT (round 35, iteration-3 audit item 4): the register result
+    exposes the ``LineAssignment`` record the register mutation
+    auto-created for a previously unconfigured ``line_id`` so the
+    adapter's write-through-failure compensation can target
+    ``restore_line(line_id, None)``. ``None`` is the common
+    already-configured-line case and carries no rollback
+    privilege."""
+    result = ProviderRegisterResult(binding=_binding())
+    assert result.auto_created_assignment is None
+    created = _assignment()
+    with_assignment = ProviderRegisterResult(binding=_binding(), auto_created_assignment=created)
+    assert with_assignment.auto_created_assignment == created
+    # The field is typed - an arbitrary value can never validate in.
+    with pytest.raises(ValidationError):
+        ProviderRegisterResult(
+            binding=_binding(),
+            auto_created_assignment={"line_id": "line-main"},
+        )

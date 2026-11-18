@@ -23,7 +23,7 @@ first-class `ProviderCommandAck` facts + `pending_command`/
 fallback suppression, positive-evidence `caller_id` attribution +
 `external_call`, durable `ProviderBinding` stamp watermarks +
 channel-local `orphan_deadline_at`, `WakeAudience` zero-subscriber
-routing, adapter-owned listing `cursor`, `media_epoch` on the
+routing, adapter-owned listing `cursor`, per-role media epochs on the
 call-lease tuple, phonenumbers-region `default_region` and unique
 `adapter_mac` provisioning validation; PR #82 review fixes add the
 tokenless `IncomingCallWakeEvent` wake payload, the dial-only
@@ -67,10 +67,20 @@ second leg can never run unbounded. Leg-B outcomes: a BUSY/
 RINGING_LOCKED target rides ONE `call.acquire{enqueue:true}`
 queue turn inside the budget; `unreachable`/`LINE_NOT_FOUND`/
 `DIAL_REJECTED`/`PROVIDER_UNREACHABLE` is terminal immediately.
-The terminal path's announcement is the `answer_and_announce`
-machinery — the provisioned announcement the caller hears
-before the worker hangs up the answered leg — and teardown is
-symmetric: losing EITHER leg ends BOTH.
+Failure taxonomy
+(round 35, iteration-3 audit item 14): a terminal leg-B outcome
+tears the SOURCE leg down through the ordinary answered-lease
+path — the worker's `call.hangup`/`call.release` rides the
+`terminating` leg like any established-call teardown — never
+through the ring-scoped `missed_call`/`no_pickup` machinery:
+the source ring was ANSWERED at accept time, so it is an
+answered lease ending early, not an unanswered ring (no
+`event.missed_call` is minted for it). No terminal
+announcement is owed on the forwarding hop — the
+`answer_and_announce` machinery terminates a RING, the
+`ForwardViaLineFallback` model carries no `announcement_ref`,
+and the worker holds no admin announcement access — and
+teardown is symmetric: losing EITHER leg ends BOTH.
 
 ### Requirement: Outbox soft-cap pre-flight and drain discipline
 
@@ -125,8 +135,16 @@ a `dial`/`answer` that timed out on the wire may still have
 executed on the modem, and an uncompensated air-side call would
 outlive its lease as a ghost ring — and ends the lease atomically
 with `network_error` in the same mutation, so it never wedges in
-DIALING. When the provider socket is already dead the command is
-dropped silently and the lease still ends. The entry is
+DIALING. The dead-binding command ban applies to the saga path
+too (round 35, iteration-3 audit item 3): when the lease's
+binding already sits `ws_disconnected`/dead NO
+`ProviderHangupCommand` is minted — the command is best-effort
+and has no socket to ride — while the lease still ends
+`network_error` in the same atomic step; because the lease ENDS
+rather than parking `TERMINATING`, no durable command intent
+survives for a `provider.reregister` to re-mint, and the
+modem-side call is left to the provider's own
+reconnect/caller-side cleanup. The entry is
 BINDING-scoped, not session-scoped: the adapter holds no agent
 `session_id` and MUST NOT forge one to reach the owner-scoped
 `hangup()` path; a superseded `assignment_id` resolves
@@ -162,6 +180,16 @@ or on a lease already parked in `TERMINATING` (round 32,
 swe2_review_2 item 26, the same dedupe rule `compensate_dial`
 carries) — is a dedupe/no-op through `_closed_leases`/the parked
 state: it mints no second reject and never re-ends the lease.
+Dead-channel compensation (round 35, iteration-3 audit item 3):
+when the ring's binding already sits `ws_disconnected`/dead NO
+ring-scoped reject is minted — the lease still ends and the line
+still stays `RINGING_LOCKED`, but the OPEN RING itself carries
+the durable reject intent: a successful `provider.reregister`
+inside the orphan grace re-mints `ProviderHangupCommand`
+`{call_token}` while the ring remains undrained, and a ring that
+drains with no live channel simply never sends one — the
+`TERMINATING` re-mint model carried by ring state instead of a
+parked lease.
 
 ### Requirement: Call-lease phases and the grant TTL (round 31)
 
@@ -972,8 +1000,18 @@ MUST resolve through the closed-assignment ring and be rejected
 `STALE_TOKEN` (round 29), and the adapter MUST close the
 superseded control socket after delivering the supersede reply.
 A `provider.register` on an already-live binding MUST
-be rejected `INVALID_STATE` — reconnect inside the grace window
-uses `provider.reregister`. The exception is a HYDRATED-DEAD row
+be rejected `INVALID_STATE` — but `INVALID_STATE` covers the
+LIVE case only. On a `ws_disconnected` binding sitting inside
+its orphan grace, BOTH reconnect paths are legal and they are
+different operations (round 35, iteration-3 audit item 5):
+`provider.reregister` is the preservation path (keeps the
+binding identity and the orphaned leases alive on it), while
+plain `provider.register` is the fresh-supersede path — a NEW
+socket mints a fresh `channel_seq` and supersedes the dead
+binding outright, ending the orphan grace on that binding and
+ending the orphaned leases `provider_lost` atomically (never
+INVALID_STATE — supersede is always legal). The same
+fresh-supersede rule covers a HYDRATED-DEAD row
 (round 31, item 3): `hydrate_lines` loads every persisted
 `provider_bindings` row as a DEAD binding — liveness forced to
 `ws_disconnected`, `last_seen_at` preserved verbatim, orphan
@@ -1331,16 +1369,22 @@ a real stream stamp can reach — and on receipt the router MUST
 drop ALL still-queued uplink frames for the lease regardless of
 timestamp; it is consumed at the router and never bridged to the
 provider. The `0x05` pause itself is BOUNDED (round 34,
-iteration-2 audit item 17): the router resumes autonomous
-egress when no trailing `0x02` flush arrives within
-`DTMF_PAUSE_BUDGET_MS` = 30 000 ms of the `0x05`
-(`MAX_DTMF_STREAM_PAUSE_SEC` = 30.0 s — sized so the largest
-legal `call.send_dtmf` workload, `MAX_DTMF_DIGITS` = 32 digits
-including `,`/`w`/`W` pause chars, fits inside the budget), a
-second `0x05` received while paused RE-ARMS the watermark and
-budget rather than stacking pauses, and a pause observed beyond
-the budget is a media-fault signal handled exactly like a
-detached role, never read as in-call silence.
+iteration-2 audit item 17; exhaustion semantic unified round 35,
+iteration-3 audit item 22): a pause whose trailing `0x02` flush
+never arrives within `DTMF_PAUSE_BUDGET_MS` = 30 000 ms of the
+`0x05` (`MAX_DTMF_STREAM_PAUSE_SEC` = 30.0 s — sized so the
+largest legal `call.send_dtmf` workload, `MAX_DTMF_DIGITS` = 32
+digits including `,`/`w`/`W` pause chars, fits inside the
+budget) is a media-fault signal, not a resume cue — the router
+reports the PROVIDER role detached (`ingest_media_state`
+`attached:false`), that role's `MEDIA_PAIR_TTL_SEC` re-attach
+window arms, and the lease ends `network_error` if no fresh
+provider-role `media.auth` rebinds inside it. A `0x02` flush
+landing BEFORE the budget lapses resumes forwarding and
+contributes NOTHING to detach accounting — resumed pauses never
+accumulate into a phantom fault — and a second `0x05` received
+while paused RE-ARMS the watermark and budget rather than
+stacking pauses. A pause is never read as in-call silence.
 
 ### Requirement: Provider command acknowledgements are kernel facts (round 33)
 
@@ -1593,8 +1637,16 @@ projection (round 34, iteration-2 audit item 16): it carries the
 mask marker — a raw-bearing `RedactedString` field would
 serialize the full number in JSON-mode dumps to an
 unauthenticated hook, so the field types a plain bounded `str`
-that can never hold a raw E.164. `MissedCallEvent` already
-carries no token and needs no sibling projection. With no hooks
+that can never hold a raw E.164. The `missed_call` wake leg
+splits the same way (round 35, iteration-3 audit item 7): the
+earlier "`MissedCallEvent` carries no token and needs no sibling"
+reading is superseded — its `caller_id` types a `RedactedString`
+whose JSON dump emits the RAW number, so a `wake`-audience
+`missed_call` envelope MUST carry the dedicated tokenless
+`MissedCallWakeEvent` projection `{line_id, caller_id?, reason}`
+with the same masked-str `caller_id` rule, and `EventEnvelope`
+rejects the crossed pairing just like `incoming_call`. With no
+hooks
 configured, NO `incoming_call`
 envelope is emitted at all — the ring still waits out
 `accept_window_sec` so a sleeping agent can wake and answer.
@@ -1651,8 +1703,13 @@ alternative, and any `line.dial`/`line.answer` dispatch: no
 `line.dial` or `line.answer` may EVER target a `ws_disconnected`
 binding, because the orphan has no socket a command could ride —
 the command is never queued and the serve path fails
-`PROVIDER_UNREACHABLE` until a `provider.reregister` on a
-strictly newer `channel_seq` restores a live channel. The claim
+`PROVIDER_UNREACHABLE` until a live channel is restored: either
+`provider.reregister` on a strictly newer `channel_seq`
+(reattach of the SAME binding, leases preserved) or a plain
+`provider.register` on a new socket — a legal fresh supersede
+(round 35, iteration-3 audit item 5) that restores servability
+while ending the orphan's live leases `provider_lost`
+atomically inside the supersede mutation. The claim
 view alone admits `ws_disconnected` (the moderator-resolved
 request may legitimately outlive the grace window); serving
 never does. `AdminLineView.orphan_deadline_at`
@@ -1672,23 +1729,40 @@ policy endings. Death is also queue-side terminal (item 6): a
 command enqueue targeted at a DEAD binding is refused —
 `PROVIDER_UNREACHABLE`, never appended — so
 the outbox can never accumulate commands a dead control socket
-will never drain. Recovery flows exclusively through
-`provider.reregister` on a strictly newer `channel_seq`, never
+will never drain. A live channel is restored only on a newer
+channel generation: `provider.reregister` on a strictly newer
+`channel_seq` reattaches the SAME binding and preserves its
+leases, while a plain `provider.register` on a new socket is a
+legal fresh supersede (round 35, iteration-3 audit item 5) that
+restores servability with a fresh `assignment_id`/`channel_seq`
+and ends the orphan's live leases `provider_lost` in the same
+mutation — never a recovery of the same binding — and never
 through stale-fact resurrection.
 
 ### Requirement: Media pair TTL arms after command acknowledgement (round 34)
 
 The lease's media credential pair is issued at lease mint but
 its TTL is not armed then (round 34, iteration-2 audit item 9):
-`media_epoch` is stamped into the credentials and the expiry
+the per-role media epochs — `agent_media_epoch` and
+`provider_media_epoch`, split per role in round 35
+(iteration-3 audit item 1) so a single-role `reissue` burns only
+the addressed role's token and socket while the sibling's live
+socket keeps streaming under its own epoch — are stamped into
+the credentials and the expiry
 clock starts ONLY when the provider's `{accepted:true}` command
 acknowledgement lands — `line.dial`/`line.answer` both carry the
 credentials, so a pair minted while the provider never answered
 must not burn its TTL in a window where no media socket could
-legitimately connect. The effective deadline is the
+legitimately connect. The ack-arm is PER-ROLE (round 35,
+iteration-3 audit item 18): `{accepted:true}` arms the countdown
+only for the roles not already attached — an already-attached
+role keeps the attach stamp it earned and never restarts at ack
+time — and a role-specific detach (socket close, a DTMF
+pause-budget lapse) arms THAT role's re-attach window alone.
+The effective deadline is the
 ack-resolution instant plus `MEDIA_PAIR_TTL_SEC`; the ack's own
 deadline (`provider_command_ack_deadline_at`) bounds the
-pre-arm window. A `media.auth` presenting a stale `media_epoch`
+pre-arm window. A `media.auth` presenting a stale role epoch
 — minted under a superseded binding or an already-ended lease —
 fails terminally, never refreshes a dead credential pair.
 
@@ -1709,3 +1783,102 @@ by AFFECTED TICKETS, not by step count — at most
 strictly below `OUTBOX_HARD_CAP` by construction — so a mass
 queue shift can never overflow the outbox or starve the teardown
 effects committed alongside it.
+
+### Requirement: Iteration-3 audit hardening pins (round 35)
+
+The third external architecture audit (iteration-3, issue #85)
+pinned the following edges; each is normative and mirrored on
+`LineManager`'s docstrings.
+
+1. **Pending answer after `ACTIVE`.** An answer handshake may stay
+   armed while a provider `active` fact advances `ANSWERING ->
+   ACTIVE`. A failed/timed-out handshake before `ACTIVE` is
+   RING-scoped (ring-reject `line.hangup{call_token}`, ring
+   drains under missed-call rules); after `ACTIVE` it is
+   LEASE-scoped (`line.hangup{lease_id}`, `network_error`,
+   `call_state_changed` — never `missed_call`). A
+   `PROVIDER_UNREACHABLE` verdict rendered BEFORE `line.answer`
+   was dispatched leaves the `call_token` unconsumed.
+2. **Dead-channel commands.** No `line.*` command is queued to a
+   `ws_disconnected`/dead binding: teardown parks the lease
+   `TERMINATING` (the durable intent) and a `provider.reregister`
+   inside orphan grace re-mints `line.hangup{lease_id}` on the NEW
+   binding inside the supersede mutation; grace lapse takes the
+   `provider_lost` cascade, `hangup_hold_sec` lapse ends
+   `network_error`. The ban reaches the saga path too:
+   `compensate_dial` mints no hangup command on a dead binding
+   while still ending the lease `network_error`, and
+   `compensate_answer`/`{accepted:false}` mints no ring-scoped
+   reject — the OPEN RING itself carries the reject intent a
+   `provider.reregister` re-mints while the ring remains
+   undrained.
+3. **Register vs reregister.** Plain `provider.register` on a NEW
+   socket is a legal fresh supersede against a `ws_disconnected`
+   (orphan or hydrated-dead) binding — never `INVALID_STATE` —
+   and it is a supersede, never recovery of the same binding: it
+   mints a fresh `assignment_id`/`channel_seq` and, carrying no
+   `state_snapshot`, ends the orphan's live leases `provider_lost`
+   atomically inside the supersede mutation — while
+   `provider.reregister` stays the lease-PRESERVING idempotent
+   reattach inside grace. `ProviderRegisterResult` exposes the
+   `auto_created_assignment` record so an adapter write-through
+   failure compensates via `restore_line(line_id, None)` in one
+   rollback.
+4. **Teardown verbs ride `terminating`.** `drop_session` and the
+   `max_call_duration` `tick` path route in-flight leases through
+   `TERMINATING` exactly like `hangup`/`release`, preserving the
+   pending end reason (`agent_disconnected`/`max_call_duration`)
+   until the provider `disconnected` fact or the hold lapse
+   resolves; `provider_lost` owns every dead-binding teardown —
+   orphan-grace expiry, heartbeat-down, `dongle_lost` and
+   `admin.revoke_assignment` alike — while `network_error` names
+   only saga-compensation and deadline-lapse paths.
+5. **Stale facts are record-only.** A provider fact stamped at or
+   below the recorded per-scope watermark, or on an equal/older
+   `channel_seq`, may raise the monotone-max dedup watermark but
+   mutates NEITHER `liveness` NOR `last_seen_at` and disarms NO
+   deadline — a replayed `reachable` off a dead generation can
+   never clear the orphan grace; only a strictly newer channel
+   generation recovers.
+6. **Occupancy union and external calls.** Line occupancy is the
+   union of live leases, open rings and `external_call` holds; an
+   `external_call` hold minted on an unmatched call-present fact is
+   bounded by `UNMATCHED_CALL_SAFETY_SEC` = 3600 s when
+   `max_call_duration_sec` is unset, a correlated
+   `call_token`/`provider_call_id` refresh renews the record
+   instead of double-minting, and a tokenless `active` on a
+   `RINGING_LOCKED` line is the handset-answer case (external mint,
+   ring burns) while a tokenless `disconnected` resolves the one
+   open ring.
+7. **Queue survives orphan grace.** Pool and preferred tickets are
+   PRESERVED while any eligible binding's orphan-grace window is
+   open and are cancelled `provider_lost` only after the LAST such
+   window lapses. A `line_id`-naming acquire targets a preferred
+   line: `enqueue:true` queues on `RINGING_LOCKED`/busy, without
+   enqueue `RINGING_LOCKED` answers `LINE_BUSY_INCOMING` and busy
+   the ordinary `free_lines` shape; `ws_disconnected`-in-grace may
+   queue, `unbound`/expired/`unreachable` answers
+   `PROVIDER_UNREACHABLE`. A preempted queue-origin grant reissue
+   RE-VALIDATES its preferred line, falls back to the servable
+   pool, and cancels `provider_lost` when nothing remains.
+8. **Idempotent replay revalidates liveness.** A recorded
+   `lease_id`/`ticket_id` outcome is served verbatim ONLY while
+   the referenced object is still live; a dead outcome re-executes
+   fresh. `release`/`hangup` resolve `OWNER_MISMATCH` BEFORE the
+   expiry verdict and treat an already-ENDED lease (grant TTL
+   included) as an idempotent no-op — never `GRANT_TTL_EXPIRED`.
+9. **Wake and listing surfaces.** `wake`-audience `missed_call`
+   envelopes carry only the tokenless masked `MissedCallWakeEvent`
+   projection; exclusive-owner inbound delivery requires an owner
+   session that declared `receive_inbound`; `has_more` is computed
+   by the adapter's locked two-call probe (page rows plus a second
+   `offset + len(rows), limit = 1` read under the same kernel
+   serialization gate) while the kernel returns bare lists;
+   `admin.issue_key` gains `subject_id?` — REQUIRED on
+   `admin`-scope keys (the bound admin identity `admin.list_keys`
+   reports) and FORBIDDEN on `agent`/`provider` keys.
+10. **Forward fallback teardown.** A terminal second-leg failure
+    tears the answered source leg down through the ordinary
+    answered-lease path — never `missed_call`/`no_pickup`
+    semantics — and owes no terminal announcement on the
+    forwarding hop.
