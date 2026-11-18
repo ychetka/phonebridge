@@ -65,8 +65,9 @@ referenced sections.
 | round 25 (`SA_carbon_review_15` — pre-M1 contract consolidation) | Deployment: `--network=host` + `/dev/vhci` on a dedicated host ratified as THE production profile (`AF_BLUETOOTH` is `init_net`-only; isolated netns impossible), micro-VM documented as optional hardened profile; `phonebridge doctor` pre-flight; UDS `0660`/`0700` state dirs. Contract: `LineState`/`LivenessState` split (`event.line_health_changed`, RESERVED/DEGRADED/DOWN removed from occupancy); `event.claim_resolved`/`event.assignment_granted`/`event.queue_cancelled` added (`assignment_id` finally reaches the owner); agent/provider media endpoint split (`MediaCredentials`); `line.reattach_media`/`call.reattach_media` token reissue; ring correlates by line not token (fallback token + snapshot reconcile + 1:1 ambiguity rule + provider `/run` state file); queue `seq` minted at acquire ingress; provider `call_state` gains `observed_at`/`call_token`/`caller_id`/`reason` echo + provider disconnect-reason closed vocab; `call.release` XOR `{lease_id\|assignment_id}` + `STALE_TOKEN`; `system:*` identities rejected on external sockets; `clear_idle_revoke_after`; forwarding cycle bound 8 hops; `max_call_duration_sec`/`ring_drain_ttl_sec` timeouts; media pair TTL 30 s + `network_error` teardown on timeout; DTMF `0x02` timestamped watermark flush + ALERTING early-media gate; `call.get_lines` privacy filter + redacted broadcast `line_state_changed` reasons for exclusive lines; JSON-RPC numeric error codes + `error_code`/`ErrorData` + `UNAUTHORIZED`/`FORBIDDEN`/`SESSION_NOT_FOUND`; WS-over-UDS framing 64 KiB | contract.py, docs/api-contract.md, docs/hci-agent.md, §2.1, §4.5, §5.2-§5.4, §6.3-§6.4, §7, §9-§10, §13 |
 | round 30 (`SA_carbon_review_19` slice B2a — design-doc hardening) | Webhook HTTP client never follows `3xx` (redirect = delivery failure under the retry budget); `/var/lib/phonebridge-media` third volume + media quotas (`max_recording_sec`, per-line cap, delete-after-send, retention TTL, ENOSPC isolation from SQLite WAL); `restore_line` kernel compensation + single-transaction `lines`+`line_assignments` writes + hydration as last-resort reconciler; single mutation lock covers kernel call→drain→`bus.publish` on every adapter path (per-mutation FIFO); `forward_via_line` second-leg FSM (`enqueue` on busy, terminal on unreachable/`DIAL_REJECTED`, ~20 s budget, either-leg teardown); `answer_and_announce` decision-time eligibility (EXCLUSIVE or live `receive_inbound`, degrade `no_pickup`), WAV-only ref validated at `configure_line`, hangup only after MediaRouter drain + jitter budget; `record_and_telegram` bot token in SQLite secrets injected by supervisor, mandatory beep before record, dead-letter spool + restart resume; `/run/phonebridge/<line_id>.json` bound to call-instance id + deleted on teardown + stale-age rejection; sibling-liveness check precedes D-Bus-loss `call_state` reports (`dongle_lost` ordering, supervisor flush window); phone numbers PII-masked incl. exec-hook stdio, `DIAL_REJECTED.detail`, `phonebridgectl` (default masked, `--reveal`); `remove_line` → `INVALID_STATE` while referenced by another line's `forward_via_line`; exec-hook coalescing keyed per `(hook, line_id)` keeps latest payload (cross-line payloads never merge); `vhci.lock` on a host-shared path (bind-mount or host-side lock service) | §2.1, §4.5, §5.3-§5.4, §7, §10 |
 | round 31 (`SA_swe2_review_1` — 40/40 accepted, design batch 3) | `provider_bindings` becomes a persisted table (`channel_seq`, `last_seen_at`, heartbeat stamps) — `hydrate_lines` loads bindings DEAD (`ws_disconnected` + expired `orphan_deadline_at`) and the first `tick` runs the full orphan cascade unless a fresh `provider.register` supersedes; orphan cascade spelled atomically (UNREACHABLE → lease `network_error` teardowns → ticket/claim `provider_lost` cancels → ring/`external_call` reset → binding tombstone; heartbeat-down suspended while `ws_disconnected`); uplink overflow single policy — socket ALWAYS read, `0x02`/`0x03` processed normally, drop-NEWEST PCM only, `0x04` + `event.media_overflow` once per contiguous episode; mutation lock NARROWED to kernel mutation + drains (in-memory) — SQLite write-through and `bus.publish` ride a single ordered writer task preserving per-mutation FIFO, `restore_line` compensation re-enters the lock deadlock-free; `compensate_dial(line_id, assignment_id, lease_id)` binding-scoped saga entry (hangup-first `network_error`, no fabricated provider facts); `CallPhase.ANSWERING` internal accept phase; provider-stamp watermark — ping facts below the watermark are applied CLAMPED, state facts are deduped; `provider_call_id` exact ring identity + `RING_DEDUP_MIN_GAP_SEC` best-effort fallback; `record_and_telegram` gains mandatory `announcement_ref` + `max_recording_sec` policy fields; stale-surface refresh (four listeners, `LineSummary.assignment_id`, full method/event inventories, `remove_line` quiescent-only) | §2.2-§3.6, §4.2, §4.5, §5.2-§5.4, §6.3-§6.4, §6.6, §7, §9-§10 |
-| round 32 (`SA_swe2_review_2` — design batch 3) | `hangup_hold_sec` (default 10 s, bound 1–120) + `CallPhase.TERMINATING` — `call.hangup` parks an in-flight lease until provider `disconnected` or a kernel-side `network_error` lapse, only `ACQUIRED` grants end directly; pending-write marker + bounded admin wait + guarded `restore_line` (re-mutated record degrades to `config_stale` + admin alert, never a blind old-snapshot overwrite); `provider_bindings` = best-effort cache (failed write = `config_stale`, NO kernel compensation; `restore_line` is `LineAssignment`-only; `last_seen_at` debounced `>= 30 s`; stamp watermarks persisted; `channel_seq` reseeds `max(stored)+1`; hydrated-dead cascade suppresses external escalation hooks); orphan-cascade reason unified `provider_lost` + NO commands to dead/tombstoned bindings; DTMF `0x05` = egress-pacer PAUSE (frames buffer, flush keeps post-DTMF speech; `pre_dtmf_consumed`/`none` semantics); SCO MTU — fixed `hci_vhci.sco_mtu`, feeder answers the kernel's first `HCI_Read_Buffer_Size` locally (60 mSBC/48 CVSD), real `0x1005` proxied for learning only; `compensate_answer` ring-scoped reject vs `compensate_dial` lease-scoped hangup-first; `ingest_media_overflow` sole `event.media_overflow` source + `audio_lost` never arms pair TTL; external-call attribution = evidence-agreement rule; queue — terminal `grant_ttl_expired`, `seq` ordering, `DIAL_OUT`-only tickets, full re-check trigger set; idempotency TTL 3600 s + LRU 256 + `IDEMPOTENCY_CONFLICT`; `register_intent` identity-triple matching; `grant_expires_at` ACQUIRED-only; four hardware-identity fields on `lines` (`adapter_mac`, `paired_phone_mac`, `transport_profile` `loopback\|direct_mtls\|wireguard`, `line_home_country` display-region only) | §3.3-§3.5, §4.2, §4.5, §5.1-§5.4, §6.3-§6.4, §6.6, §9-§10 |
+| round 32 (`SA_swe2_review_2` — design batch 3) | `hangup_hold_sec` (default 10 s, bound 1–120) + `CallPhase.TERMINATING` — `call.hangup` parks an in-flight lease until provider `disconnected` or a kernel-side `network_error` lapse, only `ACQUIRED` grants end directly; pending-write marker + bounded admin wait + guarded `restore_line` (re-mutated record degrades to `config_stale` + admin alert, never a blind old-snapshot overwrite); `provider_bindings` = best-effort cache (failed write = `config_stale`, NO kernel compensation; `restore_line` is `LineAssignment`-only; `last_seen_at` debounced `>= 30 s`; stamp watermarks persisted; `channel_seq` reseeds `max(stored)+1`; hydrated-dead cascade suppresses external escalation hooks); orphan-cascade reason unified `provider_lost` + NO commands to dead/tombstoned bindings; DTMF `0x05` = egress-pacer PAUSE (frames buffer, flush keeps post-DTMF speech; `pre_dtmf_consumed`/`none` semantics); SCO MTU — fixed `hci_vhci.sco_mtu`, feeder answers EVERY kernel `HCI_Read_Buffer_Size` locally (60 mSBC/48 CVSD), real `0x1005` proxied for learning only and never forwarded as the command response; `compensate_answer` ring-scoped reject vs `compensate_dial` lease-scoped hangup-first; `ingest_media_overflow` sole `event.media_overflow` source + `audio_lost` never arms pair TTL; external-call attribution = evidence-agreement rule; queue — terminal `grant_ttl_expired`, `seq` ordering, `DIAL_OUT`-only tickets, full re-check trigger set; idempotency TTL 3600 s + LRU 256 + `IDEMPOTENCY_CONFLICT`; `register_intent` identity-triple matching; `grant_expires_at` ACQUIRED-only; four hardware-identity fields on `lines` (`adapter_mac`, `paired_phone_mac`, `transport_profile` `loopback\|direct_mtls\|wireguard`, `line_home_country` display-region only) | §3.3-§3.5, §4.2, §4.5, §5.1-§5.4, §6.3-§6.4, §6.6, §9-§10 |
 | round 33 (iteration-1 architecture audit — contract re-freeze) | The `{accepted}` provider reply is distilled into a first-class kernel fact `ProviderCommandAck` ingested via `LineManager.ingest_command_ack` — `CommandAckKind` `dial\|answer`, `call_token` echo answer-only, `accepted:true` clears the armed handshake and records `provider_call_id` on the dial path, `accepted:false` applies the identical effects of `compensate_dial`/`compensate_answer` in one mutation; `CallLease.pending_command` + `provider_command_ack_deadline_at` arm atomically per down-channel dispatch (phase-coherent, DIALING/ANSWERING only), `provider_command_ack_sec` (default 2 s, ≤ 60 s) joins `TimeoutConfig`/`LineTimeouts`, `tick` is the ack-deadline backstop — the agent's `call.dial`/`call.accept` wire reply is withheld until the bounded handshake resolves (`PROVIDER_UNREACHABLE` on refusal/timeout/unreachable, no new error code); answer-pending ring sub-state — a consumed `call_token` never re-enters the fallback decision; unqualified sole-live-lease attribution requires positive evidence (`provider_call_id` and/or normalized `caller_id` present on both sides AND agreeing, else `external_call` mint); `ProviderBinding` carries durable `liveness_stamp_watermark`/`call_stamp_watermark` (monotone-max, persisted, inherited on reregister, `channel_seq` reseeds, `orphan_deadline_at` channel-local never durable); `WakeAudience` zero-live-subscriber fan-out (hooks-only, no envelope without hooks); adapter-owned listing `cursor` (XOR `offset`, fail-closed `INVALID_ARGUMENT`, kernel keeps `offset`/`limit`); `CallLease.media_epoch` (0 on `ACQUIRED`, ≥ 1 on call-bearing phases); provisioning validation hardens (unique `adapter_mac`, ISO 3166-1 `default_region`, pairing windows require `paired_phone_mac`, E.164 ASCII digit guard, `RedactedString` value-equality/hash) | contract.py, docs/api-contract.md, docs/specs/line-manager.md, §3.3-§3.5, §4.5, §5.2-§5.3 |
+| round 34 (iteration-2 architecture audit — contract hardening, issue #83) | `pending_command` survives provider phase advances (dial → DIALING/ALERTING/ACTIVE, answer → ANSWERING/ACTIVE) so a late ack still records `provider_call_id`; the withheld wire reply is terminal `PROVIDER_UNREACHABLE` when teardown wins the ack race — dead-lease credentials are never delivered; `SERVABLE_LIVENESS_STATES` (`reachable`/`degraded`) split from `CLAIM_VISIBLE_LIVENESS_STATES` — `ws_disconnected` stays claim-visible but never servable (no `line.dial`/`line.answer` until a newer `provider.reregister`), `AdminLineView.orphan_deadline_at` mirrors the live binding, `ws_disconnected` recovery requires a strictly newer `channel_seq`; binding death unifies on `provider_lost` + no queues to dead bindings; media pair TTL arms at `{accepted:true}` with `media_epoch` carried into `media.auth`; per-`(line_id, call_identity, accepted_stamp)` call-state watermarks (bounded 64/line) replace the line-wide live scalar; `call_present`-only `external_call` mint + flat `UNMATCHED_CALL_SAFETY_SEC` = 3600 s safety net; `pending_ring` token return via `pending_rings` incl. `provider.ping`; `WakeAudience` gains kernel-visible `wake_hooks` + masked-str wake `caller_id` + exclusive-line wake routing; per-ticket mutation-coalesced `event.queue_updated` bounded by affected tickets; `call.release` rides the `terminating` leg; `forward_via_line` second-leg FSM — one bounded queued acquire on BUSY/`RINGING_LOCKED`, terminal on unreachable — + `answer_and_announce` terminal announcement; `register_provider` auto-created assignment counts `MAX_LINES_TOTAL` + write-through; split `/run/phonebridge{,-private}` mounts; masked hook payload + HMAC fields; DTMF pacer pause bounded at `DTMF_PAUSE_BUDGET_MS` = 30 000 ms (`MAX_DTMF_STREAM_PAUSE_SEC` = 30 s, sized for the 32-digit `send_dtmf` max); hci-agent `0x1005` local answer `ncmd=1` every issue + fixed SCO geometry across reopen; idempotent replay restricted to granted/queued outcomes; expired grant = `RESOURCE_EXHAUSTED`/`GRANT_TTL_EXPIRED`; single `has_more` formula + context-bound cursors; `_FrozenMeta` serializable provider metadata | contract.py, docs/api-contract.md, docs/specs/line-manager.md, docs/hci-agent.md, §3.4, §4.5, §5.2-§5.4, §6.4, §7 |
 
 ## §1. Service boundary
 
@@ -389,8 +390,21 @@ implicit; round 31 pins the full inventory):
 |---|---|---|---|
 | **Manager** | `wss://gw:7001/provider` | Line providers (LocalLine, RemoteLine) | `provider.*` (up), `line.*` (down) |
 | **APICallService** | `wss://gw:7002/agent` | AI agents | `agent.*`, `call.*` (up), `event.*` (down) |
-| **AdminService** | `unix:///run/phonebridge/admin.sock` (mode 0600) or `wss://gw:7004/admin` | Admin clients (`phonebridgectl`, admin MCP) | `admin.*` |
-| **InternalService** | `unix:///run/phonebridge/internal.sock` (mode 0600, never bind-mounted or network-exposed) | In-container service identities (`system:*`, e.g. the FallbackWorker) | `agent.*`, `call.*` (up), `event.*` (down) |
+| **AdminService** | `unix:///run/phonebridge-private/admin.sock` (mode 0600) or `wss://gw:7004/admin` | Admin clients (`phonebridgectl`, admin MCP) | `admin.*` |
+| **InternalService** | `unix:///run/phonebridge-private/internal.sock` (mode 0600, never bind-mounted or network-exposed) | In-container service identities (`system:*`, e.g. the FallbackWorker) | `agent.*`, `call.*` (up), `event.*` (down) |
+
+**Split runtime mounts (round 34, iteration-2 audit item 16):**
+`/run/phonebridge/` is the SHARED runtime tree — it carries the
+host-visible `vhci.lock`, the provider restart state files
+`<line_id>.json` and the `media/<line_id>.sock` loopback
+endpoints other pods legitimately mount — while the private
+control sockets live on a SEPARATE daemon-private mount
+`/run/phonebridge-private/` (mode `0700`, never bind-mounted or
+network-exposed) holding `admin.sock` and `internal.sock`. The
+split is load-bearing, not cosmetic: mounting the whole
+`/run/phonebridge` tree into a provider/utility pod would smuggle
+the admin and internal listeners into an untrusted mount
+namespace, so the two trees are distinct mounts by contract.
 
 The internal listener is the ONLY socket family where a `system:*`
 identity may authenticate — its peer credential (`SO_PEERCRED`)
@@ -573,7 +587,9 @@ kernel-side media state, not on the frozen `CallLease` DTO, so the
 latch re-arms on the next `audio_ready`; latch bookkeeping ONLY —
 round 32, SA_swe2_review_2 item 11: while the media socket stays
 attached the fact arms NO `MEDIA_PAIR_TTL_SEC` re-attach window —
-mint/detach/reissue alone own that deadline — and never produces
+the `{accepted:true}` command acknowledgement for an initial
+dial/answer pair, a detach fact, or a credential reissue alone
+own that deadline — and never produces
 `event.media_overflow`, which is minted only by the MediaRouter's
 `ingest_media_overflow(line_id, lease_id)` PCM-drop ingress),
 `provider.reattach_media`
@@ -1749,7 +1765,15 @@ Design consequences:
   never a sentinel; the `0xFFFFFFFF` discard-all encoding is
   shared with the agent-side barge-in `0x02`, which occupies a
   different frame's `timestamp_ms` slot and cannot collide with
-  `pre_dtmf_consumed`.
+  `pre_dtmf_consumed`. The pacer pause itself is BOUNDED
+  (round 34, iteration-2 audit item 17): the router resumes
+  autonomous egress when no trailing `0x02` flush arrives within
+  `DTMF_PAUSE_BUDGET_MS` = 30 000 ms of the `0x05` (the budget
+  covers the 32-digit `call.send_dtmf` maximum including
+  `,`/`w`/`W` pause chars — a provider that dies mid-synthesis
+  can never wedge the agent's uplink permanently), and a second
+  `0x05` received while paused RE-ARMS watermark and budget
+  rather than stacking pauses.
 
 ### §6.5 Remote-line audio transport (round 12)
 
@@ -1836,7 +1860,22 @@ Three primitives only - no broker in v1:
 1. **Socket subscribe** - broadcast to live subscribers on the
    agent/control socket.
 2. **Webhook** - HTTP POST per event type with retry, idempotency
-   `delivery_id`, and HMAC signature. Retry budget is bounded by
+   `delivery_id`, and HMAC signature. The POST body is the MASKED
+   hook projection (round 34, iteration-2 audit item 16): a JSON
+   object `{event, delivery_id, issued_at, line_id?, payload}`
+   where `payload` is `EventEnvelope.payload.model_dump(
+   mode="json")` — the projection the audience rules already
+   force (a `wake`-audience `incoming_call` carries the tokenless
+   `IncomingCallWakeEvent` whose `caller_id` is the masked string
+   rendering), so NO `RedactedString` raw value and no
+   `call_token`/`media_token` can ever appear in a hook body.
+   Authentication is HMAC-SHA256 over the canonical string
+   `<delivery_id>.<raw_body>` keyed by the hook's signing secret,
+   carried in the `X-Phonebridge-Signature` header as
+   `sha256=<hex>`; `delivery_id` also rides
+   `X-Phonebridge-Delivery` so a retry is byte-identical and the
+   receiver can dedupe on it without parsing the body.
+   Retry budget is bounded by
    the event's own deadline (round 23, review-12 M7): for
    `incoming_call`-class events retries MUST stop at
    `expires_at - 1 s` — a wake-up POST landing after the accept
@@ -1878,7 +1917,15 @@ Three primitives only - no broker in v1:
    shell (`sh -c` is forbidden, so hook config cannot smuggle
    command injection); the event JSON is delivered on the child's
    stdin, never in argv/environment (keeps caller PII out of
-   `/proc/*/cmdline` and the process table); every hook run carries
+   `/proc/*/cmdline` and the process table). The stdin payload is
+   the SAME masked hook projection the webhook posts (round 34,
+   iteration-2 audit item 16 — supersedes the round-30 "child sees
+   the full JSON" claim): `{event, delivery_id, issued_at,
+   line_id?, payload}` with the payload's masked `model_dump`
+   rendering — a wake hook needs the line identity and the masked
+   caller projection to wake the right agent, never the raw
+   number, so raw PII never crosses an unauthenticated hook
+   boundary; every hook run carries
    a hard process timeout (default 10 s, admin-cap 60 s), a
    per-hook concurrency cap of 1 queued run (later triggers
    coalesce), and cgroup-less memory discipline via a bounded
@@ -2208,7 +2255,9 @@ status (mirrors the busctl commands used in Phase-0).
   B2a#12):** `caller_id`/`number`/`target_number` are PII in
   EVERY surface — wrapped/masked in event models and structured
   logs like the tokens, carried masked through exec-hook handling
-  (the child sees the full JSON on stdin because it needs it;
+  (the child's stdin JSON is the masked hook projection — the
+  wake semantics need the line identity and masked caller only,
+  round 34;
   the child's captured `stdout`/`stderr` is byte-bounded and
   PII-scrubbed before the daemon log can record it — §7), kept
   OUT of `DIAL_REJECTED`'s `data.detail` (the typed `reason`

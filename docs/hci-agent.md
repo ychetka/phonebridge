@@ -151,7 +151,7 @@ agent `0x16 SCO_STATE`:
   `altsetting 2` (`17`), `altsetting 1` (`9`) only for 8-bit CVSD
   links. **`sco_data_packet_len` follows the REAL altsetting
   (round 30, review-19 B2b + swe-2):** the geometry the feeder
-  declares to the kernel — its LOCAL answer to the kernel's first
+  declares to the kernel — its LOCAL answer to EVERY kernel
   `HCI_Read_Buffer_Size` (MTU alignment below, round 32) — is not a fixed
   `60` — it is the HCI SCO payload length the selected
   altsetting actually produces on the wire: `48` B under
@@ -211,6 +211,19 @@ agent `0x16 SCO_STATE`:
   generated silence into the phone forever while holding host
   USB bandwidth hostage; release is unconditional on ANY path
   that ends the media pipeline.
+- **SCO_STATE reissue on media reconnect (round 34, iteration-2
+  audit item 19):** a clean media-channel reconnect is a NEW
+  pipeline — the container MUST re-issue the CURRENT
+  `SCO_STATE{open:true}` (same `handle`/`air_mode`/packet lengths
+  the still-live SCO link negotiated) on every media
+  (re)establishment; the agent MUST NOT assume its isoc
+  transfers survived the channel drop. Symmetrically, if the
+  SCO link itself closed while the channel was down, the
+  re-issued state is `SCO_STATE{open:false}` — the reconnect
+  handshake always re-declares the link truth, and the
+  kernel-side geometry stays fixed per the `0x1005` rules above
+  (a reopen reselects the same line profile, it never
+  re-negotiates `sco_mtu`).
 
 This keeps the agent dumb about call state — it reacts to an
 explicit command from the feeder that already knows the ground
@@ -556,18 +569,33 @@ does not exist on a virtual adapter — behind `/dev/vhci` the feeder
 IS the controller, and `hci_vhci` fixes the kernel-visible
 `sco_mtu` ONCE at adapter init from the profile the line targets.
 The kernel's SCO MTU is therefore NOT a negotiated value and can
-never be re-declared mid-session: the feeder answers the kernel's
-FIRST `HCI_Read_Buffer_Size` (`0x1005`) LOCALLY with the line's
+never be re-declared mid-session: the feeder answers EVERY kernel
+`HCI_Read_Buffer_Size` (`0x1005`) LOCALLY with the line's
 target-profile geometry — `sco_data_packet_len` `60` B for the
 mSBC profile, `48` B for CVSD (the alt-3 mSBC fallback produces
 the same 60 B payload as alt 6, only spread over more
-microframes) — because a verbatim real-dongle answer would
+microframes) — and `num_hci_command_packets` (`ncmd`) `= 1`
+(round 34, iteration-2 audit item 19): the fixed ncmd serializes
+the kernel's command window onto the one control path the tunnel
+provides, and a value > 1 would invite concurrent HCI commands
+the feeder cannot de-mux on return. The local answer is
+IDENTICAL on every issue — a second `0x1005` after an hdev
+reset or an SCO link close/reopen re-declares the SAME fixed
+geometry, because the kernel-side `sco_mtu` was bound once at
+adapter init and an SCO reopen NEVER re-negotiates it (the alt-
+setting reopen reselects the SAME line profile; a profile flip
+requires a new line configuration, not an in-session
+renegotiation) — because a verbatim real-dongle answer would
 declare a geometry the virtual adapter registered differently at
 init, and the kernel's `hdev->cmd_cnt`/buffer bookkeeping must
 agree with what `hci_vhci` announced. The REAL `0x1005` is STILL
 proxied through the tunnel to the physical controller like any
 other `HCI_PASSTHRU` — but for geometry LEARNING only: the
-returned `sco_data_packet_len`/ACL values drive the feeder's
+feeder OWNS the real dongle's `0x0e` response — it is consumed
+for learning and DROPPED, the kernel's answer is always the
+local one (round 34, same item: two answer paths can never race
+a single command slot). The learned
+`sco_data_packet_len`/ACL values drive the feeder's
 pacing and buffer validation (its `/dev/vhci` read buffer is
 sized ≥ the largest kernel frame, and ACL `data_len` is checked
 against the learned geometry — see the frame-validation
@@ -581,7 +609,10 @@ altsetting section). The EXACT locally-rewritten command set is
 enumerated, never implied by "etc." (round 30): in V1 the feeder
 rewrites NOTHING else — every other command passes through
 verbatim; the only LOCAL interventions are the locally answered
-first `0x1005` and the altsetting-derived SCO packet length the
+`0x1005` — answered locally on EVERY issue, the real dongle's
+`0x0e` response is proxied for learning and consumed by the
+feeder, never forwarded as the kernel's command response — and
+the altsetting-derived SCO packet length the
 kernel must slice at. If the kernel side ever
 reports a different length (e.g.
 a host bluetoothd SCO-buffer readback mismatch), the feeder refuses

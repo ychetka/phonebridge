@@ -58,6 +58,20 @@ defect, not a deferred discovery. A
 self-loop (`forward.line_id` equal to the configured line) MUST be
 rejected at `configure_line`.
 
+The policy also defines its second leg (round 34, iteration-2
+audit item 18): the worker's `call.accept` answers the SOURCE
+ring first, then dials `forward.target_number` OUT through
+`forward.line_id` inside a bounded leg budget (~20 s) — the
+caller is billable from the accept instant, so an unresolved
+second leg can never run unbounded. Leg-B outcomes: a BUSY/
+RINGING_LOCKED target rides ONE `call.acquire{enqueue:true}`
+queue turn inside the budget; `unreachable`/`LINE_NOT_FOUND`/
+`DIAL_REJECTED`/`PROVIDER_UNREACHABLE` is terminal immediately.
+The terminal path's announcement is the `answer_and_announce`
+machinery — the provisioned announcement the caller hears
+before the worker hangs up the answered leg — and teardown is
+symmetric: losing EITHER leg ends BOTH.
+
 ### Requirement: Outbox soft-cap pre-flight and drain discipline
 
 The outbox is a TWO-LEVEL bounded model (round 30). Only
@@ -375,10 +389,19 @@ pair have independent lifetimes. A media socket dropping therefore
 MUST invalidate only its own role's credentials and close only its
 own socket, never tear down the surviving role. The
 `MEDIA_PAIR_TTL_SEC` (30 s) deadline is armed at BOTH ends of a
-pair's life (round 31, item 21): at the token's MINT — inside
-`dial`/`accept` allocation and at every `reissue()` — so a pair
-that is still un-`media.auth`-ed when `issued_at +
-MEDIA_PAIR_TTL_SEC` lapses ends the lease with
+pair's life (round 31, item 21; mint-side arming SUPERSEDED by
+the round-34 ack-armed rule — iteration-2 audit item 9): an
+initial pair minted for `line.dial`/`line.answer` allocation
+arms its expiry clock ONLY when the provider's `{accepted:true}`
+command acknowledgement lands — a pair minted while the provider
+never answered must not burn its TTL in a window where no media
+socket could legitimately connect, and the command's own
+`provider_command_ack_deadline_at` bounds that pre-arm window —
+while a pair minted at every `reissue()` (and the
+`provider.reregister` re-pair) arms at the reissue instant —
+so a pair
+that is still un-`media.auth`-ed when its armed
+`MEDIA_PAIR_TTL_SEC` window lapses ends the lease with
 `event.call_state_changed{reason:"network_error"}` (a caller that
 never received its audio path cannot be served), AND on a detach —
 an ESTABLISHED pair that loses a half gets the same re-attach
@@ -517,6 +540,33 @@ the typed detail replaces the bare INVALID_ARGUMENT of round 28).
 Every recorded outcome expires `IDEMPOTENCY_TTL_SEC` = 3600 s
 after recording — a retry AFTER the window re-executes fresh: the
 contract is a bounded retry window, not a permanent alias.
+Replayable outcomes are exactly TWO (round 34, iteration-2 audit
+item 20): a granted `lease_id` and a queued `ticket_id`. A
+REFUSED (`granted:false`/`free_lines`) or TRANSIENT verdict
+(`PROVIDER_UNREACHABLE`, `LINE_BUSY_INCOMING`,
+`RESOURCE_EXHAUSTED`, any error thrown before recording) is
+NEVER stored under the TTL — pinning a transient refusal for
+3600 s would turn a recoverable retry into a dead key, so a
+same-key retry after such an outcome simply re-executes. An
+operation on a grant whose `grant_expires_at` already lapsed is
+`RESOURCE_EXHAUSTED`/`GRANT_TTL_EXPIRED` across
+`dial`/`hangup`/`release`/`send_dtmf` — never `STALE_TOKEN`:
+the lease identity is still known, its grant window is what
+expired.
+Reissue ordering follows `seq` (round 34, iteration-2 audit
+item 22): a preempted queue-origin ticket rejoins with its
+RETAINED `seq` at the position that seq earns — the head unless
+a still-waiting ticket carries a LOWER `seq`; the reissue is no
+special head privilege. A minted ring is likewise insulated
+from caps churn (same item): removing `receive_inbound` from a
+provider's `caps` via `provider.capability_update` — or losing
+sessions from the fan-out — affects only NEW ring eligibility
+and fan-out membership, never an already-minted
+`call_token`'s accept lifecycle. `AdminLineView.queue_position`
+reports the GLOBAL FIFO rank of the head ticket ELIGIBLE for
+that line — a `line_id`-bound ticket plus every pool ticket
+(`line_id=None`), which competes for every eligible pool line
+(same item).
 In-flight idempotency (round 33, PR #82 review): the adapter MUST
 create the `(method, session_id, idempotency_key)` dedup entry
 BEFORE the kernel mutation or provider command is dispatched —
@@ -941,9 +991,17 @@ ingestion (round 30): `ProviderRegisterResult` carries it on
 to demote a late-arriving stale-channel fact instead of letting a
 pre-supersede ping overwrite the new binding's state: a REACHABLE
 fact MUST clear `orphan_deadline_at` ONLY when its `channel_seq`
-equals the binding's live `channel_seq` — a ping replayed on a
-lingering pre-reregister socket can never disarm the new channel's
-grace deadline.
+is STRICTLY NEWER than the generation that entered
+`ws_disconnected` — i.e. it arrived through a `provider.reregister`
+(or a fresh `provider.register` supersede) that minted a new
+channel generation on a live socket (round 34, iteration-2 audit
+item 8): an EQUAL-generation fact is a delayed frame of the
+already-dead socket — it was minted before the drop, and letting
+it disarm the deadline would resurrect a channel that can never
+drain a command; older-generation facts are demoted the same way,
+so a ping replayed on a
+lingering pre-reregister socket can never disarm the grace
+deadline.
 `register_provider` MUST return a
 `ProviderRegisterResult` (round 30 — never a bare
 `ProviderBinding`): `binding` (the created/superseded
@@ -951,7 +1009,22 @@ grace deadline.
 tuple — snapshot-reported rings the kernel minted `call_token`s
 for through the `ingest_ring` path, relayed to the provider so
 each rediscovered ring keeps one kernel-minted token,
-deduplicated by ring identity, never re-minted).
+deduplicated by ring identity, never re-minted; the ping-side
+`pending_rings` channel additionally returns the tokens of
+`pending_ring` entries promoted after a ring-drain completes —
+the parked ring's fresh `call_token` has no other delivery path —
+round 34, iteration-2 audit item 12). On a first-ever attach the
+kernel auto-creates the line's default `LineAssignment`
+(SHARED_POOL, `owner_agent_id=None`) — and that record rides
+the FULL provisioning contract (round 34, iteration-2 audit
+item 15): it counts against `MAX_LINES_TOTAL` like an
+`admin.provision_line` row (a register pushing the fleet past
+256 is `RESOURCE_EXHAUSTED`), and the adapter MUST persist its
+`lines` row under the same kernel-first write-through ordering,
+compensating a failed row write through
+`restore_line(line_id, None)` — an auto-created record is
+durable config, never the best-effort `provider_bindings`
+cache path.
 
 ### Requirement: Dead-binding cleanup runs at the mutation (round 28)
 
@@ -1257,7 +1330,17 @@ discard-all case: it MUST carry the reserved marker
 a real stream stamp can reach — and on receipt the router MUST
 drop ALL still-queued uplink frames for the lease regardless of
 timestamp; it is consumed at the router and never bridged to the
-provider.
+provider. The `0x05` pause itself is BOUNDED (round 34,
+iteration-2 audit item 17): the router resumes autonomous
+egress when no trailing `0x02` flush arrives within
+`DTMF_PAUSE_BUDGET_MS` = 30 000 ms of the `0x05`
+(`MAX_DTMF_STREAM_PAUSE_SEC` = 30.0 s — sized so the largest
+legal `call.send_dtmf` workload, `MAX_DTMF_DIGITS` = 32 digits
+including `,`/`w`/`W` pause chars, fits inside the budget), a
+second `0x05` received while paused RE-ARMS the watermark and
+budget rather than stacking pauses, and a pause observed beyond
+the budget is a media-fault signal handled exactly like a
+detached role, never read as in-call silence.
 
 ### Requirement: Provider command acknowledgements are kernel facts (round 33)
 
@@ -1284,10 +1367,19 @@ provider-call-handle because ring correlation stays
 commands: an accepted ack never carries one.
 
 From command-dispatch until the handshake resolves the lease
-carries `pending_command` (phase-coherent: `"dial"` on DIALING
-only, `"answer"` on ANSWERING only) together with the kernel-clock
+carries `pending_command` together with the kernel-clock
 `provider_command_ack_deadline_at` — set and cleared atomically
-with the marker. While armed, the lease is EXCLUDED from
+with the marker. The marker SURVIVES forward phase advances a
+provider fact may report before the acknowledgement (round 34,
+iteration-2 audit item 1 — supersedes the round-33 narrow
+phase-lock): `"dial"` is legal on DIALING/ALERTING/ACTIVE, a
+provider `alerting`/`active` fact does NOT clear it, so the late
+`{accepted:true}` ack still finds its handshake and records
+`provider_call_id` on the live lease; `"answer"` is legal on
+ANSWERING/ACTIVE the same way. The marker never rides ACQUIRED
+(no command was ever queued), TERMINATING or ENDED (teardown
+clears the pair atomically — below). While armed, the lease is
+EXCLUDED from
 snapshot/`state_snapshot` omission reconciliation (the provider's
 picture cannot reflect a command it has not answered yet) and
 from unqualified sole-live-lease attribution, though a matching
@@ -1336,12 +1428,23 @@ never for cellular alerting or answer — and a refused, timed-out
 or unreachable handshake answers `PROVIDER_UNREACHABLE` (all
 three command-handshake failures collapse to the one existing
 code; no new error code is minted). While the caller session is
-alive the withheld answer stays handshake-bound across a racing
-teardown (round 33, PR #82 review): `{accepted:true}` yields the
-normal `DialResult`/`AcceptResult` even when a teardown raced
-after the provider's acceptance; `{accepted:false}`/timeout/
-unreachable yields `PROVIDER_UNREACHABLE`; a session that died
-while the handshake was open receives no answer at all.
+alive the withheld answer stays handshake-bound while the LEASE
+is (round 34, iteration-2 audit item 10 — supersedes the
+round-33 "yields the normal result even when a teardown raced"
+clause): `{accepted:true}` yields the normal
+`DialResult`/`AcceptResult` ONLY when the lease is still live at
+ack resolution; when a teardown already ended it the late ack is
+stale, the pending wire call answers `PROVIDER_UNREACHABLE`
+TERMINALLY, and the dead lease's `media_token`/`provider_call_id`
+are NEVER delivered — a successful reply carrying revoked
+credentials would hand the agent a token that can never
+authenticate. `{accepted:false}`/timeout/unreachable yields
+`PROVIDER_UNREACHABLE` the same way; a session that died while
+the handshake was open receives no answer at all. Event
+ownership on the answer-pending path belongs to the RING
+lifecycle: the failed `call.accept` exposes no `lease_id`, and
+the consumed ring reports its missed outcome through
+`event.missed_call`/the ring-drain path instead.
 
 ### Requirement: Answer-pending rings suppress the fallback decision (round 33)
 
@@ -1360,6 +1463,24 @@ line keeps `RINGING_LOCKED` under the drain rule. A consumed ring
 NEVER re-enters the fallback decision on any path: the accept
 window burned with the token, so no second decision can be minted
 for the same physical ring.
+
+Two priority pins close the remaining race (round 34,
+iteration-2 audit item 5). (a) While an answer is
+pending, the provider's `active` fact on that ring belongs to
+the answering lease: `ANSWERING -> ACTIVE` is what moves the
+line `RINGING_LOCKED -> BUSY` — the pending agent answer takes
+priority over the handset-answer `external_call` attribution,
+and only an `active` fact whose identity CONTRADICTS the pending
+answer's ring (a foreign token/handle, positive mismatch
+evidence) may mint `external_call` instead. (b) While the
+lease sits in ANSWERING the teardown stays RING-SCOPED: any
+failed-answer path — refused ack, handshake lapse, provider
+death, session drop — issues the reject vehicle
+`line.hangup{call_token}` for the still-ringing physical call,
+never the lease-scoped `line.hangup{lease_id}`; the
+lease-scoped teardown becomes legal only AFTER the provider's
+`active` confirms the call established (the answered leg is
+what the modem teardown then targets).
 
 ### Requirement: Unqualified provider-state attribution needs positive evidence (round 33)
 
@@ -1383,6 +1504,22 @@ or more candidates. A lease with an armed `pending_command` is
 protected twice: the evidence floor and the command-ack
 exclusion both refuse attribution while the handshake is open.
 
+The `external_call` mint exists for call-PRESENT states only
+(round 34, iteration-2 audit item 13): `dialing`/`alerting`/
+`active` mint the tracking record under the rules above, while
+an unqualified `disconnected` with ZERO live candidates mints
+NOTHING — a teardown report with no call behind it is a
+dedupe/`{ok}` no-op, never a phantom record — and an
+unqualified `disconnected` against a `pending_ring` parked in
+ring-drain clears the parked ring without minting a token or a
+record. The minted hold is BOUNDED by the flat safety net:
+`tick` tears an unmatched `external_call` down at
+`UNMATCHED_CALL_SAFETY_SEC` = 3600 s regardless of the line's
+`max_call_duration_sec` — a handset call can legitimately
+outlive the configured call cap, so the configured cap never
+shortens an unmatched hold, but no unmatched record may live
+forever.
+
 ### Requirement: Provider-stamp watermarks are durable and line-scoped (round 33)
 
 `ProviderBinding` carries two DURABLE watermark fields —
@@ -1396,20 +1533,49 @@ persisted verbatim on the provider-binding row, restored by
 `hydrate_lines`, and inherited line-scoped by a reregistered
 binding so a stamp replayed by a new binding still dedupes
 against the line's recorded watermark — they are never reset by
-supersession. `channel_seq` is the accepted-socket generation
-counter; a restart reseeds it strictly newer than any stored
-value, and a delayed fact on an older channel can never disarm
-the orphan deadline. `orphan_deadline_at` is channel-local and
-is NEVER persisted as durable line state; a hydrated binding
-loads DEAD (`ws_disconnected`, orphan deadline already expired)
-and suppresses duplicate external escalation during restart
-recovery — a persisted row alone never makes a binding live.
+supersession.
+
+The live call-state ordering key is finer than the durable
+scalar (round 34, iteration-2 audit item 11): live dedup/order
+is scoped per `(line_id, call_identity, accepted_stamp)` where
+`call_identity` resolves `lease_id`, then `call_token`, then
+`provider_call_id`, then `_unqualified` — a clock-regressed or
+out-of-order stamp on ONE call can never drop a valid fact
+from ANOTHER call on the same line, which a single line-wide
+monotone scalar would. The per-identity table is BOUNDED
+(`MAX_CALL_STAMP_WATERMARKS_PER_LINE` = 64, FIFO-evicted); the
+durable `call_stamp_watermark` stays the restart replay floor,
+never the sole live ordering scalar.
+
+`channel_seq` is the accepted-socket generation counter the
+ADAPTER owns and stamps; a restart reseeds it strictly newer
+than any stored value. Recovery from `ws_disconnected` REQUIRES
+a strictly newer generation — a `provider.reregister` on a new
+socket — because an equal-generation delayed fact is recorded
+but can NEVER clear `orphan_deadline_at` (round 34, iteration-2
+audit item 8: the binding reached `ws_disconnected` precisely
+because that generation's socket died, so equality can never
+mean "the socket is back"). `orphan_deadline_at` is
+channel-local and is NEVER persisted as durable line state; a
+hydrated binding loads DEAD (`ws_disconnected`, orphan deadline
+already expired) and suppresses duplicate external escalation
+during restart recovery — a persisted row alone never makes a
+binding live.
 
 ### Requirement: Zero-subscriber inbound routing uses the wake audience (round 33)
 
 A shared-pool ring whose `receive_inbound` fan-out resolves to
 ZERO live sessions stamps a `WakeAudience` envelope ONLY when at
-least one wake hook is configured — socket fan-out is empty by
+least one wake hook is configured — the kernel-visible hook set
+is `LineAssignment.wake_hooks` (round 34, iteration-2 audit item
+2: a bounded `frozenset` of ≤ `MAX_WAKE_HOOKS_PER_LINE` = 16
+checked hook identifiers, patched through `configure_line`, so
+"hooks exist" is a kernel fact, not adapter state). The same
+wake route serves an EXCLUSIVE line whose owner has no live
+`receive_inbound` session — the sleeping owner's ring reaches
+the configured hooks through the identical tokenless projection
+(same item: exclusivity changes the live-audience predicate,
+never the hook payload). Socket fan-out is empty by
 construction and only the `escalation_hooks` delivery leg
 consumes it, carrying the masked/bounded wake payload (never a
 live `call_token`). The tokenless shape is STRUCTURAL, not
@@ -1421,8 +1587,15 @@ the model — while every live `agent`/`session`/`fanout` audience
 keeps the token-bearing `IncomingCallEvent`; `EventEnvelope`
 enforces the split at construction, so a token-bearing payload on
 `wake` — or the tokenless projection on a live audience — is not
-constructible. `MissedCallEvent` already carries no token and
-needs no sibling projection. With no hooks configured, NO `incoming_call`
+constructible. The wake `caller_id` is the MASKED string
+projection (round 34, iteration-2 audit item 16): it carries the
+`str(RedactedString)` masked rendering validated to contain the
+mask marker — a raw-bearing `RedactedString` field would
+serialize the full number in JSON-mode dumps to an
+unauthenticated hook, so the field types a plain bounded `str`
+that can never hold a raw E.164. `MissedCallEvent` already
+carries no token and needs no sibling projection. With no hooks
+configured, NO `incoming_call`
 envelope is emitted at all — the ring still waits out
 `accept_window_sec` so a sleeping agent can wake and answer.
 `wake` is legal ONLY on `incoming_call`/`missed_call`; PII-bearing
@@ -1447,3 +1620,92 @@ boundary, and the reply-side `{has_more, cursor}` contract plus
 the stable orderings (lines/assignments/bindings by `line_id`,
 leases by `(created_at, lease_id)`, tickets by `seq`, pending
 claims by `(created_at, claim_id)`) are unchanged.
+
+Two pins land with it (round 34, iteration-2 audit item 21):
+`has_more` obeys ONE formula — `has_more` is `true` exactly when
+rows remain after the returned slice (`(cursor's resume offset)
+< (total rows matching the query)`, and `cursor` is `null` when
+`has_more` is `false`) — the wire `limit` caps the RETURNED row
+count, never the adapter's internal tail probe, so a full page
+that consumed the tail reports `has_more: false` and needs no
+trailing empty page, while a byte-cap-truncated page keeps
+`cursor` at the first dropped row and reports `true` whenever
+rows remain past it; and the cursor is BOUND to its
+listing context — the adapter encodes the method identity plus
+the effective filter parameters (`intent`, `subject_id`, and
+every other enumeration-shaping param) inside the token, so a
+cursor presented to a different method or under different
+filters is a foreign cursor and fails closed the same way.
+
+### Requirement: Provider claimability and servability are distinct predicates (round 34)
+
+The servable predicate is `SERVABLE_LIVENESS_STATES` — `liveness`
+is `reachable` or `degraded` (round 34, iteration-2 audit item
+4): a binding without a live control socket can NEVER serve, even
+while `CLAIM_VISIBLE_LIVENESS_STATES` keeps it claim-VISIBLE (a
+`ws_disconnected` binding inside orphan grace still pins the
+line's claim story and is still listed in
+`AdminLineView.provider_bindings`). Servable membership gates
+EVERY serve path — a new `call.acquire` grant, a `free_lines`
+alternative, and any `line.dial`/`line.answer` dispatch: no
+`line.dial` or `line.answer` may EVER target a `ws_disconnected`
+binding, because the orphan has no socket a command could ride —
+the command is never queued and the serve path fails
+`PROVIDER_UNREACHABLE` until a `provider.reregister` on a
+strictly newer `channel_seq` restores a live channel. The claim
+view alone admits `ws_disconnected` (the moderator-resolved
+request may legitimately outlive the grace window); serving
+never does. `AdminLineView.orphan_deadline_at`
+mirrors the live binding's channel-local deadline and is
+non-NULL ONLY for `WS_DISCONNECTED` — the admin surface never
+diverges from the kernel's view of the same binding.
+
+### Requirement: Provider death paths use provider_lost and never queue to dead bindings (round 34)
+
+EVERY provider-binding death path — drop, `unregister_provider`,
+orphan-grace lapse, `admin.revoke_assignment`, heartbeat-down
+`tick`, supersession — ends its leases and pending rings with the
+single reason `provider_lost` (round 34, iteration-2 audit item
+6): the binding's fate is the fact, never a phase-derived guess,
+so a caller can distinguish "the provider died" from air-side or
+policy endings. Death is also queue-side terminal (item 6): a
+command enqueue targeted at a DEAD binding is refused —
+`PROVIDER_UNREACHABLE`, never appended — so
+the outbox can never accumulate commands a dead control socket
+will never drain. Recovery flows exclusively through
+`provider.reregister` on a strictly newer `channel_seq`, never
+through stale-fact resurrection.
+
+### Requirement: Media pair TTL arms after command acknowledgement (round 34)
+
+The lease's media credential pair is issued at lease mint but
+its TTL is not armed then (round 34, iteration-2 audit item 9):
+`media_epoch` is stamped into the credentials and the expiry
+clock starts ONLY when the provider's `{accepted:true}` command
+acknowledgement lands — `line.dial`/`line.answer` both carry the
+credentials, so a pair minted while the provider never answered
+must not burn its TTL in a window where no media socket could
+legitimately connect. The effective deadline is the
+ack-resolution instant plus `MEDIA_PAIR_TTL_SEC`; the ack's own
+deadline (`provider_command_ack_deadline_at`) bounds the
+pre-arm window. A `media.auth` presenting a stale `media_epoch`
+— minted under a superseded binding or an already-ended lease —
+fails terminally, never refreshes a dead credential pair.
+
+### Requirement: Queue update fanout is mutation-coalesced (round 34)
+
+Within ONE kernel mutation a ticket emits AT MOST ONE
+`event.queue_updated` envelope carrying its FINAL position
+(round 34, iteration-2 audit item 14): a cascade that shifts a
+ticket through several ranks — a mass grant, a cancel sweep, a
+provider death dropping several tickets — coalesces to the
+landing rank, never one envelope per intermediate step. The
+payload stays per-ticket (`{session_id, ticket_id, position}`):
+position updates are session-private data, so a shared summary
+envelope could never carry them without leaking foreign
+`ticket_id`s across sessions. Queue fan-out is therefore bounded
+by AFFECTED TICKETS, not by step count — at most
+`MAX_QUEUE_TICKETS_TOTAL` = 1024 envelopes per mutation,
+strictly below `OUTBOX_HARD_CAP` by construction — so a mass
+queue shift can never overflow the outbox or starve the teardown
+effects committed alongside it.
