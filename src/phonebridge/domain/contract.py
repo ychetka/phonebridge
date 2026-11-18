@@ -722,6 +722,16 @@ _CheckedMediaToken = Annotated[MediaToken, AfterValidator(_check_token)]
 _CheckedCallerNumber = Annotated[RedactedString, AfterValidator(_check_caller_number)]
 
 
+_MASKED_CALLER_SHAPE: re.Pattern[str] = re.compile(r".{0,4}\*{4}.{0,2}")
+"""Exact geometry of :meth:`RedactedString._mask` output (round 34
+fix): at most ``_MASK_PREFIX_LEN`` = 4 visible chars, the
+``_MASK`` marker ``"****"``, then at most ``_MASK_SUFFIX_LEN`` = 2
+visible chars. A ``fullmatch`` pins the marker into position, so a
+raw string that merely CONTAINS ``****`` somewhere - a leading
+mask glued to a full number, a trailing mask, or a buried marker -
+can never validate as a masked projection."""
+
+
 def _check_masked_caller(value: str) -> str:
     """Masked-caller projection check (round 34, iteration-2 audit
     item 16): the value a wake-hook payload may carry for the
@@ -732,17 +742,24 @@ def _check_masked_caller(value: str) -> str:
     and serializable in ANY dump mode without ever revealing the
     raw number (a ``RedactedString``'s own JSON-mode dump emits
     the raw value, so the wake model deliberately types this a
-    plain ``str``). The mask marker is REQUIRED: every
-    ``RedactedString._mask`` output contains ``_MASK``, so a value
-    without it is structurally a raw number - rejected. Bounded by
-    ``MAX_CALLER_ID_LEN`` like the raw field it projects and free
-    of control text."""
+    plain ``str``). The mask SHAPE is required, not just the
+    marker: every ``RedactedString._mask`` output matches
+    :data:`_MASKED_CALLER_SHAPE` (``.{0,4}****.{0,2}`` fullmatch -
+    up to 4 visible prefix chars, the ``****`` marker, up to 2
+    visible suffix chars), so a full raw number, a raw number with
+    a leading/trailing ``****`` glued on, or any value whose mask
+    sits outside the rendered window is rejected just like a
+    markerless string. Bounded by ``MAX_CALLER_ID_LEN`` like the
+    raw field it projects and free of control text."""
     if not value:
         raise ValueError("masked caller number must be non-empty")
     if len(value) > MAX_CALLER_ID_LEN:
         raise ValueError(f"masked caller number exceeds {MAX_CALLER_ID_LEN} chars")
-    if _MASK not in value:
-        raise ValueError("masked caller number must carry the mask marker")
+    if _MASKED_CALLER_SHAPE.fullmatch(value) is None:
+        raise ValueError(
+            "masked caller number must match the masked projection shape "
+            "(<=4 chars, the **** marker, <=2 chars)"
+        )
     _require_no_control_text(value, "masked caller number")
     return value
 

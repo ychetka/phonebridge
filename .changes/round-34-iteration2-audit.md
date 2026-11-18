@@ -2,7 +2,7 @@
 type: fix
 scope: domain
 user_visible: false
-breaking: false
+breaking: true
 user_summary: "-"
 dev_summary: >-
   Round-34 contract/specification hardening (issue #83, iteration-2
@@ -54,7 +54,18 @@ dev_summary: >-
   edge pins, last_seen_at assign_line stamping and
   paired_phone_mac uniqueness; false-positive tests, fake-kernel
   shapes, spec-anchor/release-note tooling and stale CHANGELOG
-  fixed.
+  fixed. Breaking pre-M1 contract deltas vs the pre-review shape:
+  CallEndReason.ADMIN_REVOKED is removed (provider-binding
+  revocation surfaces through line.revoke plus the
+  line_state_changed/provider_lost paths, never as a lease
+  teardown reason), IncomingCallWakeEvent.caller_id is retyped to
+  the masked plain-str projection (the pinned
+  .{0,4}****.{0,2} shape - raw caller strings no longer
+  validate), MediaCredentials.media_epoch is a new REQUIRED >=1
+  field on every minted pair, and
+  LineManager.note_provider_liveness now returns
+  tuple[PendingRing, ...] for the provider.ping reply instead of
+  None.
 why: >-
   The iteration-2 external audit returned STOP for M1 until these
   contract contradictions land; this round hardens the executable
