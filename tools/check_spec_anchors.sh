@@ -209,10 +209,16 @@ def parse_impact(path):
 
 files = sorted(
     f for f in os.listdir(changes_dir)
-    if f.endswith(".md") and not f.startswith("_") and f != "README.md"
+    if f.endswith(".md") and not f.startswith("_")
+    and not f.startswith(".") and f != "README.md"
     and os.path.isfile(os.path.join(changes_dir, f))
 )
-if not files:
+# Round 34 (iteration-2 audit item 25): an empty .changes/ is NOT a
+# reason to skip the --base coverage check - a diff that touches
+# docs/specs/*.md while every fragment is absent is exactly the
+# undocumented-spec-edit case the per-file coverage rule exists to
+# catch. Only a NO-base run with no fragments exits early.
+if not files and changed_specs is None:
     print("no pending .changes entries - nothing to check")
     sys.exit(0)
 

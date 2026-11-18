@@ -3,6 +3,12 @@
 #
 # Usage:
 #   tools/release_notes.sh                      print both sections
+#   tools/release_notes.sh --check              validate every pending
+#                                               fragment's frontmatter
+#                                               (fields, type, scope)
+#                                               and exit - the PR gate
+#                                               mode (round 34): an
+#                                               empty .changes/ is OK
 #   tools/release_notes.sh --version X.Y.Z      print with a
 #                                               "## [X.Y.Z] - <date>" header
 #   tools/release_notes.sh --version X.Y.Z --apply
@@ -22,11 +28,13 @@ CHANGELOG="$TOP/CHANGELOG.md"
 
 VERSION=""
 APPLY=0
+CHECK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="${2:?--version needs a version}"; shift 2 ;;
     --apply)   APPLY=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    --check)   CHECK=1; shift ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -36,17 +44,27 @@ fi
 if [ "$APPLY" = 1 ] && [ -z "$VERSION" ]; then
   echo "--apply requires --version" >&2; exit 2
 fi
+if [ "$CHECK" = 1 ] && { [ "$APPLY" = 1 ] || [ -n "$VERSION" ]; }; then
+  echo "--check does not combine with --apply/--version" >&2; exit 2
+fi
 [ -d "$CHANGES" ] || { echo "no .changes/ directory" >&2; exit 1; }
 
-GENERATED=$(CHANGES_DIR="$CHANGES" VERSION="$VERSION" python3 - <<'PYEOF'
+GENERATED=$(CHANGES_DIR="$CHANGES" VERSION="$VERSION" CHECK_ONLY="$CHECK" python3 - <<'PYEOF'
 import os, re, sys, datetime
 
 changes_dir = os.environ["CHANGES_DIR"]
 version = os.environ.get("VERSION", "")
+check_only = os.environ.get("CHECK_ONLY", "0") == "1"
 
 FIELDS = ("type", "scope", "user_visible", "breaking",
           "user_summary", "dev_summary", "why", "refs")
 TYPES = ("feat", "fix", "refactor", "docs", "chore")
+# Canonical scope vocabulary (.changes/README.md) - round 34
+# (iteration-2 audit item 25): the PR gate validates the scope
+# whitelist the README declares, so a typo'd scope can no longer
+# ride a fragment through to release notes.
+SCOPES = ("domain", "daemon", "hci", "media",
+          "docs", "tooling", "ci", "deploy")
 
 def _close_quote(s, q):
     """Index of the closing quote in s (s[0] is the open quote), or
@@ -189,6 +207,11 @@ def parse(path):
         raise SystemExit(f"{name}: missing fields: {', '.join(missing)}")
     if fm["type"] not in TYPES:
         raise SystemExit(f"{name}: bad type {fm['type']!r}")
+    if fm["scope"] not in SCOPES:
+        raise SystemExit(
+            f"{name}: bad scope {fm['scope']!r} "
+            f"(one of {', '.join(SCOPES)})"
+        )
     for b in ("user_visible", "breaking"):
         if fm[b] not in ("true", "false"):
             raise SystemExit(f"{name}: {b} must be true|false")
@@ -198,9 +221,19 @@ def parse(path):
 
 files = sorted(
     f for f in os.listdir(changes_dir)
-    if f.endswith(".md") and not f.startswith("_") and f != "README.md"
+    if f.endswith(".md") and not f.startswith("_")
+    and not f.startswith(".") and f != "README.md"
 )
 entries = [parse(os.path.join(changes_dir, f)) for f in files]
+# --check (round 34, iteration-2 audit item 25): the PR gate runs
+# the SAME parser the release fold uses - fields/type/scope
+# validated above - then exits 0. An empty .changes/ is legal on a
+# PR (release-prep branches fold CHANGELOG.md directly and carry no
+# fragments), so the "no entries" verdict is only an error when
+# notes were actually requested.
+if check_only:
+    print(f"fragment frontmatter OK ({len(entries)} entries)")
+    raise SystemExit(0)
 if not entries:
     raise SystemExit(".changes/ has no pending entries")
 

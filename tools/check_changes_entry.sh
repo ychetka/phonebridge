@@ -163,6 +163,70 @@ if fragment:
             )
             print('{"status":"fail","reason":"changes_fragment_unterminated_frontmatter"}')
             sys.exit(1)
+        # round 34 (iteration-2 audit item 25): frontmatter FIELD
+        # validation is a PR gate, not a release-time surprise -
+        # the release_notes.sh parser used to be the first place a
+        # fragment missing `refs:` or carrying `type: bogus` failed,
+        # long after merge. Validate the field set and the scalar
+        # shapes the generator requires, at PR time.
+        fm_block = "\n".join(fm_lines[1:fm_end])
+        missing = [
+            f for f in (
+                "type", "scope", "user_visible", "breaking",
+                "user_summary", "dev_summary", "why", "refs",
+            )
+            if not re.search(rf"(?m)^{f}\s*:", fm_block)
+        ]
+        if missing:
+            print(
+                f"FAIL: {frag} frontmatter is missing fields: "
+                f"{', '.join(missing)} - see .changes/_template.md",
+                file=sys.stderr,
+            )
+            print('{"status":"fail","reason":"changes_fragment_missing_fields"}')
+            sys.exit(1)
+        tm = re.search(
+            r"(?m)^type\s*:\s*[\"']?(\w+)[\"']?\s*$", fm_block
+        )
+        if tm is None or tm.group(1) not in (
+            "feat", "fix", "refactor", "docs", "chore"
+        ):
+            print(
+                f"FAIL: {frag} frontmatter 'type' must be one of "
+                "feat|fix|refactor|docs|chore",
+                file=sys.stderr,
+            )
+            print('{"status":"fail","reason":"changes_fragment_bad_type"}')
+            sys.exit(1)
+        sm = re.search(
+            r"(?m)^scope\s*:\s*[\"']?(\w+)[\"']?\s*$", fm_block
+        )
+        if sm is None or sm.group(1) not in (
+            "domain", "daemon", "hci", "media",
+            "docs", "tooling", "ci", "deploy",
+        ):
+            print(
+                f"FAIL: {frag} frontmatter 'scope' must be one of "
+                "domain|daemon|hci|media|docs|tooling|ci|deploy "
+                "(.changes/README.md canonical list)",
+                file=sys.stderr,
+            )
+            print('{"status":"fail","reason":"changes_fragment_bad_scope"}')
+            sys.exit(1)
+        for b in ("user_visible", "breaking"):
+            if not re.search(
+                rf"(?m)^{b}\s*:\s*[\"']?(true|false)[\"']?\s*$",
+                fm_block,
+            ):
+                print(
+                    f"FAIL: {frag} frontmatter '{b}' must be "
+                    "true|false",
+                    file=sys.stderr,
+                )
+                print(
+                    '{"status":"fail","reason":"changes_fragment_bad_bool"}'
+                )
+                sys.exit(1)
         if not re.search(r"(?m)^##\s+Spec impact\s*$", body):
             print(
                 f"FAIL: {frag} has no '## Spec impact' section - "

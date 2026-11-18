@@ -34,6 +34,8 @@ jobs:
         run: uv sync --extra dev --locked
       - name: Check types
         run: uv run mypy src tests
+      - name: Check fragment frontmatter
+        run: bash tools/release_notes.sh --check
       - name: Check spec anchors
         env:
           BASE_REF: ${{ github.base_ref }}
