@@ -15,7 +15,17 @@ ring-scoped reject, DTMF `0x05` pacer-pause semantics, orphan
 cascade `provider_lost` unification + dead-binding command ban,
 idempotency TTL/LRU/`IDEMPOTENCY_CONFLICT`, `provider_call_id`,
 grant-TTL ACQUIRED-only, `orphan_deadline_at` projections and
-hardware-identity fields).
+hardware-identity fields),
+and refreshed again at round 33 (iteration-1 architecture audit —
+first-class `ProviderCommandAck` facts + `pending_command`/
+`provider_command_ack_deadline_at` + `tick` backstop +
+`provider_command_ack_sec`, `answer_pending` rings + burned-token
+fallback suppression, positive-evidence `caller_id` attribution +
+`external_call`, durable `ProviderBinding` stamp watermarks +
+channel-local `orphan_deadline_at`, `WakeAudience` zero-subscriber
+routing, adapter-owned listing `cursor`, `media_epoch` on the
+call-lease tuple, ISO-3166 `default_region` and unique
+`adapter_mac` provisioning validation).
 Prose sections carry the
 requirements; each is cited by `.changes` fragments via its heading
 anchor (see `docs/specs/README.md`).
@@ -1227,3 +1237,152 @@ a real stream stamp can reach — and on receipt the router MUST
 drop ALL still-queued uplink frames for the lease regardless of
 timestamp; it is consumed at the router and never bridged to the
 provider.
+
+### Requirement: Provider command acknowledgements are kernel facts (round 33)
+
+The provider's `{accepted, provider_call_id?, reason?}` reply to a
+down-channel `line.dial`/`line.answer` is a FIRST-CLASS kernel
+fact, not a transport outcome the adapter may interpret alone.
+The adapter MUST distill the reply into
+`ProviderCommandAck{line_id, assignment_id, command, lease_id,
+call_token?, accepted, provider_call_id?, reason?}` and report it
+through `LineManager.ingest_command_ack` inside the line's
+effective `provider_command_ack_sec` window (default 2 s, `>0`
+and ≤ 60 s, patched through `configure_line` like every timeout
+knob). `command` is the closed `CommandAckKind` vocabulary —
+`"dial"`/`"answer"` — and `call_token` echoes the ring token ONLY
+on the answer handshake (the ring-scoped reject needs it).
+
+From command-dispatch until the handshake resolves the lease
+carries `pending_command` (phase-coherent: `"dial"` on DIALING
+only, `"answer"` on ANSWERING only) together with the kernel-clock
+`provider_command_ack_deadline_at` — set and cleared atomically
+with the marker. While armed, the lease is EXCLUDED from
+snapshot/`state_snapshot` omission reconciliation (the provider's
+picture cannot reflect a command it has not answered yet) and
+from unqualified sole-live-lease attribution, though a matching
+strong-identity `disconnected` fact still ends it.
+
+`{accepted:true}` clears the pair and — on the dial path —
+records `provider_call_id` as the lease's durable external-handle
+evidence (the agent's `call.dial` reply mirrors the stored value);
+the ack itself NEVER advances a phase — only provider call-state
+facts move phases. `{accepted:false}` performs the IDENTICAL
+effects the matching compensation entry carries inside one
+mutation: dial — best-effort lease-scoped `line.hangup` then
+`network_error` end and line free; answer — ring-scoped reject
+then `network_error` end and the line stays `RINGING_LOCKED`
+under the drain rule. A timeout or transport error carries NO
+reply to distill: the adapter invokes `compensate_dial`/
+`compensate_answer` instead, and the stamped deadline is `tick`'s
+backstop applying the identical terminal effect when no report
+ever arrives — one deadline against `MAX_TICK_DEADLINES`. An ack
+on a superseded `assignment_id` resolves `STALE_TOKEN` through the
+closed-assignment ring; an ack that does not match the armed
+`pending_command` is dropped as a stale/foreign fact; an ack for
+an already-resolved or ended lease is a dedupe/no-op.
+Synthesizing a `disconnected` provider fact for any ack failure
+stays FORBIDDEN.
+
+The agent-facing consequence is handshake-locked wire replies:
+the `call.dial`/`call.accept` answer is withheld until the
+bounded handshake resolves — it waits ONLY for the command ack,
+never for cellular alerting or answer — and a refused, timed-out
+or unreachable handshake answers `PROVIDER_UNREACHABLE` (all
+three command-handshake failures collapse to the one existing
+code; no new error code is minted).
+
+### Requirement: Answer-pending rings suppress the fallback decision (round 33)
+
+`call.accept` consuming a `call_token` moves the ring into the
+kernel-internal `answer_pending` sub-state for the duration of
+the `line.answer` handshake: the burned token stays burned — a
+second `call.accept` resolves `STALE_TOKEN` — and `tick` MUST NOT
+run the fallback decision for the ring while the handshake is
+armed inside its `provider_command_ack_sec` window; a direct
+`decide_fallback` on an answer-pending (or burned/draining) ring
+is `INVALID_STATE`. An `{accepted:true}` ack commits the ring —
+the `ANSWERING` lease stays ANSWERING until provider
+`active`/`disconnected` facts drive the phase; a failed handshake
+ends the lease via the answer-compensation semantics and the
+line keeps `RINGING_LOCKED` under the drain rule. A consumed ring
+NEVER re-enters the fallback decision on any path: the accept
+window burned with the token, so no second decision can be minted
+for the same physical ring.
+
+### Requirement: Unqualified provider-state attribution needs positive evidence (round 33)
+
+A `provider.call_state` update carrying NEITHER `call_token` nor
+`lease_id` on a non-`RINGING_LOCKED` line is correlated against
+the line's live leases before the `external_call` mint. The bind
+requires POSITIVE evidence: at least one of `provider_call_id`
+(vs the lease's recorded handle) or normalized `caller_id` (vs
+the dialed number or the ring's recorded caller) must be present
+on BOTH sides and agree — `caller_id` is legal on post-ring
+updates precisely as this bounded evidence field, never to
+re-mint caller identity. A field absent on either side is
+unverifiable; a present-but-disagreeing field is conflicting
+evidence that blocks attribution; an update carrying no
+corroborating evidence can never bind an external call to an
+agent lease. In every non-binding outcome the kernel mints the
+`external_call` hold for the call the update truly describes and
+leaves the unmatched lease to its own deadline/orphan grace —
+never ended early by foreign evidence, never guessed among two
+or more candidates. A lease with an armed `pending_command` is
+protected twice: the evidence floor and the command-ack
+exclusion both refuse attribution while the handshake is open.
+
+### Requirement: Provider-stamp watermarks are durable and line-scoped (round 33)
+
+`ProviderBinding` carries two DURABLE watermark fields —
+`liveness_stamp_watermark` and `call_stamp_watermark` — the
+monotone-max provider-stamp domains of the dedupe/ordering
+rules: liveness/ping stamps are refresh facts (an out-of-order
+stamp is CLAMPED to the watermark, never dropped), call-state/
+ring stamps are state facts (an out-of-order stamp below the
+watermark is dropped as a duplicate). Both watermarks are
+persisted verbatim on the provider-binding row, restored by
+`hydrate_lines`, and inherited line-scoped by a reregistered
+binding so a stamp replayed by a new binding still dedupes
+against the line's recorded watermark — they are never reset by
+supersession. `channel_seq` is the accepted-socket generation
+counter; a restart reseeds it strictly newer than any stored
+value, and a delayed fact on an older channel can never disarm
+the orphan deadline. `orphan_deadline_at` is channel-local and
+is NEVER persisted as durable line state; a hydrated binding
+loads DEAD (`ws_disconnected`, orphan deadline already expired)
+and suppresses duplicate external escalation during restart
+recovery — a persisted row alone never makes a binding live.
+
+### Requirement: Zero-subscriber inbound routing uses the wake audience (round 33)
+
+A shared-pool ring whose `receive_inbound` fan-out resolves to
+ZERO live sessions stamps a `WakeAudience` envelope ONLY when at
+least one wake hook is configured — socket fan-out is empty by
+construction and only the `escalation_hooks` delivery leg
+consumes it, carrying the masked/bounded wake payload (never a
+live `call_token`). With no hooks configured, NO `incoming_call`
+envelope is emitted at all — the ring still waits out
+`accept_window_sec` so a sleeping agent can wake and answer.
+`wake` is legal ONLY on `incoming_call`/`missed_call`; PII-bearing
+inbound events are never widened to `broadcast` or to
+`dial_out`-only sessions, and a live fan-out stays bounded as ONE
+`fanout` envelope carrying the member list.
+
+### Requirement: Listing cursors are adapter-owned and fail closed (round 33)
+
+Every listing call (`call.get_lines`, `admin.list_lines`,
+`admin.list_leases`, `admin.list_tickets`,
+`admin.list_pending_claims`, `admin.list_assignments`,
+`admin.list_provider_bindings`, `admin.list_keys`) MAY accept a
+`cursor` param — the opaque token the previous reply emitted —
+INSTEAD of `offset`; the two are mutually exclusive on one
+request (`offset`+`cursor` → `INVALID_ARGUMENT`) and a malformed,
+expired or foreign cursor is `INVALID_ARGUMENT` — a bad cursor
+never silently rewinds to offset 0. The kernel surface keeps
+`offset`/`limit` only: the adapter translates its cursor into the
+kernel window, the opaque token never crosses the kernel
+boundary, and the reply-side `{has_more, cursor}` contract plus
+the stable orderings (lines/assignments/bindings by `line_id`,
+leases by `(created_at, lease_id)`, tickets by `seq`, pending
+claims by `(created_at, claim_id)`) are unchanged.

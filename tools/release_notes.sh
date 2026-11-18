@@ -258,6 +258,18 @@ fi
 # large enough notes payload would make the python child fail to
 # exec at all.
 [ -f "$CHANGELOG" ] || { printf '# Changelog\n' > "$CHANGELOG"; }
+# Stale-coverage guard (round 33, iteration-1 audit item 32): the
+# fold is idempotent - a CHANGELOG that already carries the target
+# version section means these fragments were already folded (the
+# release-prep ran before) or the version argument is wrong; either
+# way re-appending would duplicate the section and double-delete
+# nothing, so refuse loudly instead of corrupting the changelog.
+if grep -qF "## [$VERSION]" "$CHANGELOG"; then
+  echo "FAIL: CHANGELOG.md already has a '## [$VERSION]' section -" >&2
+  echo "the fragments were already folded (stale leftovers) or the" >&2
+  echo "--version argument is wrong. Nothing applied." >&2
+  exit 1
+fi
 NOTES_FILE=$(mktemp) || { echo "mktemp failed" >&2; exit 1; }
 trap 'rm -f "$NOTES_FILE"' EXIT
 printf '%s\n' "$GENERATED" > "$NOTES_FILE"

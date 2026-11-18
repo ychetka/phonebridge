@@ -23,4 +23,11 @@ jobs:
         with:
           fetch-depth: 0
       - name: Assert pyproject version has a release tag
+        # Round 33 (audit finding 20): the check is pinned to the
+        # commit this run was triggered for - a later merge landing
+        # on main while an earlier run still polls must not
+        # invalidate it, so the tag is verified against THIS sha and
+        # the pyproject version read from the tagged commit.
+        env:
+          VERSION_TAG_EXPECT_SHA: ${{ github.sha }}
         run: bash tools/check_version_tag.sh 600

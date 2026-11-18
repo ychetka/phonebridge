@@ -42,8 +42,8 @@
   <div class="zone-title">DOCKER container "phonebridge-gateway" — the single deployment artifact</div>
 
   <div class="box core">Manager + APICallService<span class="small">two surfaces of one daemon: Manager accepts <code>provider.register/line.*</code> from lines; APICallService accepts <code>agent.*/call.*</code> from agents; shared LineManager kernel; separate token scopes</span></div>
-  <div class="box core">LineManager<span class="small">LineAssignment (durable, no heartbeat) + CallLease (ephemeral) + intent-resolver + ProviderBinding; queues: per-line + global pool; bounded outboxes (<code>drain_events</code>/<code>drain_provider_commands</code>, round 20); admin surface on narrow <code>LineAdminKernel</code> (round 19)</span></div>
-  <div class="box core">EventBus<span class="small">audience-routed fan-out (broadcast | agent | session | admin — admin scope added round 23): socket-subscribe · webhook (retry+HMAC) · exec/file-drop — wakes any agent type; admin-audience events (e.g. event.idle_alert, round 23) are delivered to configured escalation_hooks (Webhook/Telegram/Exec) and the c_admin MCP stream, never to ordinary agent sessions (round 24)</span></div>
+  <div class="box core">LineManager<span class="small">LineAssignment (durable, no heartbeat) + CallLease (ephemeral) + intent-resolver + ProviderBinding (durable stamp watermarks, round 33); CallLease arms <code>pending_command</code> + bounded ack deadline on every <code>line.dial</code>/<code>line.answer</code> (round 33); queues: per-line + global pool; bounded outboxes (<code>drain_events</code>/<code>drain_provider_commands</code>, round 20); admin surface on narrow <code>LineAdminKernel</code> (round 19)</span></div>
+  <div class="box core">EventBus<span class="small">audience-routed fan-out (broadcast | fanout | agent | session | admin | wake — admin scope added round 23, wake scope added round 33): socket-subscribe · webhook (retry+HMAC) · exec/file-drop — wakes any agent type; a shared-pool ring with ZERO live subscribers emits one wake-audience envelope when hooks are configured and none otherwise (round 33); admin-audience events (e.g. event.idle_alert, round 23) are delivered to configured escalation_hooks (Webhook/Telegram/Exec) and the c_admin MCP stream, never to ordinary agent sessions (round 24)</span></div>
 
   <div class="wire">▼ internal call to address <code>127.0.0.1</code> — every provider is container-local (all adapters are virtual)</div>
 
@@ -72,8 +72,8 @@
 <h2>Inbound call under any topology</h2>
 <ol>
   <li>Phone rings → provider (local or Pi — no difference) reports it to the gateway → line goes <code>RINGING_LOCKED</code>.</li>
-  <li>Gateway consults LineAssignment: owner exists → wakes it via webhook/event; no owner → notifies live subscribers per the line's inbound policy.</li>
-  <li>Woken agent: <code>call.accept(call_token)</code> → atomically lease+answer+media. Non-owner → <code>OWNER_MISMATCH</code>. Timeout → per-line fallback policy (default: phone rings on to carrier voicemail as usual).</li>
+  <li>Gateway consults LineAssignment: owner exists → wakes it via webhook/event; no owner → notifies live subscribers per the line's inbound policy; zero live subscribers → one wake-audience envelope to configured hooks (round 33 — no envelope at all when no hooks exist).</li>
+  <li>Woken agent: <code>call.accept(call_token)</code> → atomically lease+answer+media; the token burns into an <code>answer_pending</code> ring while the bounded <code>line.answer</code> handshake resolves (round 33 — reply withheld until the ack, <code>PROVIDER_UNREACHABLE</code> on refusal/timeout). Non-owner → <code>OWNER_MISMATCH</code>. Timeout → per-line fallback policy (default: phone rings on to carrier voicemail as usual).</li>
 </ol>
 
 <h2>Deliberate asymmetries (per consultation)</h2>

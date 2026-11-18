@@ -1,5 +1,9 @@
 target-version = "py310"
 line-length = 100
+# .audit_exchange/ holds reviewer-local iteration artifacts (ignored in
+# .gitignore); exclude it explicitly so `ruff check .` never lints
+# throwaway scripts that are not part of the shipped tree.
+extend-exclude = [".audit_exchange"]
 
 [lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]

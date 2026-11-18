@@ -1047,14 +1047,19 @@ def test_ingress_payloads_validate() -> None:
             state=ProviderCallState.RINGING,
             observed_at=NOW_UTC,
         )
-    with pytest.raises(ValidationError):
-        ProviderCallStateUpdate(
-            line_id=LineId("line-main"),
-            assignment_id=contract.AssignmentId("asg-1"),
-            caller_id=RedactedString(_RAW_NUMBER),
-            state=ProviderCallState.ACTIVE,
-            observed_at=NOW_UTC,
-        )
+    # Round 33: ``caller_id`` is REOPENED on post-ring updates as
+    # bounded correlation evidence (one of the two positive-evidence
+    # fields the sole-live-lease rule requires - the other is
+    # ``provider_call_id``). It is evidence, never identity: the
+    # field accepts the same normalized-E.164 shape as the
+    # ring-ingress carrier.
+    ProviderCallStateUpdate(
+        line_id=LineId("line-main"),
+        assignment_id=contract.AssignmentId("asg-1"),
+        caller_id=RedactedString(_RAW_NUMBER),
+        state=ProviderCallState.ACTIVE,
+        observed_at=NOW_UTC,
+    )
     # ...while the pre-answer hangup the token exists for remains
     # legal: the provider echoes the kernel-minted call_token on the
     # DISCONNECTED update for a still-open ring.
@@ -1457,6 +1462,14 @@ class _FakeLineManager(LineManager):
         self._require_live_binding(assignment_id)
         return None
 
+    async def ingest_command_ack(self, ack: contract.ProviderCommandAck) -> None:
+        # Round 33: the typed provider-command acknowledgement fact
+        # ingress - the same binding-scope guard as every other
+        # ``provider.*`` fact (a superseded assignment_id is
+        # STALE_TOKEN through the closed-assignment ring).
+        self._require_live_binding(ack.assignment_id)
+        return None
+
     async def decide_fallback(self, line_id: LineId, call_token: CallToken) -> FallbackDecision:
         return FallbackDecision(line_id=line_id, call_token=call_token, policy=NoPickupFallback())
 
@@ -1499,12 +1512,13 @@ def test_line_manager_is_abstract() -> None:
 
 async def test_line_manager_async_surface() -> None:
     """Non-e2e async exercise: EVERY abstract method is awaitable and
-    returns its contracted result type (all 29 methods - 27 async +
+    returns its contracted result type (all 30 methods - 28 async +
     the two sync outbox drains; round 30 adds ``ingest_media_state``
     and the ``ProviderRegisterResult`` return on
     ``register_provider``, round 31 adds ``ingest_audio_lost`` and
     ``compensate_dial``, round 32 adds ``ingest_media_overflow``
-    and ``compensate_answer``)."""
+    and ``compensate_answer``, round 33 adds
+    ``ingest_command_ack``)."""
     assert set(LineManager.__abstractmethods__) == {
         "register_intent",
         "acquire",
@@ -1540,6 +1554,9 @@ async def test_line_manager_async_surface() -> None:
         # overflow ingress and the ring-scoped answer compensation.
         "ingest_media_overflow",
         "compensate_answer",
+        # Round 33: the typed provider-command acknowledgement fact
+        # ingress - the kernel's ``{accepted}`` handshake gate.
+        "ingest_command_ack",
         "decide_fallback",
         "drop_session",
         "tick",
@@ -1707,6 +1724,30 @@ async def test_line_manager_async_surface() -> None:
             contract.AssignmentId("asg-1"),
             result.lease_id,
             CallToken(RedactedString("tok-1")),
+        )
+    assert excinfo.value.code is ErrorCode.STALE_TOKEN
+    # Round 33: the typed ``{accepted}`` command-acknowledgement fact
+    # ingress rides the same live-binding guard - a reply distilled
+    # off a superseded channel can never resolve a pending handshake.
+    await mgr.ingest_command_ack(
+        contract.ProviderCommandAck(
+            line_id=LineId("line-main"),
+            assignment_id=contract.AssignmentId("bind-1"),
+            command="dial",
+            lease_id=result.lease_id,
+            accepted=True,
+            provider_call_id="ofono/call0",
+        )
+    )
+    with pytest.raises(PhonebridgeError) as excinfo:
+        await mgr.ingest_command_ack(
+            contract.ProviderCommandAck(
+                line_id=LineId("line-main"),
+                assignment_id=contract.AssignmentId("asg-1"),
+                command="dial",
+                lease_id=result.lease_id,
+                accepted=True,
+            )
         )
     assert excinfo.value.code is ErrorCode.STALE_TOKEN
     await mgr.drop_session(session)
@@ -3763,6 +3804,10 @@ def test_cross_field_validators_batch3() -> None:
         intent=Intent.RECEIVE_INBOUND,
         answered_at=NOW_UTC,
         phase=CallPhase.ACTIVE,
+        # Round 33: a call-bearing phase owns a media credential
+        # pair - the epoch the pair was minted under rides the
+        # lease, so ACTIVE requires media_epoch >= 1.
+        media_epoch=1,
     )
     assert ok_lease.answered_at == NOW_UTC
     with pytest.raises(ValidationError):
@@ -5475,11 +5520,15 @@ def test_call_lease_phase_cross_field_invariants() -> None:
             CallLease(**base, phase=post, grant_expires_at=NOW_UTC + timedelta(seconds=5))
     for late in (CallPhase.ACTIVE, CallPhase.TERMINATING, CallPhase.ENDED):
         # ...and answer facts are legal once the call is established.
+        # Round 33: a call-bearing phase carries media_epoch >= 1
+        # (the media pair the call leg rides); an ENDED lease keeps
+        # the epoch it died with.
         CallLease(
             **base,
             phase=late,
             answered_at=NOW_UTC,
             answer_confidence="confirmed",
+            media_epoch=1,
         )
     # Round 31 (SA_swe2_review_1 item 37): the ACQUIRED deadline is
     # REQUIRED (an undialed lease without one would park the line
@@ -6082,6 +6131,10 @@ def test_agent_call_wire_method_drift() -> None:
         "call.dial": {"idempotency_key"},
         "call.accept": {"idempotency_key"},
         "call.claim_exclusive": {"idempotency_key"},
+        # Round 33: ``cursor`` is adapter-owned pagination input -
+        # the kernel signature keeps offset/limit only, the adapter
+        # translates the opaque token into the kernel window.
+        "call.get_lines": {"cursor"},
     }
     method_map: dict[str, Callable[..., Any]] = {
         "agent.register_intent": contract.LineManager.register_intent,
@@ -6174,7 +6227,14 @@ def test_admin_wire_method_drift() -> None:
     list_keys_row = next(ln for ln in section.splitlines() if ln.startswith("| `admin.list_keys`"))
     for field in ("key_id", "scope", "subject_id", "created_at", "last_used_at?", "revoked"):
         assert field in list_keys_row, f"admin.list_keys row misses {field}"
-    assert table["admin.list_keys"] == {"subject_id": True, "offset": True, "limit": True}
+    assert table["admin.list_keys"] == {
+        "subject_id": True,
+        "offset": True,
+        "limit": True,
+        # Round 33: adapter-owned cursor input joins the shared
+        # pagination window like every other listing call.
+        "cursor": True,
+    }
 
     # Adapter-owned param columns stay drift-checked too (round 32,
     # SA_swe2_review_2 item 23): no kernel signature exists for them,
@@ -6195,19 +6255,34 @@ def test_admin_wire_method_drift() -> None:
         f"extra={pair_req - set(table['admin.pair_window'])}"
     )
 
+    # Round 33: ``cursor`` is adapter-owned pagination input on the
+    # listing calls - the kernel signatures keep offset/limit only
+    # while the wire accepts the opaque token INSTEAD of offset.
+    adapter_owned_params: dict[str, set[str]] = {
+        wire: {"cursor"}
+        for wire in (
+            "admin.list_lines",
+            "admin.list_leases",
+            "admin.list_tickets",
+            "admin.list_pending_claims",
+            "admin.list_assignments",
+            "admin.list_provider_bindings",
+        )
+    }
     for wire, fn in method_map.items():
+        exempt = adapter_owned_params.get(wire, set())
         sig_params = _signature_params(fn)
         doc_params = table[wire]
-        assert set(sig_params) == set(doc_params), (
+        assert set(sig_params) == set(doc_params) - exempt, (
             f"{fn.__name__} drift vs {wire}: "
-            f"missing={set(doc_params) - set(sig_params)}, "
+            f"missing={set(doc_params) - exempt - set(sig_params)}, "
             f"extra={set(sig_params) - set(doc_params)}"
         )
         doc_optional = {p for p, optional in doc_params.items() if optional}
         sig_optional = {p for p, has_default in sig_params.items() if has_default}
-        assert doc_optional == sig_optional, (
+        assert doc_optional - exempt == sig_optional, (
             f"{fn.__name__} optionality drift vs {wire}: "
-            f"doc-optional-only={doc_optional - sig_optional}, "
+            f"doc-optional-only={(doc_optional - exempt) - sig_optional}, "
             f"kernel-optional-only={sig_optional - doc_optional}"
         )
 
@@ -6248,3 +6323,386 @@ def test_closed_ticket_ring_and_ring_dedup_bounds() -> None:
     assert MAX_CLOSED_TICKETS <= contract.MAX_QUEUE_TICKETS_TOTAL
     assert RING_DEDUP_MIN_GAP_SEC == 30.0
     assert RING_DEDUP_MIN_GAP_SEC > 0
+
+
+# ---------------------------------------------------------------------------
+# Round 33 (iteration-1 audit exchange, 0.0.28): provider command
+# acknowledgement facts, answer-pending rings, wake audience, durable
+# provider-stamp watermarks, positive-evidence correlation, cursor
+# pagination pins, media epochs, and the misc hardening fixes
+# (E.164 ASCII digits, region membership, RedactedString eq/hash).
+# ---------------------------------------------------------------------------
+
+
+def _dial_ack(**overrides: Any) -> contract.ProviderCommandAck:
+    kwargs: dict[str, Any] = {
+        "line_id": LineId("line-main"),
+        "assignment_id": contract.AssignmentId("bind-1"),
+        "command": "dial",
+        "lease_id": LeaseId("l-1"),
+        "accepted": True,
+    }
+    kwargs.update(overrides)
+    return contract.ProviderCommandAck(**kwargs)
+
+
+def test_round33_command_ack_kind_vocabulary() -> None:
+    """GWT: ``CommandAckKind`` is exactly ``"dial" | "answer"`` - the
+    two handshakes that carry a bounded ``{accepted}`` reply. A third
+    spelling is rejected at the model boundary."""
+    assert "CommandAckKind" in contract.__all__
+    assert set(get_args(contract.CommandAckKind)) == {"dial", "answer"}
+    _dial_ack(command="dial")
+    _dial_ack(command="answer", call_token=CallToken(RedactedString("tok-1")))
+    with pytest.raises(ValidationError):
+        _dial_ack(command="hangup")
+
+
+def test_round33_provider_command_ack_shape_coherence() -> None:
+    """GWT: the distilled ``{accepted, provider_call_id?, reason?}``
+    reply obeys its shape rules - ``call_token`` is answer-only
+    (the ring-scoped reject needs it), a refused command mints no
+    provider_call_id, and an accepted reply carries no reason."""
+    # Legal shapes: accepted dial (+optional provider_call_id),
+    # accepted/refused answer, refused dial with bounded reason.
+    _dial_ack()
+    _dial_ack(provider_call_id="/ofono/voicecall01")
+    _dial_ack(accepted=False, reason="modem busy")
+    _dial_ack(command="answer", call_token=CallToken(RedactedString("tok-1")))
+    _dial_ack(
+        command="answer",
+        call_token=CallToken(RedactedString("tok-1")),
+        accepted=False,
+        reason="no media path",
+    )
+    # call_token is ring-scoped - never on a dial ack.
+    with pytest.raises(ValidationError):
+        _dial_ack(call_token=CallToken(RedactedString("tok-1")))
+    # An answer ack MUST echo the ring token (the reject needs it).
+    with pytest.raises(ValidationError):
+        _dial_ack(command="answer")
+    # reason is the refusal detail - never on an accepted reply.
+    with pytest.raises(ValidationError):
+        _dial_ack(reason="but it worked")
+    # A refused command mints no provider handle.
+    with pytest.raises(ValidationError):
+        _dial_ack(accepted=False, provider_call_id="/ofono/voicecall01")
+    # reason rides the shared MAX_REASON_LEN bound.
+    _dial_ack(accepted=False, reason="x" * MAX_REASON_LEN)
+    with pytest.raises(ValidationError):
+        _dial_ack(accepted=False, reason="x" * (MAX_REASON_LEN + 1))
+
+
+def test_round33_ingest_command_ack_signature_pinned() -> None:
+    """GWT drift pin: ``LineManager.ingest_command_ack`` is an
+    abstract coroutine taking ONE ``ProviderCommandAck`` - the typed
+    kernel-fact ingress; adapters distill, never pass raw frames."""
+    method = LineManager.ingest_command_ack
+    assert getattr(method, "__isabstractmethod__", False)
+    assert inspect.iscoroutinefunction(method)
+    params = inspect.signature(method).parameters
+    assert list(params) == ["self", "ack"]
+    hints = get_type_hints(method)
+    assert hints["ack"] is contract.ProviderCommandAck
+    assert hints["return"] is type(None)
+
+
+def test_round33_call_lease_pending_command_coherence() -> None:
+    """GWT: ``pending_command``/``provider_command_ack_deadline_at``
+    are an atomic pair with phase coherence - ``"dial"`` lives only
+    on DIALING, ``"answer"`` only on ANSWERING, and the deadline is
+    armed exactly while the marker is set."""
+    deadline = NOW_UTC + timedelta(seconds=2)
+    dial_pending = CallLease(
+        **_lease_base(),
+        phase=CallPhase.DIALING,
+        pending_command="dial",
+        provider_command_ack_deadline_at=deadline,
+        media_epoch=1,
+    )
+    assert dial_pending.pending_command == "dial"
+    answer_pending = CallLease(
+        **_lease_base(),
+        phase=CallPhase.ANSWERING,
+        pending_command="answer",
+        provider_command_ack_deadline_at=deadline,
+        media_epoch=1,
+    )
+    assert answer_pending.pending_command == "answer"
+    # Phase coherence: dial-pending only on DIALING, answer-pending
+    # only on ANSWERING.
+    with pytest.raises(ValidationError):
+        CallLease(
+            **_lease_base(),
+            phase=CallPhase.ALERTING,
+            pending_command="dial",
+            provider_command_ack_deadline_at=deadline,
+            media_epoch=1,
+        )
+    with pytest.raises(ValidationError):
+        CallLease(
+            **_lease_base(),
+            phase=CallPhase.ACTIVE,
+            pending_command="answer",
+            provider_command_ack_deadline_at=deadline,
+            media_epoch=1,
+        )
+    # The marker and its deadline are set/cleared TOGETHER - a
+    # deadline with nothing pending is a phantom tick entry, a
+    # pending command with no deadline could wedge forever.
+    with pytest.raises(ValidationError):
+        CallLease(
+            **_lease_base(),
+            phase=CallPhase.DIALING,
+            pending_command="dial",
+            media_epoch=1,
+        )
+    with pytest.raises(ValidationError):
+        CallLease(
+            **_lease_base(),
+            phase=CallPhase.DIALING,
+            provider_command_ack_deadline_at=deadline,
+            media_epoch=1,
+        )
+    # ...and a deadline can never precede the lease it arms on.
+    with pytest.raises(ValidationError):
+        CallLease(
+            **_lease_base(),
+            phase=CallPhase.DIALING,
+            pending_command="dial",
+            provider_command_ack_deadline_at=NOW_UTC - timedelta(seconds=1),
+            media_epoch=1,
+        )
+
+
+def test_round33_call_lease_evidence_and_media_epoch() -> None:
+    """GWT: ``provider_call_id``/``media_epoch`` evidence rules -
+    an ACQUIRED (pre-dial) lease carries neither, every call-bearing
+    phase owns a media pair (epoch >= 1), and ENDED keeps the epoch
+    it died with."""
+    # ACQUIRED: no provider handle, epoch 0.
+    acquired = CallLease(**_lease_base(), grant_expires_at=NOW_UTC + timedelta(seconds=5))
+    assert acquired.media_epoch == 0 and acquired.provider_call_id is None
+    with pytest.raises(ValidationError):
+        CallLease(
+            **_lease_base(),
+            grant_expires_at=NOW_UTC + timedelta(seconds=5),
+            provider_call_id="/ofono/voicecall01",
+        )
+    with pytest.raises(ValidationError):
+        CallLease(
+            **_lease_base(),
+            grant_expires_at=NOW_UTC + timedelta(seconds=5),
+            media_epoch=1,
+        )
+    # Call-bearing phases require the pair epoch.
+    for phase in (
+        CallPhase.DIALING,
+        CallPhase.ANSWERING,
+        CallPhase.ALERTING,
+        CallPhase.ACTIVE,
+        CallPhase.TERMINATING,
+    ):
+        with pytest.raises(ValidationError):
+            CallLease(**_lease_base(), phase=phase)
+        CallLease(**_lease_base(), phase=phase, media_epoch=1)
+    # ENDED keeps whatever epoch it died with - both 0 (released
+    # pre-dial) and a live epoch are legal.
+    CallLease(**_lease_base(), phase=CallPhase.ENDED)
+    CallLease(**_lease_base(), phase=CallPhase.ENDED, media_epoch=3)
+    # A recorded provider handle rides a call-bearing lease as
+    # durable correlation evidence.
+    lease = CallLease(**_lease_base(), phase=CallPhase.ACTIVE, media_epoch=1,
+                      provider_call_id="/ofono/voicecall01")
+    assert lease.provider_call_id == "/ofono/voicecall01"
+    # Negative epochs are impossible.
+    with pytest.raises(ValidationError):
+        CallLease(**_lease_base(), phase=CallPhase.ACTIVE, media_epoch=-1)
+
+
+def test_round33_wake_audience_scope() -> None:
+    """GWT: ``WakeAudience`` is the zero-live-member fan-out marker -
+    legal ONLY on the caller-PII events ``incoming_call``/
+    ``missed_call`` (the wake-hook envelope), never on
+    session-scoped or broadcast-shaped events."""
+    assert "WakeAudience" in contract.__all__
+    wake = contract.WakeAudience()
+    assert wake.scope == "wake"
+    # It is a member of the audience union - an EventEnvelope accepts
+    # it through the discriminated EventAudience annotation.
+    EventEnvelope[IncomingCallEvent](
+        name=EventName.INCOMING_CALL,
+        audience=wake,
+        emitted_at=NOW_UTC,
+        payload=IncomingCallEvent(
+            line_id=LineId("line-main"),
+            call_token=CallToken(RedactedString("tok-1")),
+            expires_at=NOW_UTC,
+        ),
+    )
+    EventEnvelope[MissedCallEvent](
+        name=EventName.MISSED_CALL,
+        audience=wake,
+        emitted_at=NOW_UTC,
+        payload=MissedCallEvent(line_id=LineId("line-main"), reason=CallEndReason.NO_ANSWER),
+    )
+    # ...but a wake envelope can never carry a session lease fact or
+    # a broadcast-shaped line event.
+    with pytest.raises(ValidationError):
+        EventEnvelope[CallStateChangedEvent](
+            name=EventName.CALL_STATE_CHANGED,
+            audience=wake,
+            emitted_at=NOW_UTC,
+            payload=CallStateChangedEvent(
+                lease_id=LeaseId("l-1"), line_id=LineId("line-main"), state="active"
+            ),
+        )
+    with pytest.raises(ValidationError):
+        EventEnvelope[LineStateChangedEvent](
+            name=EventName.LINE_STATE_CHANGED,
+            audience=wake,
+            emitted_at=NOW_UTC,
+            payload=LineStateChangedEvent(
+                line_id=LineId("line-main"),
+                old_state=LineState.FREE,
+                new_state=LineState.BUSY,
+            ),
+        )
+    # The scope table pins the exact wake-carrying pair - caller-PII
+    # events only.
+    wake_scoped = {name for name, scopes in EVENT_AUDIENCE_SCOPES.items() if "wake" in scopes}
+    assert wake_scoped == {EventName.INCOMING_CALL, EventName.MISSED_CALL}
+    # Round-trip through the union adapter - a serialized wake
+    # audience re-validates as WakeAudience.
+    env_adapter = TypeAdapter(EventAudience)
+    assert isinstance(env_adapter.validate_python({"scope": "wake"}), contract.WakeAudience)
+
+
+def test_round33_provider_binding_watermark_fields() -> None:
+    """GWT: the two durable provider-stamp watermarks are typed,
+    optional and aware-datetime - persisted verbatim on the binding
+    row so reregister/hydration inherit the line-scoped ordering
+    domain."""
+    binding = _binding(
+        liveness_stamp_watermark=NOW_UTC,
+        call_stamp_watermark=NOW_UTC + timedelta(seconds=1),
+    )
+    assert binding.liveness_stamp_watermark == NOW_UTC
+    assert binding.call_stamp_watermark == NOW_UTC + timedelta(seconds=1)
+    # Both default to None on a first-attach binding.
+    plain = _binding()
+    assert plain.liveness_stamp_watermark is None
+    assert plain.call_stamp_watermark is None
+    # Naive stamps are rejected like every other domain datetime.
+    with pytest.raises(ValidationError):
+        _binding(liveness_stamp_watermark=datetime(2026, 11, 13, 12, 0, 0))
+    # The persisted-row invariant stands: the channel-local
+    # orphan_deadline_at exists only on WS_DISCONNECTED bindings and
+    # is NOT part of the durable watermark pair.
+    assert "orphan_deadline_at" in ProviderBinding.__pydantic_fields__
+
+
+def test_round33_command_ack_timeout_knob() -> None:
+    """GWT: ``provider_command_ack_sec`` is the bounded
+    ``{accepted}``-handshake window - default 2.0 s, positive,
+    60 s-capped - and a TimeoutConfig patch merges it through
+    ``apply_patch`` like every other knob."""
+    assert LineTimeouts().provider_command_ack_sec == 2.0
+    with pytest.raises(ValidationError):
+        LineTimeouts(provider_command_ack_sec=0.0)
+    with pytest.raises(ValidationError):
+        LineTimeouts(provider_command_ack_sec=60.1)
+    with pytest.raises(ValidationError):
+        TimeoutConfig(provider_command_ack_sec=-1.0)
+    # An all-None patch keeps the effective value; a set field is
+    # merged atomically through the same full-revalidation path.
+    timeouts = LineTimeouts()
+    assert timeouts.apply_patch(TimeoutConfig()).provider_command_ack_sec == 2.0
+    patched = timeouts.apply_patch(TimeoutConfig(provider_command_ack_sec=5.0))
+    assert patched.provider_command_ack_sec == 5.0
+    assert patched.fallback_accept_ttl_sec == timeouts.fallback_accept_ttl_sec
+
+
+def test_round33_e164_ascii_digit_gate() -> None:
+    """GWT: ``E164_PATTERN`` is ASCII-``[0-9]`` - Python ``\\d``
+    accepts Unicode digits (e.g. ARABIC-INDIC digits U+0660..0669),
+    and a Unicode-digit number must never pass the shape gate."""
+    assert contract.E164_PATTERN.fullmatch(_RAW_NUMBER) is not None
+    unicode_digits = "+373" + "١٢٣٤٥٦٧"  # Arabic-Indic digits
+    assert contract.E164_PATTERN.fullmatch(unicode_digits) is None
+    # The same reject propagates through the typed helper as
+    # INVALID_FORMAT_NOT_E164.
+    assert _e164_reason(unicode_digits, "MD") is ErrorReason.INVALID_FORMAT_NOT_E164
+
+
+def test_round33_region_membership_on_line_country() -> None:
+    """GWT: ``_check_country_alpha2`` carriers reject an
+    alpha-2-SHAPED but unassigned region - ``"ZZ"`` is not an ISO
+    3166-1 region and must never silently feed the dial
+    normalization default."""
+    assert "ZZ" not in contract._ISO_REGION_CODES
+    assert "AA" not in contract._ISO_REGION_CODES
+    assert "MD" in contract._ISO_REGION_CODES
+    provisioned = _assignment(line_home_country="MD")
+    assert provisioned.line_home_country == "MD"
+    for bad_region in ("ZZ", "AA"):
+        with pytest.raises(ValidationError):
+            _assignment(line_home_country=bad_region)
+
+
+def test_round33_redacted_string_eq_hash_consistency() -> None:
+    """GWT: RedactedString eq/hash agree on BOTH paths - encodable
+    values use constant-time comparison, unencodable surrogates fall
+    back to ordinary string equality, and equal-content instances
+    behave identically as dict keys/set members."""
+    a, b = RedactedString("secret-value"), RedactedString("secret-value")
+    assert a == b and hash(a) == hash(b)
+    assert {a: 1}[b] == 1
+    assert len({a, b}) == 1
+    # The unencodable path no longer falls back to identity: two
+    # same-content surrogate strings compare equal and hash equal.
+    s1, s2 = RedactedString("\ud800"), RedactedString("\ud800")
+    assert s1 == s2 and hash(s1) == hash(s2)
+    assert len({s1, s2}) == 1
+    assert s1 != RedactedString("x")
+
+
+def test_round33_cursor_pagination_doc_pin() -> None:
+    """GWT drift pin: the shared listing window documents
+    cursor-as-request-input - ``cursor`` is accepted INSTEAD of
+    ``offset`` (mutually exclusive), malformed/foreign cursors fail
+    closed INVALID_ARGUMENT, and the kernel surface keeps
+    offset/limit only (the adapter translates)."""
+    doc = LineManager.get_lines.__doc__ or ""
+    assert "cursor" in doc
+    assert "INVALID_ARGUMENT" in doc
+    # The kernel listing surface itself stays offset/limit-only -
+    # cursor never leaks into kernel signatures (the adapter owns
+    # the opaque token).
+    get_lines_params = inspect.signature(LineManager.get_lines).parameters
+    assert "cursor" not in get_lines_params
+    assert "offset" in get_lines_params and "limit" in get_lines_params
+
+
+def test_round33_answer_pending_ring_doc_pin() -> None:
+    """GWT drift pin: once ``call.accept`` burns the ring token the
+    ring sits ``answer_pending`` - fallback MUST NOT run while the
+    ``line.answer`` handshake is in flight, and a burned ring never
+    re-enters the fallback decision."""
+    doc = LineManager.decide_fallback.__doc__ or ""
+    assert "answer_pending" in doc
+    assert "INVALID_STATE" in doc
+    tick_doc = LineManager.tick.__doc__ or ""
+    assert "provider_command_ack_sec" in tick_doc
+
+
+def test_round33_snapshot_gate_doc_pin() -> None:
+    """GWT drift pin: snapshot reconciliation is gated on the armed
+    command-ack handshake - a lease whose ``pending_command`` is
+    still inside ``provider_command_ack_sec`` is excluded from
+    omission-based reconciliation."""
+    registration_src = inspect.getsource(ProviderRegistration)
+    liveness_src = inspect.getsource(ProviderLiveness)
+    for src in (registration_src, liveness_src):
+        assert "pending_command" in src
+        assert "provider_command_ack_sec" in src
