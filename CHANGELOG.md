@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.0.33] - 2026-11-18
+
+### User-facing
+
+_No user-visible changes._
+
+### Codebase
+
+#### docs
+- [docs] Issue #93 iteration-5 external architecture audit fixes implemented (docs/diagram only, 4 Major findings, all accepted): the internal.sock named-UID ACL model is replaced by a dedicated-group model — a 0600 socket zeroes POSIX ACL_MASK so named-UID entries are masked out at connect(); internal.sock now lives at 0660 gateway-uid:phonebridge-internal on a NEW dedicated mount /run/phonebridge-internal/ (0750, same owner/group) where phonebridge-internal is an empty-population group holding ONLY the FallbackWorker uid, and the supervisor's setgroups(0,NULL) reset now re-adds ONLY role-required groups (FallbackWorker: [phonebridge-internal]; all other children: zero) — admin.sock is unchanged; system:* dispatch is unified on the ordered writer (KERNEL->WRITER->internal.sock->FB, kernel keeps fallback_accept_ttl_sec + bounded ack-retry) and the diagram gains WRITER->INT; stack restart gains a cascade re-init — kernel reconciliation emits re-init items through the ordered writer (Agent1 re-registers on the fresh org.bluez, bundle supervisors re-attach LineProvider/vhci-feeder D-Bus watches, phonebridge_uplink/downlink virtual PipeWire nodes re-created, line_id-to-hciN map re-verified) and the diagram gains STACKSUP->SUP; hci-agent btusb restore is scoped to remote/dedicated hosts only — on the co-located loopback profile the agent MUST NOT re-bind btusb (a physical hciN in the shared init_net would be adopted by the container's bluetoothd), so loopback leaves btusb unbound and the deployment keeps the physical MAC unmanaged. Why: The iteration-5 audit found the named-UID ACL socket model mechanically broken (mode-0600 zeroes ACL_MASK), a dispatch path for system:* commands that bypassed the ordered writer and could race SQLite write-through, a missing re-init cascade when the stack supervisor restarts shared daemons, and a btusb-restore defect that lets a co-located agent register a physical hciN in the shared init_net the container bluetoothd can adopt; the accepted resolutions replace the ACL model with a dedicated group, route all system:* dispatch and re-init items through the ordered writer, and scope btusb restore to remote hosts — without touching implementation code. (issue #93)
+
+## [0.0.32] - 2026-11-18
+
+### User-facing
+
+_No user-visible changes._
+
+### Codebase
+
+#### docs
+- [docs] Issue #91 iteration-4 external architecture audit fixes implemented (docs/diagram only, 23 findings: 20 accepted, 2 documentation clarifications, 1 disputed/deferred): the Mermaid block diagram now draws /dev/vhci as a bidirectional reader/writer, terminates the Bluetooth RF edge at the remote DONGLE, routes all post-mutation dispatch through the ordered writer task (write-through first, then drained envelopes/commands to EventBus/Manager/bundle supervisor+pair-window/Agent1/ MediaRouter/internal.sock), adds the container init / stack supervisor with a reconciliation edge to the kernel, draws the oFono HandsfreeAudioAgent SCO-fd path to PipeWire, makes InternalService-FallbackWorker and FallbackWorker- MediaRouter edges bidirectional, adds the LineProvider->MediaRouter 0x05/0x06 DTMF control edge, scopes pair-window force-clear to the kernel's authoritative line_id-to-hciN map with PairableTimeout/DiscoverableTimeout backstop, and labels the tunnel edge with SCO_SETUP/SCO_TEARDOWN plus control-TCP(mTLS)/media-DTLS and SOCK_SEQPACKET loopback transport; hci-agent.md gains the SCO_SETUP/SCO_TEARDOWN altsetting actuation pair, SOCK_SEQPACKET loopback media, the mandatory DTLS-on-UDP note for direct_mtls, HELLO-inside- authenticated-tunnel + session_nonce binding, the IsoPump-paced outbound playout buffer with whole-packet drop/dup drift compensation, codec-correct feeder PLC (H2 seq continuation + Packet_Status_Flag=0b10), feeder->supervisor->kernel hciN reporting, fixed hardware gate ordering (post-claim HCI_Read_BD_ADDR MAC verify) and startup wedge recovery; ADR-0004 mirrors the gate fix, wedge recovery, playout buffer and actuation pair; the design doc pins the in-memory- authoritative/SQLite-write-through invariant with restore_line compensation, writer-owned ordered dispatch, the stack supervisor's full kernel reconciliation, kernel-timer-driven fallback activation with bounded ack-retry (event.fallback_triggered informational), hydrated-binding quarantine revalidation, per-uid container separation with group-scoped admin.sock + pid-to-role internal.sock, and credentials-at-rest hashing/0600 rules; api-contract.md adds the 0x06 DTMF-END/resume opcode, the per-session-probe semantics of SendTones/AT+VTS and the session_nonce media binding; line-manager.md gains a round-36 requirement for the authoritative hciN map and hydrated-binding quarantine. Why: The iteration-4 audit found bidirectional/ownership errors and missing supervision/dispatch edges on the block diagram plus underspecified protocol surfaces (altsetting trigger, UDP media auth, hciN mapping, PLC codec state, drift compensation, wedge recovery, credential storage); the accepted resolutions correct the topology and pin the mechanisms in the normative docs without touching implementation code. (issue #91)
+
+## [0.0.31] - 2026-11-18
+
+### User-facing
+
+_No user-visible changes._
+
+### Codebase
+
+#### docs
+- [docs] Issue #89 architecture-diagram review implemented (docs/diagram fixes only): new canonical Mermaid source docs/architecture-block-diagram.mmd with refreshed SVG/PNG in a light palette — FallbackWorker/InternalService/EventBus edges, line-bundle supervisor over LineProvider + vhci-feeder with bundle IPC, kernel->MediaRouter control-plane pairing edge, ordered writer task in front of SQLite, persistent volumes, BlueZ Agent1/admin.pair_window, corrected media path (MediaRouter->LineProvider->PipeWire->bluetoothd->phone) and a transport_profile-labelled HCI handshake (HELLO/HELLO_ACK); new ADR-0004 under docs/adr fixes the production hci-agent runtime as Rust + libusb (Bumble/pyusb demoted to protocol reference and dev tooling, narrow audited IsoPump FFI boundary); hci-agent.md gains the Rust runtime subsection, a feeder-side ingress jitter/playout/PLC buffer for remote media UDP, and explicit per-line channel-pair provisioning; design doc clarifies MediaRouter placement (in-process dedicated media worker, no kernel lock, no SQLite I/O), bounded-best-effort wake delivery, phonebridge doctor session-stack checks (XDG_RUNTIME_DIR, session D-Bus, PipeWire/WirePlumber), provider-owned DTMF mechanism choice (verified SendTones/AT+VTS vs in-band synthesis), and a post-MVP cellular health telemetry note; api-contract.md adds the DTMF-ownership clarification and pins WS binary PCM as the V1 media baseline. Why: The issue #89 architecture review found topological gaps on the block diagram and flagged pyusb isochronous SCO as a production risk; the accepted resolutions correct the diagram to match the normative docs, pin the agent runtime decision in an ADR, and disambiguate DTMF ownership, wake guarantees and doctor pre-flight scope. (issue #89)
+
 ## [0.0.30] - 2026-11-18
 
 ### User-facing
